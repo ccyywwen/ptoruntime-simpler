@@ -18,9 +18,12 @@
 #include "pto_runtime_c_api.h"
 
 #include "callable.h"
+#include "host_device_comm/host_device_mapped_region.h"
+#include "host_device_comm/host_device_mapped_region_sim.h"
 #include "prepare_callable_common.h"
 #include "task_args.h"
 
+#include <errno.h>
 #include <new>
 #include <pthread.h>
 
@@ -147,7 +150,10 @@ DeviceContextHandle create_device_context(void) {
     }
 }
 
-void destroy_device_context(DeviceContextHandle ctx) { delete static_cast<DeviceRunner *>(ctx); }
+void destroy_device_context(DeviceContextHandle ctx) {
+    host_device_mapped_region_close_all_common(ctx);
+    delete static_cast<DeviceRunner *>(ctx);
+}
 
 size_t get_runtime_size(void) { return sizeof(Runtime); }
 
@@ -188,6 +194,7 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
 int finalize_device(DeviceContextHandle ctx) {
     if (ctx == NULL) return -1;
     try {
+        host_device_mapped_region_close_all_common(ctx);
         int rc = static_cast<DeviceRunner *>(ctx)->finalize();
         int dev = pto_cpu_sim_get_bound_device();
         if (dev >= 0) {
@@ -197,6 +204,52 @@ int finalize_device(DeviceContextHandle ctx) {
     } catch (...) {
         return -1;
     }
+}
+
+int open_host_device_mapped_region_ctx(
+    DeviceContextHandle ctx, const HostDeviceMappedRegionConfig *cfg, HostDeviceMappedRegionHandle *out_region
+) {
+    return host_device_mapped_region_open_common(ctx, cfg, out_region, host_device_mapped_region_allocate_sim);
+}
+
+int close_host_device_mapped_region_ctx(DeviceContextHandle ctx, HostDeviceMappedRegionHandle region) {
+    return host_device_mapped_region_close_common(ctx, region);
+}
+
+int host_device_mapped_region_info_ctx(
+    DeviceContextHandle ctx, HostDeviceMappedRegionHandle region, HostDeviceMappedRegionInfo *info
+) {
+    int rc = host_device_mapped_region_info_common(ctx, region, info);
+    if (rc == 0) {
+        info->host_data_ptr = 0;
+        info->host_signal_ptr = 0;
+    }
+    return rc;
+}
+
+int host_device_mapped_region_datacopy_h2region_ctx(
+    DeviceContextHandle ctx, HostDeviceMappedRegionHandle region, uint64_t offset, const void *src, size_t nbytes
+) {
+    return host_device_mapped_region_datacopy_h2region_common(ctx, region, offset, src, nbytes);
+}
+
+int host_device_mapped_region_datacopy_region2h_ctx(
+    DeviceContextHandle ctx, HostDeviceMappedRegionHandle region, uint64_t offset, void *dst, size_t nbytes
+) {
+    return host_device_mapped_region_datacopy_region2h_common(ctx, region, offset, dst, nbytes);
+}
+
+int host_device_mapped_region_notify_ctx(
+    DeviceContextHandle ctx, HostDeviceMappedRegionHandle region, uint32_t signal_id, uint32_t value
+) {
+    return host_device_mapped_region_notify_common(ctx, region, signal_id, value);
+}
+
+int host_device_mapped_region_wait_ctx(
+    DeviceContextHandle ctx, HostDeviceMappedRegionHandle region, uint32_t signal_id, uint32_t target,
+    uint32_t timeout_us
+) {
+    return host_device_mapped_region_wait_common(ctx, region, signal_id, target, timeout_us);
 }
 
 /* ===========================================================================
