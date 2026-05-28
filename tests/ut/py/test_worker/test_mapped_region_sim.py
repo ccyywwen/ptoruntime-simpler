@@ -61,6 +61,62 @@ def test_worker_mapped_region_byte_view_accepts_bytes_for_non_byte_memoryview():
     assert bytes(byte_view) == b"\x5a" * raw.nbytes
 
 
+def test_worker_l3_mapped_region_payload_uses_requested_shm_window(monkeypatch):
+    created = {}
+
+    class FakeSharedMemory:
+        def __init__(self, name=None, create=False, size=0):
+            assert create is True
+            self.name = name
+            self.size = size
+            self.buf = memoryview(bytearray(size + 4096))
+            self.closed = False
+            self.unlinked = False
+            created[name] = self
+
+        def close(self):
+            self.closed = True
+
+        def unlink(self):
+            self.unlinked = True
+
+    class FakeDeviceWorker:
+        def control_open_mapped_region(self, worker_id, data_bytes, signal_count, flags):
+            return 0xABC
+
+        def control_mapped_region_payload(self, worker_id, sub_cmd, shm_name):
+            shm = created[shm_name]
+            buf = worker_mod._mapped_region_byte_view(shm.buf)
+            worker_mod._HDMR_INFO_PAYLOAD.pack_into(
+                buf,
+                worker_mod._HDMR_HEADER.size,
+                0,
+                0x1000,
+                8192,
+                0,
+                0x2000,
+                2,
+                8256,
+                0,
+            )
+
+    monkeypatch.setattr(worker_mod, "SharedMemory", FakeSharedMemory)
+    worker = Worker(level=3, device_ids=[0])
+    worker._initialized = True
+    worker._hierarchical_started = True
+    worker._chip_shms = [object()]
+    worker._worker = FakeDeviceWorker()
+
+    region = worker.open_mapped_region(8192, signal_count=2)
+    info = worker.mapped_region_info(region)
+
+    assert info.device_data_ptr == 0x1000
+    assert info.data_bytes == 8192
+    assert info.device_signal_ptr == 0x2000
+    assert info.signal_count == 2
+    assert all(shm.closed and shm.unlinked for shm in created.values())
+
+
 class FakeChipWorker:
     def __init__(self):
         self.calls: list[tuple[Any, ...]] = []

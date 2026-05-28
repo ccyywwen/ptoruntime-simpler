@@ -1534,10 +1534,11 @@ class Worker:
             raw_buf = shm.buf
             assert raw_buf is not None
             shm_buf = _mapped_region_byte_view(raw_buf)
+            payload_buf = shm_buf[:shm_size]
             try:
-                shm_buf[:] = b"\x00" * shm_size
+                payload_buf[:] = b"\x00" * shm_size
                 _HDMR_HEADER.pack_into(
-                    shm_buf,
+                    payload_buf,
                     0,
                     _HDMR_MAGIC,
                     _HDMR_VERSION,
@@ -1549,15 +1550,16 @@ class Worker:
                     0,
                 )
                 if payload:
-                    shm_buf[_HDMR_HEADER.size : _HDMR_HEADER.size + len(payload)] = payload
+                    payload_buf[_HDMR_HEADER.size : _HDMR_HEADER.size + len(payload)] = payload
                 try:
                     dw.control_mapped_region_payload(int(worker_id), int(sub_cmd), shm.name)
                 except RuntimeError as e:
                     self._raise_mapped_region_control_error(e)
-                status = struct.unpack_from("<i", shm_buf, _HDMR_STATUS_OFFSET)[0]
-                reply = bytes(shm_buf[_HDMR_HEADER.size : _HDMR_HEADER.size + int(nbytes)])
+                status = struct.unpack_from("<i", payload_buf, _HDMR_STATUS_OFFSET)[0]
+                reply = bytes(payload_buf[_HDMR_HEADER.size : _HDMR_HEADER.size + int(nbytes)])
                 return int(status), reply
             finally:
+                payload_buf.release()
                 _release_mapped_region_byte_view(shm_buf, raw_buf)
         finally:
             try:
