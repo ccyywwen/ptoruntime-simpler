@@ -25,6 +25,7 @@
 #include <cassert>
 #include <cstddef>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <vector>
 #include "acl/acl.h"
@@ -60,11 +61,12 @@ extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_d
 
 namespace {
 void *g_hal_handle = nullptr;
+std::mutex g_hal_mutex;
 
 using HalHostRegisterFn = int (*)(void *dev_ptr, size_t size, unsigned int flags, int device_id, void **host_ptr);
 using HalHostUnregisterFn = int (*)(void *host_ptr, int device_id);
 
-int load_hal_if_needed() {
+int load_hal_if_needed_locked() {
     if (g_hal_handle != nullptr) {
         return 0;
     }
@@ -75,18 +77,33 @@ int load_hal_if_needed() {
     return 0;
 }
 
-HalHostRegisterFn get_halHostRegister() {
+HalHostRegisterFn get_halHostRegister_locked() {
     if (g_hal_handle == nullptr) {
         return nullptr;
     }
     return reinterpret_cast<HalHostRegisterFn>(dlsym(g_hal_handle, "halHostRegister"));
 }
 
-HalHostUnregisterFn get_halHostUnregister() {
+HalHostUnregisterFn get_halHostUnregister_locked() {
     if (g_hal_handle == nullptr) {
         return nullptr;
     }
     return reinterpret_cast<HalHostUnregisterFn>(dlsym(g_hal_handle, "halHostUnregister"));
+}
+
+int load_hal_if_needed() {
+    std::lock_guard<std::mutex> lock(g_hal_mutex);
+    return load_hal_if_needed_locked();
+}
+
+HalHostRegisterFn get_halHostRegister() {
+    std::lock_guard<std::mutex> lock(g_hal_mutex);
+    return get_halHostRegister_locked();
+}
+
+HalHostUnregisterFn get_halHostUnregister() {
+    std::lock_guard<std::mutex> lock(g_hal_mutex);
+    return get_halHostUnregister_locked();
 }
 
 }  // namespace
@@ -422,14 +439,18 @@ int DeviceRunner::host_register_device_memory(void *dev_ptr, size_t bytes, void 
         LOG_ERROR("host_register_device_memory requires an attached device");
         return -1;
     }
-    if (load_hal_if_needed() != 0) {
-        LOG_ERROR("Failed to load ascend_hal for mapped region: %s", dlerror());
-        return -1;
-    }
-    HalHostRegisterFn fn = get_halHostRegister();
-    if (fn == nullptr) {
-        LOG_ERROR("halHostRegister symbol not found: %s", dlerror());
-        return -1;
+    HalHostRegisterFn fn = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_hal_mutex);
+        if (load_hal_if_needed_locked() != 0) {
+            LOG_ERROR("Failed to load ascend_hal for mapped region: %s", dlerror());
+            return -1;
+        }
+        fn = get_halHostRegister_locked();
+        if (fn == nullptr) {
+            LOG_ERROR("halHostRegister symbol not found: %s", dlerror());
+            return -1;
+        }
     }
     int rc = fn(dev_ptr, bytes, DEV_SVM_MAP_HOST, device_id_, host_ptr);
     if (rc != 0) {
@@ -448,10 +469,18 @@ int DeviceRunner::host_unregister_device_memory(void *host_ptr) {
         LOG_ERROR("host_unregister_device_memory requires an attached device");
         return -1;
     }
-    HalHostUnregisterFn fn = get_halHostUnregister();
-    if (fn == nullptr) {
-        LOG_ERROR("halHostUnregister symbol not found: %s", dlerror());
-        return -1;
+    HalHostUnregisterFn fn = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_hal_mutex);
+        if (load_hal_if_needed_locked() != 0) {
+            LOG_ERROR("Failed to load ascend_hal for mapped region: %s", dlerror());
+            return -1;
+        }
+        fn = get_halHostUnregister_locked();
+        if (fn == nullptr) {
+            LOG_ERROR("halHostUnregister symbol not found: %s", dlerror());
+            return -1;
+        }
     }
     int rc = fn(host_ptr, device_id_);
     if (rc != 0) {
