@@ -11,19 +11,34 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 from simpler.worker import Worker
 
 from simpler_setup.runtime_builder import RuntimeBuilder
 
+REPO_ROOT = Path(__file__).resolve().parents[4]
 
-@pytest.mark.requires_hardware("a2a3")
-@pytest.mark.platforms(["a2a3"])
-def test_a2a3_onboard_mapped_region_host_side_smoke(st_device_ids):
+
+def _subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    paths = [str(REPO_ROOT), str(REPO_ROOT / "python")]
+    venv_lib = REPO_ROOT / ".venv" / "lib"
+    if venv_lib.exists():
+        paths.extend(str(p) for p in sorted(venv_lib.glob("python*/site-packages")))
+    existing = env.get("PYTHONPATH")
+    if existing:
+        paths.append(existing)
+    env["PYTHONPATH"] = os.pathsep.join(paths)
+    return env
+
+
+def _run_host_side_smoke(device_id: int) -> None:
     build = bool(os.environ.get("PTO_UT_BUILD"))
     _ = RuntimeBuilder(platform="a2a3").get_binaries("tensormap_and_ringbuffer", build=build)
-    device_id = int(st_device_ids[0])
 
     worker = Worker(level=2, platform="a2a3", runtime="tensormap_and_ringbuffer", device_id=device_id, build=build)
     worker.init()
@@ -43,11 +58,34 @@ def test_a2a3_onboard_mapped_region_host_side_smoke(st_device_ids):
             assert worker.mapped_region_datacopy_region2h(region, 16, len(payload)) == payload
 
             worker.mapped_region_wait(region, 0, 0, 0)
-            with pytest.raises(TimeoutError):
+            try:
                 worker.mapped_region_wait(region, 0, 1, 0)
+            except TimeoutError:
+                pass
+            else:
+                raise AssertionError("mapped_region_wait unexpectedly succeeded")
             worker.mapped_region_notify(region, 0, 3)
             worker.mapped_region_wait(region, 0, 3, 0)
         finally:
             worker.close_mapped_region(region)
     finally:
         worker.close()
+
+
+@pytest.mark.requires_hardware("a2a3")
+@pytest.mark.platforms(["a2a3"])
+def test_a2a3_onboard_mapped_region_host_side_smoke(st_device_ids):
+    device_id = int(st_device_ids[0])
+    result = subprocess.run(
+        [sys.executable, __file__, str(device_id)],
+        text=True,
+        capture_output=True,
+        timeout=180,
+        check=False,
+        env=_subprocess_env(),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+if __name__ == "__main__":
+    _run_host_side_smoke(int(sys.argv[1]))
