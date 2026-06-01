@@ -601,6 +601,28 @@ Each region belongs to exactly one chip child. Do not pass a region opened for
 pointers to a task running on a different chip unless a higher-level protocol
 explicitly supports that.
 
+### L3 Protocol Boundary
+
+L3 mapped-region methods are proxied through the chip child's control path.
+While a chip child is synchronously running a submitted chip task, it is not
+available to service new parent-side mapped-region control requests.
+
+For that reason, a multi-epoch L3 protocol should use one submitted L2 task per
+epoch:
+
+```text
+parent writes or enqueues input bytes
+parent notifies the input-ready signal
+parent submits one L2 task through Worker.run(...)
+device task consumes input and writes output
+device task publishes the output-ready signal
+parent waits and reads output bytes
+```
+
+The mapped region may persist across all epochs, so protocol state and buffers
+can be reused. This is different from persistent-kernel streaming, where the
+host would keep sending while one long-running device task remains active.
+
 ## Platform Support
 
 Mapped regions are available on:
@@ -615,9 +637,9 @@ The portable contract is the public Python behavior described here: raw byte
 datacopy, explicit signal notify/wait, masked host pointers, opaque handles,
 and device-visible addresses suitable for task arguments.
 
-## Example Location
+## Runnable Examples
 
-The round-trip example lives at:
+The basic round-trip example shows the primitive directly:
 
 ```text
 examples/a2a3/tensormap_and_ringbuffer/host_device_mapped_region_round_trip/
@@ -636,3 +658,98 @@ Run it on a2a3 hardware with:
 cd examples/a2a3/tensormap_and_ringbuffer/host_device_mapped_region_round_trip
 python main.py -p a2a3 -d 0
 ```
+
+There are also two protocol examples that build higher-level behavior on top of
+the same primitive. They keep `HostDeviceMappedRegion` as the underlying
+runtime allocation, but expose example-local helpers instead of making the
+main flow call raw mapped-region methods directly.
+
+### SPSC Queue Protocol
+
+The small-message example lives at:
+
+```text
+examples/a2a3/tensormap_and_ringbuffer/host_device_spsc_queue_protocol/
+```
+
+It uses one persistent mapped region as a single-lane SPSC channel:
+
+```text
+HostDeviceChannelHeader
+cpu_to_l2 lane header
+cpu_to_l2 descriptor ring
+l2_to_cpu lane header
+l2_to_cpu descriptor ring
+```
+
+The CPU side uses helpers such as `open_channel`, `channel_send_cpu`, and
+`channel_recv_cpu`. The L2 device code mirrors that boundary with
+`channel_recv_l2` and `channel_send_l2`. The protocol is intentionally a
+single-lane subset: producer writes descriptor slots, producer publishes
+`tail`, consumer reads descriptor slots, and consumer publishes `head`.
+
+Only the channel image initialization copies the full control area. Per-epoch
+traffic uses range datacopy for descriptors and cursor fields, then signal
+slots for input-ready and output-ready publication.
+
+Run it with:
+
+```bash
+cd examples/a2a3/tensormap_and_ringbuffer/host_device_spsc_queue_protocol
+python main.py -p a2a3sim -d 0
+```
+
+Useful knobs:
+
+```text
+--epochs
+--messages-per-epoch
+--build
+```
+
+The default workload is 32 epochs and 8 messages per epoch, with 256-byte
+inline descriptor payloads and a lane depth of 16.
+
+### Shared-Buffer Protocol
+
+The large-message example lives at:
+
+```text
+examples/a2a3/tensormap_and_ringbuffer/host_device_shm_buffer_protocol/
+```
+
+It uses one persistent mapped region as a reusable shared-memory buffer:
+
+```text
+header
+input[payload_bytes]
+output[payload_bytes]
+```
+
+The CPU side uses helpers such as `open_shm_buffer`, `shm_buffer_send_cpu`,
+and `shm_buffer_recv_cpu`. The device side receives the same device-visible
+data and signal pointers through task scalars, reads the input buffer, writes a
+deterministic output buffer, and publishes completion through the output
+signal.
+
+Unlike the SPSC example, this protocol copies whole input and output payload
+ranges. That keeps the example focused on bulk transfer plus explicit
+synchronization rather than descriptor-ring cursor management.
+
+Run it with:
+
+```bash
+cd examples/a2a3/tensormap_and_ringbuffer/host_device_shm_buffer_protocol
+python main.py -p a2a3sim -d 0
+```
+
+Useful knobs:
+
+```text
+--epochs
+--payload-bytes
+--build
+```
+
+The default workload is 16 epochs with a 64 KiB payload. That is larger than
+the SPSC inline descriptor limit while still small enough for smoke tests.
