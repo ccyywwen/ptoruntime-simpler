@@ -75,7 +75,7 @@ class ShmBuffer:
         self.worker.close_mapped_region(self.region, worker_id=self.worker_id)
         self.closed = True
 
-    def __enter__(self) -> "ShmBuffer":
+    def __enter__(self) -> ShmBuffer:
         return self
 
     def __exit__(self, _exc_type, _exc, _tb) -> None:
@@ -176,9 +176,7 @@ def shm_buffer_recv_cpu(buffer: ShmBuffer, seq: int, timeout_us: int = TIMEOUT_U
     output = buffer.worker.mapped_region_datacopy_region2h(
         buffer.region, output_offset(buffer.payload_bytes), buffer.payload_bytes, worker_id=buffer.worker_id
     )
-    magic, version, status, got_seq, input_bytes, got_output_bytes, got_checksum, _reserved0 = unpack_header(
-        raw_header
-    )
+    magic, version, status, got_seq, input_bytes, got_output_bytes, got_checksum, _reserved0 = unpack_header(raw_header)
     return ShmResponse(
         magic=magic,
         version=version,

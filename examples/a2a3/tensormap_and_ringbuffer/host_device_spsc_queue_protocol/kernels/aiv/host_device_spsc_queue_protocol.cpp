@@ -196,7 +196,7 @@ channel_recv_l2(__gm__ uint8_t *data, __gm__ uint8_t *signal_base, uint32_t seq,
 }
 
 static inline __aicore__ bool
-channel_send_l2(__gm__ uint8_t *data, __gm__ uint8_t *signal_base, uint32_t seq, const HostDeviceDesc &msg) {
+channel_send_l2(__gm__ uint8_t *data, __gm__ uint8_t *signal_base, const HostDeviceDesc &msg) {
     auto *output = lane(data, kL2ToCpu);
     invalidate_range(output, sizeof(HostDeviceLaneHeader));
     uint32_t head = output->head;
@@ -213,15 +213,21 @@ channel_send_l2(__gm__ uint8_t *data, __gm__ uint8_t *signal_base, uint32_t seq,
     flush_range(
         reinterpret_cast<volatile __gm__ uint8_t *>(output) + offsetof(HostDeviceLaneHeader, tail), sizeof(uint32_t)
     );
-    notify_signal_l2(signal_base, 1, seq);
+    notify_signal_l2(signal_base, 1, static_cast<uint32_t>(msg.seq));
     return true;
 }
 
 static inline __aicore__ void transform_message(const HostDeviceDesc &in, HostDeviceDesc *out) {
-    *out = in;
+    out->flags = in.flags;
+    out->seq = in.seq;
+    out->correlation_id = in.correlation_id;
     out->route = in.route ^ 0x80000000U;
+    out->reserved0 = 0U;
     uint32_t nbytes = in.payload_bytes > kMaxInlineBytes ? kMaxInlineBytes : in.payload_bytes;
     out->payload_bytes = nbytes;
+    for (uint32_t i = 0; i < sizeof(out->reserved1); ++i) {
+        out->reserved1[i] = 0U;
+    }
     for (uint32_t i = 0; i < nbytes; ++i) {
         uint8_t mask = static_cast<uint8_t>(in.seq + i * 7U);
         out->inline_data[i] = static_cast<uint8_t>(in.inline_data[i] ^ mask);
@@ -241,7 +247,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         }
         HostDeviceDesc response{};
         transform_message(msg, &response);
-        if (!channel_send_l2(data, signal_base, seq, response)) {
+        if (!channel_send_l2(data, signal_base, response)) {
             break;
         }
     }

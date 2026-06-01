@@ -8,10 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 
 import inspect
+from pathlib import Path
 
 import pytest
 
 from .main import run
+
+HERE = Path(__file__).resolve().parent
 
 
 def test_run_uses_channel_protocol_helpers():
@@ -26,6 +29,18 @@ def test_run_uses_channel_protocol_helpers():
         "close_mapped_region",
     ):
         assert forbidden not in source
+
+
+def test_kernel_constructs_response_metadata_field_by_field():
+    source = (HERE / "kernels" / "aiv" / "host_device_spsc_queue_protocol.cpp").read_text()
+    assert "*out = in" not in source
+    for required in (
+        "out->flags = in.flags",
+        "out->seq = in.seq",
+        "out->correlation_id = in.correlation_id",
+        "out->route = in.route ^ 0x80000000U",
+    ):
+        assert required in source
 
 
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim"])

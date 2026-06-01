@@ -323,7 +323,6 @@ target_include_directories(test_host_device_mapped_region PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/common
     ${CMAKE_SOURCE_DIR}/../../../src/common/worker
 )
-target_compile_options(test_host_device_mapped_region PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
 target_link_libraries(test_host_device_mapped_region PRIVATE
     ${GTEST_MAIN_LIB}
     ${GTEST_LIB}

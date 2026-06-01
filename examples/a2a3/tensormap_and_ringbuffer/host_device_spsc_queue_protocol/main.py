@@ -99,7 +99,7 @@ class Channel:
         self.worker.close_mapped_region(self.region, worker_id=self.worker_id)
         self.closed = True
 
-    def __enter__(self) -> "Channel":
+    def __enter__(self) -> Channel:
         return self
 
     def __exit__(self, _exc_type, _exc, _tb) -> None:
@@ -369,9 +369,9 @@ def run(
 
             total_responses = 0
             for epoch in range(epochs):
-                seq = epoch + 1
                 expected: list[Message] = []
                 for msg_idx in range(messages_per_epoch):
+                    seq = epoch * messages_per_epoch + msg_idx + 1
                     payload = make_payload(epoch, msg_idx)
                     route = 0x1000 + msg_idx
                     correlation_id = (seq << 32) | msg_idx
@@ -383,7 +383,7 @@ def run(
                     args = TaskArgs()
                     args.add_scalar(channel.device_data_ptr)
                     args.add_scalar(channel.device_signal_ptr)
-                    args.add_scalar(seq)
+                    args.add_scalar(expected[-1].seq)
                     args.add_scalar(messages_per_epoch)
                     orch.submit_next_level(chip_cid, args, run_cfg, worker=0)
 
@@ -394,7 +394,7 @@ def run(
                     assert got is not None
                     _validate_response(msg, got)
                     total_responses += 1
-                assert channel_recv_cpu(channel, seq) is None
+                assert channel_recv_cpu(channel, expected[-1].seq) is None
 
             assert total_responses == epochs * messages_per_epoch
             assert channel_empty(channel, CPU_TO_L2)
