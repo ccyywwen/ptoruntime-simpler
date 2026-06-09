@@ -115,6 +115,9 @@ void WorkerEndpoint::control_alloc_domain(const char *, const char *) {
 }
 void WorkerEndpoint::control_release_domain(const char *) { throw_unsupported_control("control_release_domain"); }
 void WorkerEndpoint::control_comm_init(const char *) { throw_unsupported_control("control_comm_init"); }
+void WorkerEndpoint::control_l3_l2_orch_comm_init(const char *) {
+    throw_unsupported_control("control_l3_l2_orch_comm_init");
+}
 
 // =============================================================================
 // LocalMailboxEndpoint — mailbox helpers
@@ -758,6 +761,17 @@ void LocalMailboxEndpoint::control_comm_init(const char *request_shm_name) {
     run_control_command("control_comm_init");
 }
 
+void LocalMailboxEndpoint::control_l3_l2_orch_comm_init(const char *control_shm_name) {
+    if (!control_shm_name || !*control_shm_name) {
+        throw std::runtime_error("control_l3_l2_orch_comm_init: control shm name must be non-empty");
+    }
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    uint64_t sub_cmd = CTRL_L3_L2_ORCH_COMM_INIT;
+    std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
+    write_shm_name_pair(mbox(), control_shm_name, "");
+    run_control_command("control_l3_l2_orch_comm_init");
+}
+
 uint64_t WorkerThread::control_malloc(size_t size) {
     if (!endpoint_) throw std::runtime_error("control_malloc: null endpoint");
     return endpoint_->control_malloc(size);
@@ -884,6 +898,11 @@ void WorkerThread::control_release_domain(const char *request_shm_name) {
 void WorkerThread::control_comm_init(const char *request_shm_name) {
     if (!endpoint_) throw std::runtime_error("control_comm_init: null endpoint");
     endpoint_->control_comm_init(request_shm_name);
+}
+
+void WorkerThread::control_l3_l2_orch_comm_init(const char *control_shm_name) {
+    if (!endpoint_) throw std::runtime_error("control_l3_l2_orch_comm_init: null endpoint");
+    endpoint_->control_l3_l2_orch_comm_init(control_shm_name);
 }
 
 bool WorkerManager::any_busy() const {
@@ -1013,6 +1032,14 @@ void WorkerManager::control_comm_init(int worker_id, const char *request_shm_nam
         throw std::runtime_error("control_comm_init: invalid worker_id " + std::to_string(worker_id));
     }
     wt->control_comm_init(request_shm_name);
+}
+
+void WorkerManager::control_l3_l2_orch_comm_init(int worker_id, const char *control_shm_name) {
+    auto *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_l3_l2_orch_comm_init: invalid worker_id " + std::to_string(worker_id));
+    }
+    wt->control_l3_l2_orch_comm_init(control_shm_name);
 }
 
 ControlResult WorkerManager::control_digest_only(
