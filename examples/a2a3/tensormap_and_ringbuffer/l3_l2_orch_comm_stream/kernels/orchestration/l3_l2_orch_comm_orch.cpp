@@ -53,12 +53,12 @@ bool read_payload_or_fail(L3L2OrchEndpoint &endpoint, uint64_t offset, uint64_t 
 extern "C" {
 
 __attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
+aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{.expected_arg_count = kExpectedArgCount};
 }
 
-__attribute__((visibility("default"))) void l3_l2_orch_comm_orchestration(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) void l3_l2_orch_comm_orchestration(const L2TaskArgs &orch_args) {
     uint64_t desc_scalars[L3L2_ORCH_REGION_DESC_SCALAR_COUNT] = {
         orch_args.scalar(0), orch_args.scalar(1), orch_args.scalar(2),
         orch_args.scalar(3), orch_args.scalar(4), orch_args.scalar(5),
@@ -119,7 +119,7 @@ __attribute__((visibility("default"))) void l3_l2_orch_comm_orchestration(const 
         Tensor output = make_tensor_external(
             reinterpret_cast<void *>(static_cast<uintptr_t>(output_view.gm_addr)), shape, 1, dtype
         );
-        Arg params;
+        L0TaskArgs params;
         params.add_input(input);
         params.add_output(output);
         params.add_scalar(scalar);
