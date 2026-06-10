@@ -42,6 +42,7 @@
 #include "common/unified_log.h"
 #include "host/raii_scope_guard.h"
 #include "host_log.h"
+#include "pto_runtime_c_api.h"
 #include "utils/elf_build_id.h"
 // `runtime.h` (pulled in via `device_runner_helpers.h` in the base header)
 // supplies the per-arch `Handshake` + `Runtime` types used by
@@ -75,7 +76,7 @@ int DeviceRunnerBase::device_memset(void *dev_ptr, int value, std::size_t bytes)
 
 int DeviceRunnerBase::l3_l2_orch_comm_init(void *control_block, size_t control_block_size) {
     if (!l3_l2_orch_comm_supported()) {
-        return -1;
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
     }
     return l3_l2_orch_comm_service_.start(this, control_block, control_block_size);
 }
