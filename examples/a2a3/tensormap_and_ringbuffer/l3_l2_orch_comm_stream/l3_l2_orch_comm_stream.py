@@ -15,6 +15,7 @@ import ctypes
 import os
 import struct
 
+from simpler.l3_l2_orch_comm import NotifyOp, WaitCmp
 from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import CallConfig, ChipCallable, CoreCallable, DataType, TaskArgs, scalar_to_uint64
 from simpler.worker import Worker
@@ -34,6 +35,9 @@ _NBYTES = _NUMEL * 4
 _INPUT_OFFSET = _HEADER_BYTES
 _OUTPUT_OFFSET = _INPUT_OFFSET + _NBYTES
 _PAYLOAD_BYTES = _OUTPUT_OFFSET + _NBYTES
+_DATA_READY_COUNTER = 0
+_COMPLETION_COUNTER = 64
+_COUNTER_BYTES = 128
 _ROUNDS = 3
 _SCALAR = ctypes.c_float(7.0)
 
@@ -115,7 +119,11 @@ def run_closed_loop_stream(platform: str, device_id: int) -> None:
         config.aicpu_thread_num = 2
 
         def orch(orch_handle, _args, cfg):
-            region = orch_handle.create_l3_l2_region(worker_id=0, payload_bytes=_PAYLOAD_BYTES)
+            region = orch_handle.create_l3_l2_region(
+                worker_id=0, payload_bytes=_PAYLOAD_BYTES, counter_bytes=_COUNTER_BYTES
+            )
+            data_ready = region.counter(_DATA_READY_COUNTER)
+            completion = region.counter(_COMPLETION_COUNTER)
             header = orch_handle.alloc([_HEADER_BYTES], DataType.UINT8)
             host_input = orch_handle.alloc([_NUMEL], DataType.FLOAT32)
             host_output = orch_handle.alloc([_NUMEL], DataType.FLOAT32)
@@ -129,6 +137,8 @@ def run_closed_loop_stream(platform: str, device_id: int) -> None:
             task_args.add_scalar(DataType.FLOAT32.value)
             task_args.add_scalar(_NBYTES)
             task_args.add_scalar(scalar_to_uint64(_SCALAR))
+            task_args.add_scalar(_DATA_READY_COUNTER)
+            task_args.add_scalar(_COMPLETION_COUNTER)
             orch_handle.submit_next_level(handle, task_args, cfg, worker=0)
 
             for seq in range(1, _ROUNDS + 1):
@@ -136,15 +146,18 @@ def run_closed_loop_stream(platform: str, device_id: int) -> None:
                 region.payload_write(_INPUT_OFFSET, host_input, nbytes=_NBYTES)
                 _write_header(header, seq, 1)
                 region.payload_write(0, header, nbytes=_HEADER.size)
-                region.notify(seq)
-                region.wait(seq, timeout=5.0)
+                data_ready.notify(seq, NotifyOp.Set)
+                snapshot = completion.test(seq, WaitCmp.GE)
+                if not snapshot.matched:
+                    assert snapshot.observed < seq
+                    completion.wait(seq, WaitCmp.GE, timeout=5.0)
                 region.payload_read(_OUTPUT_OFFSET, host_output, nbytes=_NBYTES)
                 _assert_output_matches(host_output, expected)
 
             stop_seq = _ROUNDS + 1
             _write_header(header, stop_seq, 2)
             region.payload_write(0, header, nbytes=_HEADER.size)
-            region.notify(stop_seq)
+            data_ready.notify(stop_seq, NotifyOp.Set)
 
         worker.run(orch, args=None, config=config)
     finally:

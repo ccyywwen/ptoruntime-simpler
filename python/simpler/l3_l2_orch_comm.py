@@ -29,11 +29,21 @@ class L3L2OrchCommCmd(IntEnum):
     PAYLOAD_READ = 4
     SIGNAL_NOTIFY = 5
     SIGNAL_WAIT = 6
+    SIGNAL_TEST = 7
 
 
-class L3L2OrchCommSignalSlot(IntEnum):
-    L3_TO_L2 = 0
-    L2_TO_L3 = 1
+class NotifyOp(IntEnum):
+    Set = 0
+    Add = 1
+
+
+class WaitCmp(IntEnum):
+    EQ = 0
+    NE = 1
+    GT = 2
+    GE = 3
+    LT = 4
+    LE = 5
 
 
 _STATE_IDLE = 0
@@ -43,9 +53,9 @@ _POLL_INTERVAL_S = 0.00005
 _DEFAULT_SUBMIT_TIMEOUT_S = 5.0
 _SIGNAL_TIMEOUT_MARGIN_S = 1.0
 
-_REQUEST = struct.Struct("<IIQQQQQQQ")
+_REQUEST = struct.Struct("<IIQQQQQQiIQ")
 _DESC = struct.Struct("<6Q")
-_RESPONSE = struct.Struct("<iIQQ6Q256s")
+_RESPONSE = struct.Struct("<iIQiI6Q256s")
 _CONTROL_OFF_STATE = 0
 _CONTROL_OFF_REQUEST = 8
 _CONTROL_OFF_RESPONSE = _CONTROL_OFF_REQUEST + _REQUEST.size
@@ -60,8 +70,8 @@ class L3L2OrchRegionDesc:
     region_id: int
     payload_base: int
     payload_bytes: int
-    l3_to_l2_signal_base: int
-    l2_to_l3_signal_base: int
+    counter_base: int
+    counter_bytes: int
 
     def scalars(self) -> list[int]:
         return [
@@ -69,20 +79,28 @@ class L3L2OrchRegionDesc:
             int(self.region_id),
             int(self.payload_base),
             int(self.payload_bytes),
-            int(self.l3_to_l2_signal_base),
-            int(self.l2_to_l3_signal_base),
+            int(self.counter_base),
+            int(self.counter_bytes),
         ]
+
+
+@dataclass(frozen=True)
+class SignalTestResult:
+    matched: bool
+    observed: int
 
 
 @dataclass(frozen=True)
 class L3L2OrchCommRequest:
     cmd: L3L2OrchCommCmd
+    op: int = 0
     region_id: int = 0
-    offset: int = 0
+    payload_offset: int = 0
     host_ptr: int = 0
-    nbytes: int = 0
-    signal_slot: int = 0
-    seq: int = 0
+    payload_bytes: int = 0
+    counter_addr: int = 0
+    counter_bytes: int = 0
+    counter_operand: int = 0
     timeout_ns: int = 0
 
 
@@ -91,7 +109,8 @@ class L3L2OrchCommResponse:
     status: int
     error_kind: int
     region_id: int
-    observed_signal: int
+    observed_counter: int
+    matched: bool
     desc: L3L2OrchRegionDesc | None
     message: str
 
@@ -120,13 +139,15 @@ class L3L2OrchCommClient:
                 self._buf,
                 _CONTROL_OFF_REQUEST,
                 int(request.cmd),
-                0,
+                int(request.op),
                 int(request.region_id),
-                int(request.offset),
+                int(request.payload_offset),
                 int(request.host_ptr),
-                int(request.nbytes),
-                int(request.signal_slot),
-                int(request.seq),
+                int(request.payload_bytes),
+                int(request.counter_addr),
+                int(request.counter_bytes),
+                int(request.counter_operand),
+                0,
                 int(request.timeout_ns),
             )
             self._buf[_CONTROL_OFF_RESPONSE : _CONTROL_OFF_RESPONSE + _RESPONSE.size] = b"\x00" * _RESPONSE.size
@@ -143,9 +164,9 @@ class L3L2OrchCommClient:
 
     def _read_response(self) -> L3L2OrchCommResponse:
         fields = _RESPONSE.unpack_from(self._buf, _CONTROL_OFF_RESPONSE)
-        status, error_kind, region_id, observed_signal = fields[:4]
-        desc_values = fields[4:10]
-        raw_message = fields[10]
+        status, error_kind, region_id, observed_counter, matched = fields[:5]
+        desc_values = fields[5:11]
+        raw_message = fields[11]
         desc = None
         if any(int(v) != 0 for v in desc_values):
             desc = L3L2OrchRegionDesc(*[int(v) for v in desc_values])
@@ -154,7 +175,8 @@ class L3L2OrchCommClient:
             status=int(status),
             error_kind=int(error_kind),
             region_id=int(region_id),
-            observed_signal=int(observed_signal),
+            observed_counter=int(observed_counter),
+            matched=bool(matched),
             desc=desc,
             message=message,
         )
@@ -180,15 +202,82 @@ class _PinnedBuffer:
         self.close()
 
 
+class L3L2OrchCounter:
+    def __init__(self, region: "L3L2OrchRegion", offset: int) -> None:
+        self._region = region
+        self._offset = int(offset)
+
+    @property
+    def offset(self) -> int:
+        return self._offset
+
+    @property
+    def addr(self) -> int:
+        return int(self._region.descriptor.counter_base) + self._offset
+
+    def notify(self, value: int, op: NotifyOp = NotifyOp.Set) -> None:
+        self._region._ensure_live()
+        op = NotifyOp(op)
+        self._region._submit(
+            L3L2OrchCommRequest(
+                cmd=L3L2OrchCommCmd.SIGNAL_NOTIFY,
+                op=int(op),
+                region_id=self._region.region_id,
+                counter_addr=self.addr,
+                counter_operand=int(value),
+            )
+        )
+
+    def test(self, cmp_value: int, cmp: WaitCmp) -> SignalTestResult:
+        self._region._ensure_live()
+        cmp = WaitCmp(cmp)
+        response = self._region._submit(
+            L3L2OrchCommRequest(
+                cmd=L3L2OrchCommCmd.SIGNAL_TEST,
+                op=int(cmp),
+                region_id=self._region.region_id,
+                counter_addr=self.addr,
+                counter_operand=int(cmp_value),
+            )
+        )
+        return SignalTestResult(matched=bool(response.matched), observed=int(response.observed_counter))
+
+    def wait(self, cmp_value: int, cmp: WaitCmp, timeout: float) -> int:
+        self._region._ensure_live()
+        cmp = WaitCmp(cmp)
+        if timeout is None or float(timeout) <= 0:
+            raise ValueError("L3-L2 counter wait requires a positive timeout")
+        timeout_ns = int(float(timeout) * 1_000_000_000)
+        response = self._region._submit(
+            L3L2OrchCommRequest(
+                cmd=L3L2OrchCommCmd.SIGNAL_WAIT,
+                op=int(cmp),
+                region_id=self._region.region_id,
+                counter_addr=self.addr,
+                counter_operand=int(cmp_value),
+                timeout_ns=timeout_ns,
+            ),
+            timeout_s=float(timeout) + _SIGNAL_TIMEOUT_MARGIN_S,
+            poison_on_error=False,
+        )
+        if response.status != 0:
+            msg = response.message or "L3-L2 counter wait timed out"
+            raise TimeoutError(f"{msg}; observed={int(response.observed_counter)}")
+        return int(response.observed_counter)
+
+
 class L3L2OrchRegion:
-    def __init__(self, owner: Any, worker_id: int, desc: L3L2OrchRegionDesc, payload_bytes: int) -> None:
+    def __init__(self, owner: Any, worker_id: int, desc: L3L2OrchRegionDesc) -> None:
         self._owner = owner
         self._worker_id = int(worker_id)
         self._descriptor = desc
-        self._payload_bytes = int(payload_bytes)
         self._released = False
         self._poisoned = False
         self._expired = False
+
+    @property
+    def descriptor(self) -> L3L2OrchRegionDesc:
+        return self._descriptor
 
     @property
     def region_id(self) -> int:
@@ -207,9 +296,9 @@ class L3L2OrchRegion:
                 L3L2OrchCommRequest(
                     cmd=L3L2OrchCommCmd.PAYLOAD_WRITE,
                     region_id=self.region_id,
-                    offset=int(offset),
+                    payload_offset=int(offset),
                     host_ptr=pinned.addr,
-                    nbytes=size,
+                    payload_bytes=size,
                 )
             )
 
@@ -222,44 +311,18 @@ class L3L2OrchRegion:
                 L3L2OrchCommRequest(
                     cmd=L3L2OrchCommCmd.PAYLOAD_READ,
                     region_id=self.region_id,
-                    offset=int(offset),
+                    payload_offset=int(offset),
                     host_ptr=pinned.addr,
-                    nbytes=size,
+                    payload_bytes=size,
                 )
             )
 
-    def notify(self, seq: int) -> None:
+    def counter(self, offset: int) -> L3L2OrchCounter:
         self._ensure_live()
-        seq = int(seq)
-        if seq <= 0:
-            raise ValueError("L3-L2 notify sequence must be positive")
-        self._submit(
-            L3L2OrchCommRequest(
-                cmd=L3L2OrchCommCmd.SIGNAL_NOTIFY,
-                region_id=self.region_id,
-                signal_slot=int(L3L2OrchCommSignalSlot.L3_TO_L2),
-                seq=seq,
-            )
-        )
-
-    def wait(self, seq: int, timeout: float) -> None:
-        self._ensure_live()
-        seq = int(seq)
-        if seq <= 0:
-            raise ValueError("L3-L2 wait sequence must be positive")
-        if timeout is None or float(timeout) <= 0:
-            raise ValueError("L3-L2 wait requires a positive timeout")
-        timeout_ns = int(float(timeout) * 1_000_000_000)
-        self._submit(
-            L3L2OrchCommRequest(
-                cmd=L3L2OrchCommCmd.SIGNAL_WAIT,
-                region_id=self.region_id,
-                signal_slot=int(L3L2OrchCommSignalSlot.L2_TO_L3),
-                seq=seq,
-                timeout_ns=timeout_ns,
-            ),
-            timeout_s=float(timeout) + _SIGNAL_TIMEOUT_MARGIN_S,
-        )
+        offset = int(offset)
+        if offset < 0 or offset % 4 != 0 or offset + 4 > int(self._descriptor.counter_bytes):
+            raise ValueError("L3-L2 counter offset must be 4-byte aligned and inside the counter range")
+        return L3L2OrchCounter(self, offset)
 
     def free(self) -> None:
         if self._released:
@@ -287,20 +350,25 @@ class L3L2OrchRegion:
             raise ValueError("L3-L2 payload offset must be non-negative and nbytes must be positive")
         if nbytes > int(buffer_nbytes):
             raise ValueError(f"L3-L2 payload nbytes={nbytes} exceeds host buffer size {buffer_nbytes}")
-        if offset + nbytes > self._payload_bytes:
+        payload_bytes = int(self._descriptor.payload_bytes)
+        if offset + nbytes > payload_bytes:
             raise ValueError(
-                f"L3-L2 payload range [{offset}, {offset + nbytes}) exceeds region size {self._payload_bytes}"
+                f"L3-L2 payload range [{offset}, {offset + nbytes}) exceeds region size {payload_bytes}"
             )
 
     def _submit(
-        self, request: L3L2OrchCommRequest, timeout_s: float = _DEFAULT_SUBMIT_TIMEOUT_S
+        self,
+        request: L3L2OrchCommRequest,
+        timeout_s: float = _DEFAULT_SUBMIT_TIMEOUT_S,
+        *,
+        poison_on_error: bool = True,
     ) -> L3L2OrchCommResponse:
         try:
             response = self._owner._l3_l2_orch_comm_submit(self._worker_id, request, timeout_s)
         except Exception:
             self._poison()
             raise
-        if response.status != 0:
+        if response.status != 0 and poison_on_error:
             self._poison()
             msg = response.message or f"L3-L2 orch comm command {int(request.cmd)} failed"
             raise RuntimeError(msg)

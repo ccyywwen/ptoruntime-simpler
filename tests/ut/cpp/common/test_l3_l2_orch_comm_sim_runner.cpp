@@ -51,7 +51,8 @@ TEST(L3L2OrchCommSimRunnerTest, RunnerOwnedServiceHandlesPayloadSignalAndFree) {
 
     L3L2OrchCommRequest alloc{};
     alloc.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::ALLOC_REGION);
-    alloc.nbytes = 64;
+    alloc.payload_bytes = 64;
+    alloc.counter_bytes = 128;
     L3L2OrchCommResponse alloc_resp = submit(client, alloc);
     ASSERT_EQ(alloc_resp.status, 0) << alloc_resp.message;
     ASSERT_EQ(l3_l2_orch_comm_validate_desc(alloc_resp.desc), L3L2OrchCommValidationError::OK);
@@ -61,34 +62,38 @@ TEST(L3L2OrchCommSimRunnerTest, RunnerOwnedServiceHandlesPayloadSignalAndFree) {
     L3L2OrchCommRequest write{};
     write.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::PAYLOAD_WRITE);
     write.region_id = alloc_resp.desc.region_id;
-    write.offset = 12;
+    write.payload_offset = 12;
     write.host_ptr = reinterpret_cast<uint64_t>(src);
-    write.nbytes = sizeof(src);
+    write.payload_bytes = sizeof(src);
     EXPECT_EQ(submit(client, write).status, 0);
 
     L3L2OrchCommRequest read{};
     read.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::PAYLOAD_READ);
     read.region_id = alloc_resp.desc.region_id;
-    read.offset = 12;
+    read.payload_offset = 12;
     read.host_ptr = reinterpret_cast<uint64_t>(dst);
-    read.nbytes = sizeof(dst);
+    read.payload_bytes = sizeof(dst);
     EXPECT_EQ(submit(client, read).status, 0);
     EXPECT_EQ(std::memcmp(src, dst, sizeof(src)), 0);
 
     L3L2OrchCommRequest notify{};
     notify.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::SIGNAL_NOTIFY);
     notify.region_id = alloc_resp.desc.region_id;
-    notify.signal_slot = static_cast<uint64_t>(L3L2OrchCommSignalSlot::L2_TO_L3);
-    notify.seq = 1;
+    notify.counter_addr = alloc_resp.desc.counter_base;
+    notify.counter_operand = 1;
+    notify.op = static_cast<uint32_t>(L3L2OrchNotifyOp::Set);
     EXPECT_EQ(submit(client, notify).status, 0);
 
     L3L2OrchCommRequest wait{};
     wait.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::SIGNAL_WAIT);
     wait.region_id = alloc_resp.desc.region_id;
-    wait.signal_slot = static_cast<uint64_t>(L3L2OrchCommSignalSlot::L2_TO_L3);
-    wait.seq = 1;
+    wait.counter_addr = alloc_resp.desc.counter_base;
+    wait.counter_operand = 1;
+    wait.op = static_cast<uint32_t>(L3L2OrchWaitCmp::EQ);
     wait.timeout_ns = 100000000;
-    EXPECT_EQ(submit(client, wait).status, 0);
+    L3L2OrchCommResponse wait_resp = submit(client, wait);
+    EXPECT_EQ(wait_resp.status, 0);
+    EXPECT_EQ(wait_resp.observed_counter, 1);
 
     L3L2OrchCommRequest free_req{};
     free_req.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::FREE_REGION);

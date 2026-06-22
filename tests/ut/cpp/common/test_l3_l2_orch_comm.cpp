@@ -22,7 +22,7 @@ namespace {
 
 L3L2OrchRegionDesc valid_desc() {
     return L3L2OrchRegionDesc{
-        l3_l2_orch_comm_magic_version(), 7, 0x1000, 4096, 0x3000, 0x3040,
+        l3_l2_orch_comm_magic_version(), 7, 0x1000, 4096, 0x3000, 128,
     };
 }
 
@@ -35,8 +35,8 @@ TEST(L3L2OrchCommTest, DescriptorRoundTripsThroughSixTaskArgScalars) {
     EXPECT_EQ(scalars[1], desc.region_id);
     EXPECT_EQ(scalars[2], desc.payload_base);
     EXPECT_EQ(scalars[3], desc.payload_bytes);
-    EXPECT_EQ(scalars[4], desc.l3_to_l2_signal_base);
-    EXPECT_EQ(scalars[5], desc.l2_to_l3_signal_base);
+    EXPECT_EQ(scalars[4], desc.counter_base);
+    EXPECT_EQ(scalars[5], desc.counter_bytes);
 
     L3L2OrchRegionDesc decoded{};
     L3L2OrchCommValidationError error{};
@@ -46,8 +46,8 @@ TEST(L3L2OrchCommTest, DescriptorRoundTripsThroughSixTaskArgScalars) {
     EXPECT_EQ(decoded.region_id, desc.region_id);
     EXPECT_EQ(decoded.payload_base, desc.payload_base);
     EXPECT_EQ(decoded.payload_bytes, desc.payload_bytes);
-    EXPECT_EQ(decoded.l3_to_l2_signal_base, desc.l3_to_l2_signal_base);
-    EXPECT_EQ(decoded.l2_to_l3_signal_base, desc.l2_to_l3_signal_base);
+    EXPECT_EQ(decoded.counter_base, desc.counter_base);
+    EXPECT_EQ(decoded.counter_bytes, desc.counter_bytes);
 }
 
 TEST(L3L2OrchCommTest, DescriptorRejectsBadMajorVersion) {
@@ -75,12 +75,44 @@ TEST(L3L2OrchCommTest, DescriptorRejectsOverflowingPayloadRange) {
     EXPECT_EQ(error, L3L2OrchCommValidationError::BAD_PAYLOAD_RANGE);
 }
 
-TEST(L3L2OrchCommTest, DescriptorRejectsUnalignedSignalBase) {
+TEST(L3L2OrchCommTest, DescriptorRejectsUnalignedCounterBase) {
     L3L2OrchRegionDesc desc = valid_desc();
-    desc.l2_to_l3_signal_base = 0x3041;
+    desc.counter_base = 0x3041;
 
     L3L2OrchCommValidationError error = l3_l2_orch_comm_validate_desc(desc);
-    EXPECT_EQ(error, L3L2OrchCommValidationError::BAD_SIGNAL_BASE);
+    EXPECT_EQ(error, L3L2OrchCommValidationError::BAD_COUNTER_RANGE);
+}
+
+TEST(L3L2OrchCommTest, DescriptorRejectsInvalidCounterBytes) {
+    L3L2OrchRegionDesc desc = valid_desc();
+    desc.counter_bytes = 0;
+    EXPECT_EQ(l3_l2_orch_comm_validate_desc(desc), L3L2OrchCommValidationError::BAD_COUNTER_RANGE);
+
+    desc = valid_desc();
+    desc.counter_bytes = 6;
+    EXPECT_EQ(l3_l2_orch_comm_validate_desc(desc), L3L2OrchCommValidationError::BAD_COUNTER_RANGE);
+}
+
+TEST(L3L2OrchCommTest, CounterAddressValidationRejectsUnalignedAndOutOfRange) {
+    const L3L2OrchRegionDesc desc = valid_desc();
+
+    EXPECT_EQ(l3_l2_orch_comm_validate_counter_addr(desc, desc.counter_base), L3L2OrchCommValidationError::OK);
+    EXPECT_EQ(
+        l3_l2_orch_comm_validate_counter_addr(desc, desc.counter_base + desc.counter_bytes - sizeof(int32_t)),
+        L3L2OrchCommValidationError::OK
+    );
+    EXPECT_EQ(
+        l3_l2_orch_comm_validate_counter_addr(desc, desc.counter_base + 2),
+        L3L2OrchCommValidationError::BAD_COUNTER_RANGE
+    );
+    EXPECT_EQ(
+        l3_l2_orch_comm_validate_counter_addr(desc, desc.counter_base - sizeof(int32_t)),
+        L3L2OrchCommValidationError::OUT_OF_BOUNDS
+    );
+    EXPECT_EQ(
+        l3_l2_orch_comm_validate_counter_addr(desc, desc.counter_base + desc.counter_bytes),
+        L3L2OrchCommValidationError::OUT_OF_BOUNDS
+    );
 }
 
 TEST(L3L2OrchCommTest, PayloadBoundsRejectOverflowAndOutOfRange) {
@@ -93,23 +125,48 @@ TEST(L3L2OrchCommTest, PayloadBoundsRejectOverflowAndOutOfRange) {
     EXPECT_EQ(l3_l2_orch_comm_validate_payload_bounds(0, 0, 32), L3L2OrchCommValidationError::BAD_PAYLOAD_RANGE);
 }
 
-TEST(L3L2OrchCommTest, SignalSlotValidationIsDirectional) {
-    EXPECT_TRUE(l3_l2_orch_comm_valid_signal_slot(L3L2OrchCommSignalSlot::L3_TO_L2));
-    EXPECT_TRUE(l3_l2_orch_comm_valid_signal_slot(L3L2OrchCommSignalSlot::L2_TO_L3));
-    EXPECT_FALSE(l3_l2_orch_comm_valid_signal_slot(static_cast<L3L2OrchCommSignalSlot>(2)));
+TEST(L3L2OrchCommTest, NotifyOpAndWaitCmpValidationRejectUnknownValues) {
+    EXPECT_TRUE(l3_l2_orch_comm_valid_notify_op(L3L2OrchNotifyOp::Set));
+    EXPECT_TRUE(l3_l2_orch_comm_valid_notify_op(L3L2OrchNotifyOp::Add));
+    EXPECT_FALSE(l3_l2_orch_comm_valid_notify_op(static_cast<L3L2OrchNotifyOp>(2)));
+
+    EXPECT_TRUE(l3_l2_orch_comm_valid_wait_cmp(L3L2OrchWaitCmp::EQ));
+    EXPECT_TRUE(l3_l2_orch_comm_valid_wait_cmp(L3L2OrchWaitCmp::LE));
+    EXPECT_FALSE(l3_l2_orch_comm_valid_wait_cmp(static_cast<L3L2OrchWaitCmp>(6)));
+}
+
+TEST(L3L2OrchCommTest, WaitCmpComparisonCoversAllPredicates) {
+    EXPECT_TRUE(l3_l2_orch_comm_compare_counter(5, 5, L3L2OrchWaitCmp::EQ));
+    EXPECT_FALSE(l3_l2_orch_comm_compare_counter(4, 5, L3L2OrchWaitCmp::EQ));
+    EXPECT_TRUE(l3_l2_orch_comm_compare_counter(4, 5, L3L2OrchWaitCmp::NE));
+    EXPECT_TRUE(l3_l2_orch_comm_compare_counter(6, 5, L3L2OrchWaitCmp::GT));
+    EXPECT_TRUE(l3_l2_orch_comm_compare_counter(5, 5, L3L2OrchWaitCmp::GE));
+    EXPECT_TRUE(l3_l2_orch_comm_compare_counter(4, 5, L3L2OrchWaitCmp::LT));
+    EXPECT_TRUE(l3_l2_orch_comm_compare_counter(5, 5, L3L2OrchWaitCmp::LE));
+    EXPECT_FALSE(l3_l2_orch_comm_compare_counter(5, 5, static_cast<L3L2OrchWaitCmp>(6)));
 }
 
 TEST(L3L2OrchCommTest, RequestAndResponseAreFixedSizePodDescriptorsOnly) {
     static_assert(std::is_standard_layout<L3L2OrchRegionDesc>::value, "descriptor must be POD-like");
     static_assert(std::is_trivially_copyable<L3L2OrchRegionDesc>::value, "descriptor must be fixed-size");
+    static_assert(std::is_standard_layout<L3L2OrchSignalTestResult>::value, "test result must be POD-like");
+    static_assert(std::is_trivially_copyable<L3L2OrchSignalTestResult>::value, "test result must be fixed-size");
     static_assert(std::is_standard_layout<L3L2OrchCommRequest>::value, "request must be POD-like");
     static_assert(std::is_trivially_copyable<L3L2OrchCommRequest>::value, "request must be fixed-size");
     static_assert(std::is_standard_layout<L3L2OrchCommResponse>::value, "response must be POD-like");
     static_assert(std::is_trivially_copyable<L3L2OrchCommResponse>::value, "response must be fixed-size");
 
     EXPECT_EQ(offsetof(L3L2OrchCommRequest, cmd), 0u);
+    EXPECT_EQ(offsetof(L3L2OrchCommRequest, op), sizeof(uint32_t));
+    EXPECT_EQ(offsetof(L3L2OrchCommRequest, payload_offset), sizeof(uint32_t) * 2 + sizeof(uint64_t));
+    EXPECT_EQ(offsetof(L3L2OrchCommRequest, counter_addr), sizeof(uint32_t) * 2 + sizeof(uint64_t) * 4);
+    EXPECT_EQ(offsetof(L3L2OrchCommRequest, counter_operand), sizeof(uint32_t) * 2 + sizeof(uint64_t) * 6);
+    EXPECT_EQ(offsetof(L3L2OrchCommResponse, observed_counter), sizeof(int32_t) + sizeof(uint32_t) + sizeof(uint64_t));
+    EXPECT_EQ(
+        offsetof(L3L2OrchCommResponse, matched), sizeof(int32_t) + sizeof(uint32_t) + sizeof(uint64_t) + sizeof(int32_t)
+    );
     EXPECT_EQ(sizeof(L3L2OrchCommResponse::message), 256u);
-    EXPECT_EQ(sizeof(L3L2OrchCommRequest), sizeof(uint32_t) * 2 + sizeof(uint64_t) * 7)
+    EXPECT_EQ(sizeof(L3L2OrchCommRequest), sizeof(uint32_t) * 4 + sizeof(uint64_t) * 7)
         << "request carries descriptors only; payload bytes must not be embedded";
 }
 

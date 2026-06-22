@@ -353,11 +353,11 @@ class Orchestrator:
         """Collective release.  Equivalent to ``handle.release()``."""
         handle.release()
 
-    def create_l3_l2_region(self, *, worker_id: int, payload_bytes: int):
+    def create_l3_l2_region(self, *, worker_id: int, payload_bytes: int, counter_bytes: int):
         """Create an L3-L2 communication region on one NEXT_LEVEL chip worker."""
         if self._worker is None:
             raise RuntimeError("create_l3_l2_region requires an Orchestrator bound to a Worker")
-        return self._worker._create_l3_l2_region(int(worker_id), int(payload_bytes))
+        return self._worker._create_l3_l2_region(int(worker_id), int(payload_bytes), int(counter_bytes))
 
     # ------------------------------------------------------------------
     # Nested scope (Strict-1 per-scope rings)

@@ -3314,19 +3314,25 @@ class Worker:
                 f"L3-L2 payload ContinuousTensor size {nbytes} exceeds registered shared storage {registered_nbytes}"
             )
 
-    def _create_l3_l2_region(self, worker_id: int, payload_bytes: int):
+    def _create_l3_l2_region(self, worker_id: int, payload_bytes: int, counter_bytes: int):
         from .l3_l2_orch_comm import L3L2OrchCommCmd, L3L2OrchCommRequest, L3L2OrchRegion  # noqa: PLC0415
 
         if payload_bytes <= 0:
             raise ValueError("create_l3_l2_region: payload_bytes must be positive")
+        if counter_bytes <= 0 or counter_bytes % 4 != 0:
+            raise ValueError("create_l3_l2_region: counter_bytes must be positive and a multiple of 4")
         response = self._l3_l2_orch_comm_submit(
             int(worker_id),
-            L3L2OrchCommRequest(cmd=L3L2OrchCommCmd.ALLOC_REGION, nbytes=int(payload_bytes)),
+            L3L2OrchCommRequest(
+                cmd=L3L2OrchCommCmd.ALLOC_REGION,
+                payload_bytes=int(payload_bytes),
+                counter_bytes=int(counter_bytes),
+            ),
             timeout_s=5.0,
         )
         if response.status != 0 or response.desc is None:
             raise RuntimeError(response.message or "create_l3_l2_region: ALLOC_REGION failed")
-        region = L3L2OrchRegion(self, int(worker_id), response.desc, int(payload_bytes))
+        region = L3L2OrchRegion(self, int(worker_id), response.desc)
         self._live_l3_l2_regions.append(region)
         return region
 

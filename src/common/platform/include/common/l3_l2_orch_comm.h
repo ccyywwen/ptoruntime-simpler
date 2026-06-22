@@ -16,18 +16,19 @@
 #include <stdint.h>
 
 static constexpr uint32_t L3L2_ORCH_COMM_MAGIC = 0x4C334C32u;  // "L3L2"
-static constexpr uint16_t L3L2_ORCH_COMM_ABI_MAJOR = 1;
+static constexpr uint16_t L3L2_ORCH_COMM_ABI_MAJOR = 2;
 static constexpr uint16_t L3L2_ORCH_COMM_ABI_MINOR = 0;
 static constexpr size_t L3L2_ORCH_REGION_DESC_SCALAR_COUNT = 6;
-static constexpr uint64_t L3L2_ORCH_COMM_SIGNAL_BYTES = 64;
+static constexpr uint64_t L3L2_ORCH_COMM_COUNTER_BYTES = sizeof(int32_t);
+static constexpr uint64_t L3L2_ORCH_COMM_COUNTER_BASE_ALIGNMENT = 64;
 
 struct L3L2OrchRegionDesc {
     uint64_t magic_version;
     uint64_t region_id;
     uint64_t payload_base;
     uint64_t payload_bytes;
-    uint64_t l3_to_l2_signal_base;
-    uint64_t l2_to_l3_signal_base;
+    uint64_t counter_base;
+    uint64_t counter_bytes;
 };
 
 enum class L3L2OrchCommCmd : uint32_t {
@@ -37,11 +38,26 @@ enum class L3L2OrchCommCmd : uint32_t {
     PAYLOAD_READ = 4,
     SIGNAL_NOTIFY = 5,
     SIGNAL_WAIT = 6,
+    SIGNAL_TEST = 7,
 };
 
-enum class L3L2OrchCommSignalSlot : uint32_t {
-    L3_TO_L2 = 0,
-    L2_TO_L3 = 1,
+enum class L3L2OrchNotifyOp : uint32_t {
+    Set = 0,
+    Add = 1,
+};
+
+enum class L3L2OrchWaitCmp : uint32_t {
+    EQ = 0,
+    NE = 1,
+    GT = 2,
+    GE = 3,
+    LT = 4,
+    LE = 5,
+};
+
+struct L3L2OrchSignalTestResult {
+    bool matched;
+    int32_t observed;
 };
 
 enum class L3L2OrchCommValidationError : uint32_t {
@@ -49,7 +65,7 @@ enum class L3L2OrchCommValidationError : uint32_t {
     BAD_MAGIC_VERSION = 1,
     BAD_REGION_ID = 2,
     BAD_PAYLOAD_RANGE = 3,
-    BAD_SIGNAL_BASE = 4,
+    BAD_COUNTER_RANGE = 4,
     OUT_OF_BOUNDS = 5,
     BAD_SCALAR_COUNT = 6,
     NULL_POINTER = 7,
@@ -57,13 +73,15 @@ enum class L3L2OrchCommValidationError : uint32_t {
 
 struct L3L2OrchCommRequest {
     uint32_t cmd;
-    uint32_t reserved0;
+    uint32_t op;
     uint64_t region_id;
-    uint64_t offset;
+    uint64_t payload_offset;
     uint64_t host_ptr;
-    uint64_t nbytes;
-    uint64_t signal_slot;
-    uint64_t seq;
+    uint64_t payload_bytes;
+    uint64_t counter_addr;
+    uint64_t counter_bytes;
+    int32_t counter_operand;
+    uint32_t reserved0;
     uint64_t timeout_ns;
 };
 
@@ -71,7 +89,8 @@ struct L3L2OrchCommResponse {
     int32_t status;
     uint32_t error_kind;
     uint64_t region_id;
-    uint64_t observed_signal;
+    int32_t observed_counter;
+    uint32_t matched;
     L3L2OrchRegionDesc desc;
     char message[256];
 };
@@ -109,6 +128,15 @@ static inline bool l3_l2_orch_comm_range_contains(uint64_t base, uint64_t size, 
     return value >= base && value < base + size;
 }
 
+static inline bool
+l3_l2_orch_comm_ranges_overlap(uint64_t first_base, uint64_t first_size, uint64_t second_base, uint64_t second_size) {
+    if (first_size == 0 || second_size == 0 || l3_l2_orch_comm_add_overflows(first_base, first_size) ||
+        l3_l2_orch_comm_add_overflows(second_base, second_size)) {
+        return false;
+    }
+    return first_base < second_base + second_size && second_base < first_base + first_size;
+}
+
 static inline L3L2OrchCommValidationError
 l3_l2_orch_comm_validate_payload_bounds(uint64_t offset, uint64_t nbytes, uint64_t payload_bytes) {
     if (nbytes == 0 || payload_bytes == 0 || l3_l2_orch_comm_add_overflows(offset, nbytes)) {
@@ -120,17 +148,15 @@ l3_l2_orch_comm_validate_payload_bounds(uint64_t offset, uint64_t nbytes, uint64
     return L3L2OrchCommValidationError::OK;
 }
 
-static inline L3L2OrchCommValidationError
-l3_l2_orch_comm_validate_signal_base(const L3L2OrchRegionDesc &desc, uint64_t signal_base) {
-    if (signal_base == 0 || !l3_l2_orch_comm_is_aligned(signal_base, L3L2_ORCH_COMM_SIGNAL_BYTES) ||
-        l3_l2_orch_comm_add_overflows(signal_base, L3L2_ORCH_COMM_SIGNAL_BYTES)) {
-        return L3L2OrchCommValidationError::BAD_SIGNAL_BASE;
+static inline L3L2OrchCommValidationError l3_l2_orch_comm_validate_counter_range(const L3L2OrchRegionDesc &desc) {
+    if (desc.counter_base == 0 || desc.counter_bytes == 0 ||
+        !l3_l2_orch_comm_is_aligned(desc.counter_base, L3L2_ORCH_COMM_COUNTER_BASE_ALIGNMENT) ||
+        (desc.counter_bytes % L3L2_ORCH_COMM_COUNTER_BYTES) != 0 ||
+        l3_l2_orch_comm_add_overflows(desc.counter_base, desc.counter_bytes)) {
+        return L3L2OrchCommValidationError::BAD_COUNTER_RANGE;
     }
-    if (l3_l2_orch_comm_range_contains(desc.payload_base, desc.payload_bytes, signal_base) ||
-        l3_l2_orch_comm_range_contains(
-            desc.payload_base, desc.payload_bytes, signal_base + L3L2_ORCH_COMM_SIGNAL_BYTES - 1
-        )) {
-        return L3L2OrchCommValidationError::BAD_SIGNAL_BASE;
+    if (l3_l2_orch_comm_ranges_overlap(desc.payload_base, desc.payload_bytes, desc.counter_base, desc.counter_bytes)) {
+        return L3L2OrchCommValidationError::BAD_COUNTER_RANGE;
     }
     return L3L2OrchCommValidationError::OK;
 }
@@ -147,13 +173,9 @@ static inline L3L2OrchCommValidationError l3_l2_orch_comm_validate_desc(const L3
         l3_l2_orch_comm_add_overflows(desc.payload_base, desc.payload_bytes)) {
         return L3L2OrchCommValidationError::BAD_PAYLOAD_RANGE;
     }
-    L3L2OrchCommValidationError signal_error = l3_l2_orch_comm_validate_signal_base(desc, desc.l3_to_l2_signal_base);
-    if (signal_error != L3L2OrchCommValidationError::OK) {
-        return signal_error;
-    }
-    signal_error = l3_l2_orch_comm_validate_signal_base(desc, desc.l2_to_l3_signal_base);
-    if (signal_error != L3L2OrchCommValidationError::OK) {
-        return signal_error;
+    L3L2OrchCommValidationError counter_error = l3_l2_orch_comm_validate_counter_range(desc);
+    if (counter_error != L3L2OrchCommValidationError::OK) {
+        return counter_error;
     }
     return L3L2OrchCommValidationError::OK;
 }
@@ -166,8 +188,8 @@ static inline bool l3_l2_orch_comm_encode_desc(const L3L2OrchRegionDesc &desc, u
     scalars[1] = desc.region_id;
     scalars[2] = desc.payload_base;
     scalars[3] = desc.payload_bytes;
-    scalars[4] = desc.l3_to_l2_signal_base;
-    scalars[5] = desc.l2_to_l3_signal_base;
+    scalars[4] = desc.counter_base;
+    scalars[5] = desc.counter_bytes;
     return true;
 }
 
@@ -199,8 +221,49 @@ static inline bool l3_l2_orch_comm_decode_desc(
     return error == L3L2OrchCommValidationError::OK;
 }
 
-static inline bool l3_l2_orch_comm_valid_signal_slot(L3L2OrchCommSignalSlot slot) {
-    return slot == L3L2OrchCommSignalSlot::L3_TO_L2 || slot == L3L2OrchCommSignalSlot::L2_TO_L3;
+static inline bool l3_l2_orch_comm_valid_notify_op(L3L2OrchNotifyOp op) {
+    return op == L3L2OrchNotifyOp::Set || op == L3L2OrchNotifyOp::Add;
+}
+
+static inline bool l3_l2_orch_comm_valid_wait_cmp(L3L2OrchWaitCmp cmp) {
+    return cmp == L3L2OrchWaitCmp::EQ || cmp == L3L2OrchWaitCmp::NE || cmp == L3L2OrchWaitCmp::GT ||
+           cmp == L3L2OrchWaitCmp::GE || cmp == L3L2OrchWaitCmp::LT || cmp == L3L2OrchWaitCmp::LE;
+}
+
+static inline bool l3_l2_orch_comm_compare_counter(int32_t observed, int32_t cmp_value, L3L2OrchWaitCmp cmp) {
+    switch (cmp) {
+    case L3L2OrchWaitCmp::EQ:
+        return observed == cmp_value;
+    case L3L2OrchWaitCmp::NE:
+        return observed != cmp_value;
+    case L3L2OrchWaitCmp::GT:
+        return observed > cmp_value;
+    case L3L2OrchWaitCmp::GE:
+        return observed >= cmp_value;
+    case L3L2OrchWaitCmp::LT:
+        return observed < cmp_value;
+    case L3L2OrchWaitCmp::LE:
+        return observed <= cmp_value;
+    default:
+        return false;
+    }
+}
+
+static inline L3L2OrchCommValidationError
+l3_l2_orch_comm_validate_counter_addr(const L3L2OrchRegionDesc &desc, uint64_t counter_addr) {
+    if (!l3_l2_orch_comm_is_aligned(counter_addr, L3L2_ORCH_COMM_COUNTER_BYTES)) {
+        return L3L2OrchCommValidationError::BAD_COUNTER_RANGE;
+    }
+    if (l3_l2_orch_comm_validate_counter_range(desc) != L3L2OrchCommValidationError::OK ||
+        l3_l2_orch_comm_add_overflows(counter_addr, L3L2_ORCH_COMM_COUNTER_BYTES) ||
+        l3_l2_orch_comm_add_overflows(desc.counter_base, desc.counter_bytes)) {
+        return L3L2OrchCommValidationError::BAD_COUNTER_RANGE;
+    }
+    if (counter_addr < desc.counter_base ||
+        counter_addr + L3L2_ORCH_COMM_COUNTER_BYTES > desc.counter_base + desc.counter_bytes) {
+        return L3L2OrchCommValidationError::OUT_OF_BOUNDS;
+    }
+    return L3L2OrchCommValidationError::OK;
 }
 
 #endif  // SRC_COMMON_PLATFORM_INCLUDE_COMMON_L3_L2_ORCH_COMM_H_

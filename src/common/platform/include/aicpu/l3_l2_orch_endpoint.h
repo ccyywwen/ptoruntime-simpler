@@ -76,8 +76,9 @@ struct L3L2EndpointError {
     L3L2EndpointErrorKind kind;
     const char *op;
     uint64_t region_id;
-    uint64_t seq;
-    uint64_t observed_signal;
+    uint64_t counter_addr;
+    int32_t counter_operand;
+    int32_t observed_counter;
     const char *message;
 };
 
@@ -119,6 +120,39 @@ public:
     const L3L2EndpointError &error() const { return error_; }
 
     const L3L2OrchRegionDesc &descriptor() const { return desc_; }
+
+    bool counter_addr(uint64_t offset, uint64_t *out_addr) {
+        if (out_addr != nullptr) {
+            *out_addr = 0;
+        }
+        if (has_error()) {
+            return false;
+        }
+        if (out_addr == nullptr) {
+            set_error(
+                L3L2EndpointErrorKind::OUT_OF_BOUNDS, "counter_addr", desc_.region_id, 0, 0,
+                "null counter address output"
+            );
+            return false;
+        }
+        if (l3_l2_orch_comm_add_overflows(desc_.counter_base, offset)) {
+            set_error(
+                L3L2EndpointErrorKind::OUT_OF_BOUNDS, "counter_addr", desc_.region_id, 0, 0,
+                "counter offset is out of bounds"
+            );
+            return false;
+        }
+        uint64_t addr = desc_.counter_base + offset;
+        if (!validate_counter_addr_for_op("counter_addr", addr, 0, 0, "counter offset is out of bounds")) {
+            return false;
+        }
+        *out_addr = addr;
+        return true;
+    }
+
+    bool validate_counter_addr(uint64_t counter_addr) const {
+        return l3_l2_orch_comm_validate_counter_addr(desc_, counter_addr) == L3L2OrchCommValidationError::OK;
+    }
 
     bool payload_read(uint64_t offset, uint64_t nbytes, L3L2OrchPayloadView *out) {
         if (out != nullptr) {
@@ -163,60 +197,106 @@ public:
         return true;
     }
 
-    bool wait(uint64_t seq, uint64_t timeout) {
+    bool signal_notify(uint64_t counter_addr, int32_t value, L3L2OrchNotifyOp op) {
         if (has_error()) {
             return false;
         }
-        if (seq == 0 || seq <= last_wait_seq_) {
-            set_error(L3L2EndpointErrorKind::SIGNAL_PROTOCOL, "wait", desc_.region_id, seq, 0, "invalid wait sequence");
+        if (!validate_counter_addr_for_op("signal_notify", counter_addr, value, 0, "invalid counter address")) {
             return false;
         }
-        volatile uint64_t *slot =
-            reinterpret_cast<volatile uint64_t *>(static_cast<uintptr_t>(desc_.l3_to_l2_signal_base));
+        if (!l3_l2_orch_comm_valid_notify_op(op)) {
+            set_error(
+                L3L2EndpointErrorKind::SIGNAL_PROTOCOL, "signal_notify", desc_.region_id, counter_addr, value,
+                "invalid notify operation"
+            );
+            return false;
+        }
+
+        volatile int32_t *counter = counter_ptr(counter_addr);
+        if (op == L3L2OrchNotifyOp::Set) {
+            *counter = value;
+        } else {
+            l3_l2_orch_endpoint_cache_invalidate_range(
+                reinterpret_cast<const void *>(static_cast<uintptr_t>(counter_addr)), sizeof(*counter)
+            );
+            *counter = static_cast<int32_t>(*counter + value);
+        }
+        l3_l2_orch_endpoint_cache_flush_range(
+            reinterpret_cast<const void *>(static_cast<uintptr_t>(counter_addr)), sizeof(*counter)
+        );
+        return true;
+    }
+
+    bool signal_test(uint64_t counter_addr, int32_t cmp_value, L3L2OrchWaitCmp cmp, L3L2OrchSignalTestResult *out) {
+        if (out != nullptr) {
+            *out = L3L2OrchSignalTestResult{false, 0};
+        }
+        if (has_error()) {
+            return false;
+        }
+        if (out == nullptr) {
+            set_error(
+                L3L2EndpointErrorKind::OUT_OF_BOUNDS, "signal_test", desc_.region_id, counter_addr, cmp_value,
+                "null signal test output"
+            );
+            return false;
+        }
+        if (!validate_counter_addr_for_op("signal_test", counter_addr, cmp_value, 0, "invalid counter address")) {
+            return false;
+        }
+        if (!l3_l2_orch_comm_valid_wait_cmp(cmp)) {
+            set_error(
+                L3L2EndpointErrorKind::SIGNAL_PROTOCOL, "signal_test", desc_.region_id, counter_addr, cmp_value,
+                "invalid wait comparison"
+            );
+            return false;
+        }
+        int32_t observed = load_counter(counter_addr);
+        *out = L3L2OrchSignalTestResult{l3_l2_orch_comm_compare_counter(observed, cmp_value, cmp), observed};
+        return true;
+    }
+
+    bool
+    signal_wait(uint64_t counter_addr, int32_t cmp_value, L3L2OrchWaitCmp cmp, uint64_t timeout, int32_t *observed) {
+        if (observed != nullptr) {
+            *observed = 0;
+        }
+        if (has_error()) {
+            return false;
+        }
+        if (observed == nullptr) {
+            set_error(
+                L3L2EndpointErrorKind::OUT_OF_BOUNDS, "signal_wait", desc_.region_id, counter_addr, cmp_value,
+                "null signal wait output"
+            );
+            return false;
+        }
+        if (!validate_counter_addr_for_op("signal_wait", counter_addr, cmp_value, 0, "invalid counter address")) {
+            return false;
+        }
+        if (!l3_l2_orch_comm_valid_wait_cmp(cmp)) {
+            set_error(
+                L3L2EndpointErrorKind::SIGNAL_PROTOCOL, "signal_wait", desc_.region_id, counter_addr, cmp_value,
+                "invalid wait comparison"
+            );
+            return false;
+        }
+
         uint64_t start = l3_l2_orch_endpoint_now();
         while (true) {
-            l3_l2_orch_endpoint_cache_invalidate_range(
-                reinterpret_cast<const void *>(static_cast<uintptr_t>(desc_.l3_to_l2_signal_base)), sizeof(*slot)
-            );
-            uint64_t observed = *slot;
-            if (observed == seq) {
-                last_wait_seq_ = seq;
+            int32_t current = load_counter(counter_addr);
+            *observed = current;
+            if (l3_l2_orch_comm_compare_counter(current, cmp_value, cmp)) {
                 return true;
-            }
-            if (observed > seq) {
-                set_error(
-                    L3L2EndpointErrorKind::SIGNAL_PROTOCOL, "wait", desc_.region_id, seq, observed,
-                    "observed a future sequence"
-                );
-                return false;
             }
             if (timeout == 0 || l3_l2_orch_endpoint_now() - start >= timeout) {
                 set_error(
-                    L3L2EndpointErrorKind::SIGNAL_TIMEOUT, "wait", desc_.region_id, seq, observed, "wait timed out"
+                    L3L2EndpointErrorKind::SIGNAL_TIMEOUT, "signal_wait", desc_.region_id, counter_addr, cmp_value,
+                    current, "wait timed out"
                 );
                 return false;
             }
         }
-    }
-
-    bool notify(uint64_t seq) {
-        if (has_error()) {
-            return false;
-        }
-        if (seq == 0 || seq <= last_notify_seq_) {
-            set_error(
-                L3L2EndpointErrorKind::SIGNAL_PROTOCOL, "notify", desc_.region_id, seq, 0, "invalid notify sequence"
-            );
-            return false;
-        }
-        volatile uint64_t *slot =
-            reinterpret_cast<volatile uint64_t *>(static_cast<uintptr_t>(desc_.l2_to_l3_signal_base));
-        *slot = seq;
-        l3_l2_orch_endpoint_cache_flush_range(
-            reinterpret_cast<const void *>(static_cast<uintptr_t>(desc_.l2_to_l3_signal_base)), sizeof(*slot)
-        );
-        last_notify_seq_ = seq;
-        return true;
     }
 
 private:
@@ -232,20 +312,50 @@ private:
         return false;
     }
 
+    bool validate_counter_addr_for_op(
+        const char *op, uint64_t counter_addr, int32_t counter_operand, int32_t observed_counter, const char *message
+    ) {
+        if (l3_l2_orch_comm_validate_counter_addr(desc_, counter_addr) == L3L2OrchCommValidationError::OK) {
+            return true;
+        }
+        set_error(
+            L3L2EndpointErrorKind::OUT_OF_BOUNDS, op, desc_.region_id, counter_addr, counter_operand, observed_counter,
+            message
+        );
+        return false;
+    }
+
+    volatile int32_t *counter_ptr(uint64_t counter_addr) {
+        return reinterpret_cast<volatile int32_t *>(static_cast<uintptr_t>(counter_addr));
+    }
+
+    int32_t load_counter(uint64_t counter_addr) {
+        volatile int32_t *counter = counter_ptr(counter_addr);
+        l3_l2_orch_endpoint_cache_invalidate_range(
+            reinterpret_cast<const void *>(static_cast<uintptr_t>(counter_addr)), sizeof(*counter)
+        );
+        return *counter;
+    }
+
     void set_error(
-        L3L2EndpointErrorKind kind, const char *op, uint64_t region_id, uint64_t seq, uint64_t observed_signal,
+        L3L2EndpointErrorKind kind, const char *op, uint64_t region_id, uint64_t counter_addr, int32_t counter_operand,
         const char *message
+    ) {
+        set_error(kind, op, region_id, counter_addr, counter_operand, 0, message);
+    }
+
+    void set_error(
+        L3L2EndpointErrorKind kind, const char *op, uint64_t region_id, uint64_t counter_addr, int32_t counter_operand,
+        int32_t observed_counter, const char *message
     ) {
         if (has_error()) {
             return;
         }
-        error_ = L3L2EndpointError{kind, op, region_id, seq, observed_signal, message};
+        error_ = L3L2EndpointError{kind, op, region_id, counter_addr, counter_operand, observed_counter, message};
     }
 
     L3L2OrchRegionDesc desc_{};
-    L3L2EndpointError error_{L3L2EndpointErrorKind::NONE, "", 0, 0, 0, ""};
-    uint64_t last_wait_seq_{0};
-    uint64_t last_notify_seq_{0};
+    L3L2EndpointError error_{L3L2EndpointErrorKind::NONE, "", 0, 0, 0, 0, ""};
 };
 
 #endif  // SRC_COMMON_PLATFORM_INCLUDE_AICPU_L3_L2_ORCH_ENDPOINT_H_

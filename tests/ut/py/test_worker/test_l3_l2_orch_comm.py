@@ -9,10 +9,22 @@
 
 import ctypes
 import struct
+import threading
+import time
 from multiprocessing.shared_memory import SharedMemory
 
 import pytest
-from simpler.l3_l2_orch_comm import L3L2OrchCommCmd, L3L2OrchCommResponse, L3L2OrchRegionDesc
+import simpler.l3_l2_orch_comm as l3_l2_orch_comm
+from simpler.l3_l2_orch_comm import (
+    L3L2OrchCommCmd,
+    L3L2OrchCommClient,
+    L3L2OrchCommRequest,
+    L3L2OrchCommResponse,
+    L3L2OrchRegionDesc,
+    NotifyOp,
+    SignalTestResult,
+    WaitCmp,
+)
 from simpler.task_interface import ContinuousTensor, DataType
 from simpler.worker import (
     _IDLE,
@@ -52,7 +64,8 @@ class _EndpointFailingOrch:
 
     def _drain(self) -> None:
         raise RuntimeError(
-            "child failed: L3-L2 endpoint error op=wait kind=3 region=2 seq=7 observed=0 msg=wait timed out"
+            "child failed: L3-L2 endpoint error op=signal_wait kind=3 region=2 "
+            "counter_addr=0x200000 counter_operand=7 observed_counter=0 msg=wait timed out"
         )
 
 
@@ -60,6 +73,7 @@ class _FakeClient:
     def __init__(self):
         self.requests = []
         self.next_region_id = 1
+        self.wait_timeout_once = False
 
     def submit(self, request, timeout_s: float):
         self.requests.append((request, timeout_s))
@@ -71,22 +85,46 @@ class _FakeClient:
                 status=0,
                 error_kind=0,
                 region_id=region_id,
-                observed_signal=0,
+                observed_counter=0,
+                matched=False,
                 desc=L3L2OrchRegionDesc(
-                    magic_version=0x4C334C3200010000,
+                    magic_version=0x4C334C3200020000,
                     region_id=region_id,
                     payload_base=0x100000 + region_id * 0x1000,
-                    payload_bytes=request.nbytes,
-                    l3_to_l2_signal_base=0x200000 + region_id * 0x1000,
-                    l2_to_l3_signal_base=0x300000 + region_id * 0x1000,
+                    payload_bytes=request.payload_bytes,
+                    counter_base=0x200000 + region_id * 0x1000,
+                    counter_bytes=request.counter_bytes,
                 ),
+                message="",
+            )
+        if request.cmd == L3L2OrchCommCmd.SIGNAL_WAIT and self.wait_timeout_once:
+            self.wait_timeout_once = False
+            return L3L2OrchCommResponse(
+                status=-1,
+                error_kind=7,
+                region_id=request.region_id,
+                observed_counter=2,
+                matched=False,
+                desc=None,
+                message="SIGNAL_WAIT timed out",
+            )
+        if request.cmd == L3L2OrchCommCmd.SIGNAL_TEST:
+            matched = request.counter_operand <= 3
+            return L3L2OrchCommResponse(
+                status=0,
+                error_kind=0,
+                region_id=request.region_id,
+                observed_counter=3,
+                matched=matched,
+                desc=None,
                 message="",
             )
         return L3L2OrchCommResponse(
             status=0,
             error_kind=0,
             region_id=request.region_id,
-            observed_signal=request.seq,
+            observed_counter=request.counter_operand,
+            matched=True,
             desc=None,
             message="",
         )
@@ -107,12 +145,94 @@ def _make_started_worker(mailbox_state: int = _IDLE) -> tuple[Worker, SharedMemo
     return worker, shm, fake_c_worker, fake_client
 
 
+def test_control_client_packs_counter_request_and_unpacks_signal_response():
+    shm = SharedMemory(create=True, size=l3_l2_orch_comm.CONTROL_SHM_SIZE)
+    captured = {}
+    try:
+        client = L3L2OrchCommClient(shm)
+        assert shm.buf is not None
+        state_addr = ctypes.addressof(ctypes.c_char.from_buffer(shm.buf)) + l3_l2_orch_comm._CONTROL_OFF_STATE
+
+        def service_once() -> None:
+            deadline = time.monotonic() + 1.0
+            while l3_l2_orch_comm._mailbox_load_i32(state_addr) != l3_l2_orch_comm._STATE_READY:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("test service timed out waiting for READY")
+                time.sleep(0.00005)
+            captured["request"] = l3_l2_orch_comm._REQUEST.unpack_from(
+                shm.buf, l3_l2_orch_comm._CONTROL_OFF_REQUEST
+            )
+            message = b"matched"
+            l3_l2_orch_comm._RESPONSE.pack_into(
+                shm.buf,
+                l3_l2_orch_comm._CONTROL_OFF_RESPONSE,
+                0,
+                0,
+                17,
+                11,
+                1,
+                0x4C334C3200020000,
+                17,
+                0x100000,
+                64,
+                0x200000,
+                128,
+                message + b"\x00" * (256 - len(message)),
+            )
+            l3_l2_orch_comm._mailbox_store_i32(state_addr, l3_l2_orch_comm._STATE_DONE)
+
+        thread = threading.Thread(target=service_once)
+        thread.start()
+        response = client.submit(
+            L3L2OrchCommRequest(
+                cmd=L3L2OrchCommCmd.SIGNAL_TEST,
+                op=int(WaitCmp.GE),
+                region_id=17,
+                counter_addr=0x200040,
+                counter_operand=11,
+            ),
+            timeout_s=1.0,
+        )
+        thread.join(timeout=1.0)
+        assert not thread.is_alive()
+
+        assert captured["request"] == (
+            int(L3L2OrchCommCmd.SIGNAL_TEST),
+            int(WaitCmp.GE),
+            17,
+            0,
+            0,
+            0,
+            0x200040,
+            0,
+            11,
+            0,
+            0,
+        )
+        assert response.status == 0
+        assert response.region_id == 17
+        assert response.observed_counter == 11
+        assert response.matched is True
+        assert response.desc == L3L2OrchRegionDesc(
+            magic_version=0x4C334C3200020000,
+            region_id=17,
+            payload_base=0x100000,
+            payload_bytes=64,
+            counter_base=0x200000,
+            counter_bytes=128,
+        )
+        assert response.message == "matched"
+    finally:
+        shm.close()
+        shm.unlink()
+
+
 def test_first_region_bootstraps_and_second_region_reuses_ready_service():
     worker, shm, fake_c_worker, fake_client = _make_started_worker()
     try:
-        first = worker._create_l3_l2_region(0, 128)
+        first = worker._create_l3_l2_region(0, 128, 128)
         _mailbox_store_i32(_buffer_field_addr(shm.buf, _OFF_STATE), _TASK_READY)
-        second = worker._create_l3_l2_region(0, 256)
+        second = worker._create_l3_l2_region(0, 256, 128)
 
         assert len(fake_c_worker.bootstrap_calls) == 1
         assert first.descriptor_scalars()[1] == 1
@@ -128,7 +248,7 @@ def test_bootstrap_fails_immediately_when_worker_busy_and_service_not_ready():
     worker, shm, fake_c_worker, _fake_client = _make_started_worker(mailbox_state=_TASK_READY)
     try:
         with pytest.raises(RuntimeError, match="bootstrap.*busy"):
-            worker._create_l3_l2_region(0, 128)
+            worker._create_l3_l2_region(0, 128, 128)
         assert fake_c_worker.bootstrap_calls == []
     finally:
         worker._close_l3_l2_orch_comm()
@@ -143,7 +263,7 @@ def test_bootstrap_unsupported_failure_leaves_no_partial_service_state():
     try:
         for _ in range(2):
             with pytest.raises(RuntimeError, match="not supported"):
-                worker._create_l3_l2_region(0, 128)
+                worker._create_l3_l2_region(0, 128, 128)
             assert worker._l3_l2_orch_comm_ready == set()
             assert worker._l3_l2_orch_comm_clients == {}
             assert worker._l3_l2_orch_comm_shms == {}
@@ -155,26 +275,40 @@ def test_bootstrap_unsupported_failure_leaves_no_partial_service_state():
         shm.unlink()
 
 
-def test_region_payload_and_signal_commands_use_service_client():
+def test_region_payload_and_counter_commands_use_service_client():
     worker, shm, _fake_c_worker, fake_client = _make_started_worker()
     try:
-        region = worker._create_l3_l2_region(0, 16)
+        region = worker._create_l3_l2_region(0, 16, 128)
 
         payload = ContinuousTensor.make(0x1000, (16,), DataType.UINT8)
         worker._register_l3_l2_orch_comm_host_buffer(payload)
 
         region.payload_write(4, payload, nbytes=4)
         region.payload_read(8, payload, nbytes=4)
-        region.notify(3)
-        region.wait(3, timeout=0.001)
+        counter = region.counter(64)
+        counter.notify(3, NotifyOp.Set)
+        result = counter.test(3, WaitCmp.GE)
+        observed = counter.wait(3, WaitCmp.GE, timeout=0.001)
 
         assert [req.cmd for req, _timeout in fake_client.requests] == [
             L3L2OrchCommCmd.ALLOC_REGION,
             L3L2OrchCommCmd.PAYLOAD_WRITE,
             L3L2OrchCommCmd.PAYLOAD_READ,
             L3L2OrchCommCmd.SIGNAL_NOTIFY,
+            L3L2OrchCommCmd.SIGNAL_TEST,
             L3L2OrchCommCmd.SIGNAL_WAIT,
         ]
+        alloc_req = fake_client.requests[0][0]
+        assert alloc_req.payload_bytes == 16
+        assert alloc_req.counter_bytes == 128
+        notify_req = fake_client.requests[3][0]
+        assert notify_req.counter_addr == region.descriptor.counter_base + 64
+        assert notify_req.counter_operand == 3
+        assert notify_req.op == int(NotifyOp.Set)
+        test_req = fake_client.requests[4][0]
+        assert test_req.op == int(WaitCmp.GE)
+        assert result == SignalTestResult(matched=True, observed=3)
+        assert observed == 3
     finally:
         worker._close_l3_l2_orch_comm()
         shm.close()
@@ -184,7 +318,7 @@ def test_region_payload_and_signal_commands_use_service_client():
 def test_precommand_validation_failure_does_not_poison_region():
     worker, shm, _fake_c_worker, fake_client = _make_started_worker()
     try:
-        region = worker._create_l3_l2_region(0, 4)
+        region = worker._create_l3_l2_region(0, 4, 128)
         with pytest.raises(ValueError, match="exceeds region size"):
             payload = ContinuousTensor.make(0x1000, (1,), DataType.UINT8)
             worker._register_l3_l2_orch_comm_host_buffer(payload)
@@ -200,7 +334,7 @@ def test_precommand_validation_failure_does_not_poison_region():
 def test_private_python_payload_buffer_fails_before_service_submission_without_poisoning():
     worker, shm, _fake_c_worker, fake_client = _make_started_worker()
     try:
-        region = worker._create_l3_l2_region(0, 4)
+        region = worker._create_l3_l2_region(0, 4, 128)
         with pytest.raises(ValueError, match="ContinuousTensor.*orch.alloc"):
             region.payload_write(0, bytearray(struct.pack("<I", 0x12345678)))
         assert region.descriptor_scalars()[1] == 1
@@ -214,7 +348,7 @@ def test_private_python_payload_buffer_fails_before_service_submission_without_p
 def test_unregistered_continuous_tensor_fails_before_service_submission_without_poisoning():
     worker, shm, _fake_c_worker, fake_client = _make_started_worker()
     try:
-        region = worker._create_l3_l2_region(0, 4)
+        region = worker._create_l3_l2_region(0, 4, 128)
         payload = ContinuousTensor.make(0x1000, (4,), DataType.UINT8)
         with pytest.raises(ValueError, match="not registered"):
             region.payload_write(0, payload)
@@ -229,7 +363,7 @@ def test_unregistered_continuous_tensor_fails_before_service_submission_without_
 def test_cleanup_expires_region_handles_after_physical_free():
     worker, shm, _fake_c_worker, fake_client = _make_started_worker()
     try:
-        region = worker._create_l3_l2_region(0, 4)
+        region = worker._create_l3_l2_region(0, 4, 128)
         worker._cleanup_l3_l2_regions()
         with pytest.raises(RuntimeError, match="expired"):
             region.descriptor_scalars()
@@ -252,8 +386,8 @@ def test_endpoint_region_error_poisons_only_matching_live_region_during_drain():
     try:
 
         def orch(_orch_handle, _args, _cfg):
-            regions.append(worker._create_l3_l2_region(0, 32))
-            regions.append(worker._create_l3_l2_region(0, 64))
+            regions.append(worker._create_l3_l2_region(0, 32, 128))
+            regions.append(worker._create_l3_l2_region(0, 64, 128))
 
         with pytest.raises(RuntimeError, match="L3-L2 endpoint error.*region=2"):
             worker.run(orch)
@@ -269,6 +403,38 @@ def test_endpoint_region_error_poisons_only_matching_live_region_during_drain():
             L3L2OrchCommCmd.FREE_REGION,
             L3L2OrchCommCmd.FREE_REGION,
         ]
+    finally:
+        worker._close_l3_l2_orch_comm()
+        shm.close()
+        shm.unlink()
+
+
+def test_counter_offset_validation_fails_before_service_submission_without_poisoning():
+    worker, shm, _fake_c_worker, fake_client = _make_started_worker()
+    try:
+        region = worker._create_l3_l2_region(0, 4, 128)
+        for bad_offset in (-4, 2, 128):
+            with pytest.raises(ValueError, match="counter offset"):
+                region.counter(bad_offset)
+        assert region.descriptor_scalars()[1] == 1
+        assert len(fake_client.requests) == 1
+    finally:
+        worker._close_l3_l2_orch_comm()
+        shm.close()
+        shm.unlink()
+
+
+def test_counter_wait_timeout_does_not_poison_region():
+    worker, shm, _fake_c_worker, fake_client = _make_started_worker()
+    try:
+        region = worker._create_l3_l2_region(0, 4, 128)
+        counter = region.counter(0)
+        fake_client.wait_timeout_once = True
+        with pytest.raises(TimeoutError, match="observed=2"):
+            counter.wait(3, WaitCmp.GE, timeout=0.001)
+        assert region.descriptor_scalars()[1] == 1
+        counter.notify(3, NotifyOp.Set)
+        assert fake_client.requests[-1][0].cmd == L3L2OrchCommCmd.SIGNAL_NOTIFY
     finally:
         worker._close_l3_l2_orch_comm()
         shm.close()
@@ -298,7 +464,7 @@ def test_sim_worker_region_payload_roundtrip(platform):
             buf = buf_t.from_address(int(host.data))
             for i in range(16):
                 buf[i] = (i + 41) & 0xFF
-            region = orch_handle.create_l3_l2_region(worker_id=0, payload_bytes=16)
+            region = orch_handle.create_l3_l2_region(worker_id=0, payload_bytes=16, counter_bytes=128)
             region.payload_write(0, host)
             for i in range(16):
                 buf[i] = 0
@@ -311,7 +477,7 @@ def test_sim_worker_region_payload_roundtrip(platform):
 
 
 @pytest.mark.parametrize("platform", ["a2a3sim", "a5sim"])
-def test_sim_worker_wait_timeout_poisons_region_and_free_is_idempotent(platform):
+def test_sim_worker_counter_wait_timeout_does_not_poison_region_and_free_is_idempotent(platform):
     try:
         RuntimeBuilder(platform=platform).get_binaries("tensormap_and_ringbuffer")
     except FileNotFoundError as e:
@@ -328,11 +494,10 @@ def test_sim_worker_wait_timeout_poisons_region_and_free_is_idempotent(platform)
     try:
 
         def orch(orch_handle, _args, _cfg):
-            region = orch_handle.create_l3_l2_region(worker_id=0, payload_bytes=16)
-            with pytest.raises(RuntimeError, match="timed out"):
-                region.wait(1, timeout=0.001)
-            with pytest.raises(RuntimeError, match="poisoned"):
-                region.descriptor_scalars()
+            region = orch_handle.create_l3_l2_region(worker_id=0, payload_bytes=16, counter_bytes=128)
+            with pytest.raises(TimeoutError, match="observed=0"):
+                region.counter(0).wait(1, WaitCmp.EQ, timeout=0.001)
+            assert region.descriptor_scalars()[1] != 0
             region.free()
             region.free()
 

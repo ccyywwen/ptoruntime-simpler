@@ -74,8 +74,8 @@ private:
         uint64_t region_id{0};
         void *payload_dev{nullptr};
         uint64_t payload_bytes{0};
-        void *l3_to_l2_signal_dev{nullptr};
-        void *l2_to_l3_signal_dev{nullptr};
+        void *counter_dev{nullptr};
+        uint64_t counter_bytes{0};
         bool poisoned{false};
     };
 
@@ -86,9 +86,12 @@ private:
     void payload_write(const L3L2OrchCommRequest &request, L3L2OrchCommResponse *response);
     void payload_read(const L3L2OrchCommRequest &request, L3L2OrchCommResponse *response);
     void signal_notify(const L3L2OrchCommRequest &request, L3L2OrchCommResponse *response);
+    void signal_test(const L3L2OrchCommRequest &request, L3L2OrchCommResponse *response);
     void signal_wait(const L3L2OrchCommRequest &request, L3L2OrchCommResponse *response);
 
     Region *find_live_region(uint64_t region_id, L3L2OrchCommResponse *response);
+    L3L2OrchRegionDesc desc_for_region(const Region &region) const;
+    void *counter_ptr(Region &region, uint64_t counter_addr, L3L2OrchCommResponse *response);
     void release_region(Region &region);
     void release_all_regions();
 

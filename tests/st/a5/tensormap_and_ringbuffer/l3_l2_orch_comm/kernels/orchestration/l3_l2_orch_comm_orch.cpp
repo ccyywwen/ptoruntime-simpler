@@ -19,7 +19,7 @@ namespace {
 constexpr uint32_t kChannelData = 1;
 constexpr uint32_t kChannelStop = 2;
 constexpr uint32_t kTransformFuncId = 0;
-constexpr int kExpectedArgCount = 12;
+constexpr int kExpectedArgCount = 14;
 
 struct ChannelHeader {
     uint64_t seq;
@@ -30,9 +30,11 @@ struct ChannelHeader {
 void report_endpoint_error(const L3L2OrchEndpoint &endpoint) {
     const L3L2EndpointError &err = endpoint.error();
     rt_report_fatal(
-        PTO2_ERROR_EXPLICIT_ORCH_FATAL, "L3-L2 endpoint error op=%s kind=%u region=%llu seq=%llu observed=%llu msg=%s",
+        PTO2_ERROR_EXPLICIT_ORCH_FATAL,
+        "L3-L2 endpoint error op=%s kind=%u region=%llu counter_addr=%llu counter_operand=%d observed_counter=%d "
+        "msg=%s",
         err.op, static_cast<unsigned>(err.kind), static_cast<unsigned long long>(err.region_id),
-        static_cast<unsigned long long>(err.seq), static_cast<unsigned long long>(err.observed_signal), err.message
+        static_cast<unsigned long long>(err.counter_addr), err.counter_operand, err.observed_counter, err.message
     );
 }
 
@@ -52,8 +54,7 @@ bool read_payload_or_fail(L3L2OrchEndpoint &endpoint, uint64_t offset, uint64_t 
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const L2TaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{.expected_arg_count = kExpectedArgCount};
 }
@@ -75,11 +76,22 @@ __attribute__((visibility("default"))) void l3_l2_orch_comm_orchestration(const 
     const DataType dtype = static_cast<DataType>(orch_args.scalar(9));
     const uint64_t tensor_nbytes = orch_args.scalar(10);
     const float scalar = from_u64<float>(orch_args.scalar(11));
+    const uint64_t data_ready_counter_offset = orch_args.scalar(12);
+    const uint64_t completion_counter_offset = orch_args.scalar(13);
     const uint64_t timeout = 5000000000ULL;
     uint32_t shape[1] = {numel};
+    uint64_t data_ready_counter_addr = 0;
+    uint64_t completion_counter_addr = 0;
+    if (!endpoint.counter_addr(data_ready_counter_offset, &data_ready_counter_addr) ||
+        !endpoint.counter_addr(completion_counter_offset, &completion_counter_addr)) {
+        report_endpoint_error(endpoint);
+        return;
+    }
 
     for (uint64_t seq = 1;; ++seq) {
-        if (!endpoint.wait(seq, timeout)) {
+        const int32_t signal_value = static_cast<int32_t>(seq);
+        int32_t observed = 0;
+        if (!endpoint.signal_wait(data_ready_counter_addr, signal_value, L3L2OrchWaitCmp::GE, timeout, &observed)) {
             report_endpoint_error(endpoint);
             return;
         }
@@ -128,7 +140,7 @@ __attribute__((visibility("default"))) void l3_l2_orch_comm_orchestration(const 
 
         uint32_t first_index[1] = {0};
         (void)get_tensor_data<float>(output, 1, first_index);
-        if (!endpoint.notify(seq)) {
+        if (!endpoint.signal_notify(completion_counter_addr, signal_value, L3L2OrchNotifyOp::Set)) {
             report_endpoint_error(endpoint);
             return;
         }

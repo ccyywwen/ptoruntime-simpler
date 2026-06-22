@@ -214,7 +214,7 @@ void *SimDeviceRunnerBase::l3_l2_allocate_region_bytes(uint64_t bytes) {
         return nullptr;
     }
     void *ptr = nullptr;
-    if (posix_memalign(&ptr, L3L2_ORCH_COMM_SIGNAL_BYTES, static_cast<size_t>(bytes)) != 0) {
+    if (posix_memalign(&ptr, L3L2_ORCH_COMM_COUNTER_BASE_ALIGNMENT, static_cast<size_t>(bytes)) != 0) {
         return nullptr;
     }
     std::lock_guard<std::mutex> lk(l3_l2_alloc_mu_);

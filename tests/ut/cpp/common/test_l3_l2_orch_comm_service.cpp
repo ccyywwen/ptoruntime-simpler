@@ -88,10 +88,11 @@ struct ServiceFixture : public ::testing::Test {
 
     void TearDown() override { service.stop(); }
 
-    L3L2OrchRegionDesc alloc_region(uint64_t payload_bytes = 128) {
+    L3L2OrchRegionDesc alloc_region(uint64_t payload_bytes = 128, uint64_t counter_bytes = 128) {
         L3L2OrchCommRequest req{};
         req.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::ALLOC_REGION);
-        req.nbytes = payload_bytes;
+        req.payload_bytes = payload_bytes;
+        req.counter_bytes = counter_bytes;
         L3L2OrchCommResponse resp = submit(req);
         EXPECT_EQ(resp.status, 0) << resp.message;
         EXPECT_EQ(l3_l2_orch_comm_validate_desc(resp.desc), L3L2OrchCommValidationError::OK);
@@ -104,22 +105,60 @@ struct ServiceFixture : public ::testing::Test {
         EXPECT_EQ(rc, 0) << "client timed out";
         return resp;
     }
+
+    L3L2OrchCommResponse
+    notify(const L3L2OrchRegionDesc &desc, uint64_t counter_addr, int32_t value, L3L2OrchNotifyOp op) {
+        L3L2OrchCommRequest req{};
+        req.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::SIGNAL_NOTIFY);
+        req.region_id = desc.region_id;
+        req.counter_addr = counter_addr;
+        req.counter_operand = value;
+        req.op = static_cast<uint32_t>(op);
+        return submit(req);
+    }
+
+    L3L2OrchCommResponse
+    test(const L3L2OrchRegionDesc &desc, uint64_t counter_addr, int32_t cmp_value, L3L2OrchWaitCmp cmp) {
+        L3L2OrchCommRequest req{};
+        req.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::SIGNAL_TEST);
+        req.region_id = desc.region_id;
+        req.counter_addr = counter_addr;
+        req.counter_operand = cmp_value;
+        req.op = static_cast<uint32_t>(cmp);
+        return submit(req);
+    }
+
+    L3L2OrchCommResponse wait(
+        const L3L2OrchRegionDesc &desc, uint64_t counter_addr, int32_t cmp_value, L3L2OrchWaitCmp cmp,
+        uint64_t timeout_ns
+    ) {
+        L3L2OrchCommRequest req{};
+        req.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::SIGNAL_WAIT);
+        req.region_id = desc.region_id;
+        req.counter_addr = counter_addr;
+        req.counter_operand = cmp_value;
+        req.op = static_cast<uint32_t>(cmp);
+        req.timeout_ns = timeout_ns;
+        return submit(req);
+    }
 };
 
-TEST_F(ServiceFixture, AllocRegionReturnsDescriptorAndInitializesSignals) {
+TEST_F(ServiceFixture, AllocRegionReturnsDescriptorAndInitializesCounters) {
     L3L2OrchRegionDesc desc = alloc_region();
 
-    L3L2OrchCommRequest wait_req{};
-    wait_req.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::SIGNAL_WAIT);
-    wait_req.region_id = desc.region_id;
-    wait_req.signal_slot = static_cast<uint64_t>(L3L2OrchCommSignalSlot::L2_TO_L3);
-    wait_req.seq = 1;
-    wait_req.timeout_ns = 1000000;
+    EXPECT_EQ(desc.counter_bytes, 128u);
+    EXPECT_EQ(desc.counter_base % L3L2_ORCH_COMM_COUNTER_BASE_ALIGNMENT, 0u);
 
-    L3L2OrchCommResponse resp = submit(wait_req);
-    EXPECT_NE(resp.status, 0);
-    EXPECT_EQ(resp.region_id, desc.region_id);
-    EXPECT_EQ(resp.observed_signal, 0u);
+    L3L2OrchCommResponse first = test(desc, desc.counter_base, 0, L3L2OrchWaitCmp::EQ);
+    EXPECT_EQ(first.status, 0) << first.message;
+    EXPECT_EQ(first.observed_counter, 0);
+    EXPECT_EQ(first.matched, 1u);
+
+    uint64_t last_addr = desc.counter_base + desc.counter_bytes - sizeof(int32_t);
+    L3L2OrchCommResponse last = test(desc, last_addr, 0, L3L2OrchWaitCmp::EQ);
+    EXPECT_EQ(last.status, 0) << last.message;
+    EXPECT_EQ(last.observed_counter, 0);
+    EXPECT_EQ(last.matched, 1u);
 }
 
 TEST_F(ServiceFixture, PayloadWriteAndReadRoundTripThroughService) {
@@ -130,68 +169,111 @@ TEST_F(ServiceFixture, PayloadWriteAndReadRoundTripThroughService) {
     L3L2OrchCommRequest write_req{};
     write_req.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::PAYLOAD_WRITE);
     write_req.region_id = desc.region_id;
-    write_req.offset = 16;
+    write_req.payload_offset = 16;
     write_req.host_ptr = reinterpret_cast<uint64_t>(src);
-    write_req.nbytes = sizeof(src);
+    write_req.payload_bytes = sizeof(src);
     EXPECT_EQ(submit(write_req).status, 0);
 
     L3L2OrchCommRequest read_req{};
     read_req.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::PAYLOAD_READ);
     read_req.region_id = desc.region_id;
-    read_req.offset = 16;
+    read_req.payload_offset = 16;
     read_req.host_ptr = reinterpret_cast<uint64_t>(dst);
-    read_req.nbytes = sizeof(dst);
+    read_req.payload_bytes = sizeof(dst);
     EXPECT_EQ(submit(read_req).status, 0);
 
     EXPECT_EQ(std::memcmp(src, dst, sizeof(src)), 0);
 }
 
-TEST_F(ServiceFixture, NotifyThenWaitSucceedsForExactSequence) {
+TEST_F(ServiceFixture, SignalNotifySetAndAddUpdateCounter) {
     L3L2OrchRegionDesc desc = alloc_region();
+    uint64_t counter_addr = desc.counter_base + 64;
 
-    L3L2OrchCommRequest notify_req{};
-    notify_req.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::SIGNAL_NOTIFY);
-    notify_req.region_id = desc.region_id;
-    notify_req.signal_slot = static_cast<uint64_t>(L3L2OrchCommSignalSlot::L2_TO_L3);
-    notify_req.seq = 3;
-    EXPECT_EQ(submit(notify_req).status, 0);
+    EXPECT_EQ(notify(desc, counter_addr, 3, L3L2OrchNotifyOp::Set).status, 0);
+    L3L2OrchCommResponse set_resp = test(desc, counter_addr, 3, L3L2OrchWaitCmp::EQ);
+    EXPECT_EQ(set_resp.status, 0) << set_resp.message;
+    EXPECT_EQ(set_resp.observed_counter, 3);
+    EXPECT_EQ(set_resp.matched, 1u);
 
-    L3L2OrchCommRequest wait_req{};
-    wait_req.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::SIGNAL_WAIT);
-    wait_req.region_id = desc.region_id;
-    wait_req.signal_slot = static_cast<uint64_t>(L3L2OrchCommSignalSlot::L2_TO_L3);
-    wait_req.seq = 3;
-    wait_req.timeout_ns = 100000000;
-    EXPECT_EQ(submit(wait_req).status, 0);
+    EXPECT_EQ(notify(desc, counter_addr, -2, L3L2OrchNotifyOp::Add).status, 0);
+    L3L2OrchCommResponse add_resp = test(desc, counter_addr, 1, L3L2OrchWaitCmp::EQ);
+    EXPECT_EQ(add_resp.status, 0) << add_resp.message;
+    EXPECT_EQ(add_resp.observed_counter, 1);
+    EXPECT_EQ(add_resp.matched, 1u);
 }
 
-TEST_F(ServiceFixture, SignalWaitGreaterObservedValuePoisonsRegion) {
+TEST_F(ServiceFixture, SignalTestMismatchReturnsObservedAndKeepsRegionUsable) {
     L3L2OrchRegionDesc desc = alloc_region();
+    uint64_t counter_addr = desc.counter_base;
 
-    L3L2OrchCommRequest notify_req{};
-    notify_req.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::SIGNAL_NOTIFY);
-    notify_req.region_id = desc.region_id;
-    notify_req.signal_slot = static_cast<uint64_t>(L3L2OrchCommSignalSlot::L2_TO_L3);
-    notify_req.seq = 5;
-    EXPECT_EQ(submit(notify_req).status, 0);
-
-    L3L2OrchCommRequest wait_req{};
-    wait_req.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::SIGNAL_WAIT);
-    wait_req.region_id = desc.region_id;
-    wait_req.signal_slot = static_cast<uint64_t>(L3L2OrchCommSignalSlot::L2_TO_L3);
-    wait_req.seq = 4;
-    wait_req.timeout_ns = 100000000;
-    L3L2OrchCommResponse wait_resp = submit(wait_req);
-    EXPECT_NE(wait_resp.status, 0);
-    EXPECT_EQ(wait_resp.observed_signal, 5u);
+    EXPECT_EQ(notify(desc, counter_addr, 4, L3L2OrchNotifyOp::Set).status, 0);
+    L3L2OrchCommResponse test_resp = test(desc, counter_addr, 5, L3L2OrchWaitCmp::GE);
+    EXPECT_EQ(test_resp.status, 0) << test_resp.message;
+    EXPECT_EQ(test_resp.observed_counter, 4);
+    EXPECT_EQ(test_resp.matched, 0u);
 
     uint8_t byte = 1;
     L3L2OrchCommRequest write_req{};
     write_req.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::PAYLOAD_WRITE);
     write_req.region_id = desc.region_id;
     write_req.host_ptr = reinterpret_cast<uint64_t>(&byte);
-    write_req.nbytes = sizeof(byte);
-    EXPECT_NE(submit(write_req).status, 0);
+    write_req.payload_bytes = sizeof(byte);
+    EXPECT_EQ(submit(write_req).status, 0);
+}
+
+TEST_F(ServiceFixture, SignalTestCoversAllWaitCmpValues) {
+    L3L2OrchRegionDesc desc = alloc_region();
+    uint64_t counter_addr = desc.counter_base;
+
+    EXPECT_EQ(notify(desc, counter_addr, 5, L3L2OrchNotifyOp::Set).status, 0);
+
+    EXPECT_EQ(test(desc, counter_addr, 5, L3L2OrchWaitCmp::EQ).matched, 1u);
+    EXPECT_EQ(test(desc, counter_addr, 6, L3L2OrchWaitCmp::NE).matched, 1u);
+    EXPECT_EQ(test(desc, counter_addr, 4, L3L2OrchWaitCmp::GT).matched, 1u);
+    EXPECT_EQ(test(desc, counter_addr, 5, L3L2OrchWaitCmp::GE).matched, 1u);
+    EXPECT_EQ(test(desc, counter_addr, 6, L3L2OrchWaitCmp::LT).matched, 1u);
+    EXPECT_EQ(test(desc, counter_addr, 5, L3L2OrchWaitCmp::LE).matched, 1u);
+    EXPECT_EQ(test(desc, counter_addr, 4, L3L2OrchWaitCmp::LT).matched, 0u);
+}
+
+TEST_F(ServiceFixture, SignalWaitPollsUntilMatchAndReturnsObserved) {
+    L3L2OrchRegionDesc desc = alloc_region();
+    uint64_t counter_addr = desc.counter_base + 64;
+
+    EXPECT_EQ(notify(desc, counter_addr, 7, L3L2OrchNotifyOp::Set).status, 0);
+    L3L2OrchCommResponse wait_resp = wait(desc, counter_addr, 5, L3L2OrchWaitCmp::GE, 100000000);
+    EXPECT_EQ(wait_resp.status, 0) << wait_resp.message;
+    EXPECT_EQ(wait_resp.observed_counter, 7);
+    EXPECT_EQ(wait_resp.matched, 1u);
+}
+
+TEST_F(ServiceFixture, SignalWaitTimeoutReturnsObservedAndDoesNotPoisonRegion) {
+    L3L2OrchRegionDesc desc = alloc_region();
+    uint64_t counter_addr = desc.counter_base;
+
+    EXPECT_EQ(notify(desc, counter_addr, 2, L3L2OrchNotifyOp::Set).status, 0);
+    L3L2OrchCommResponse wait_resp = wait(desc, counter_addr, 3, L3L2OrchWaitCmp::GE, 1000000);
+    EXPECT_NE(wait_resp.status, 0);
+    EXPECT_EQ(wait_resp.observed_counter, 2);
+    EXPECT_EQ(wait_resp.matched, 0u);
+
+    EXPECT_EQ(notify(desc, counter_addr, 3, L3L2OrchNotifyOp::Set).status, 0);
+    L3L2OrchCommResponse test_resp = test(desc, counter_addr, 3, L3L2OrchWaitCmp::EQ);
+    EXPECT_EQ(test_resp.status, 0) << test_resp.message;
+    EXPECT_EQ(test_resp.matched, 1u);
+}
+
+TEST_F(ServiceFixture, SignalOperationsRejectInvalidCounterAddressWithoutPoisoningRegion) {
+    L3L2OrchRegionDesc desc = alloc_region();
+
+    L3L2OrchCommResponse unaligned = notify(desc, desc.counter_base + 2, 1, L3L2OrchNotifyOp::Set);
+    EXPECT_NE(unaligned.status, 0);
+
+    L3L2OrchCommResponse out_of_range = test(desc, desc.counter_base + desc.counter_bytes, 0, L3L2OrchWaitCmp::EQ);
+    EXPECT_NE(out_of_range.status, 0);
+
+    EXPECT_EQ(notify(desc, desc.counter_base, 1, L3L2OrchNotifyOp::Set).status, 0);
+    EXPECT_EQ(test(desc, desc.counter_base, 1, L3L2OrchWaitCmp::EQ).matched, 1u);
 }
 
 TEST_F(ServiceFixture, MultipleRegionsKeepPayloadSignalsAndPoisonSeparate) {
@@ -206,62 +288,41 @@ TEST_F(ServiceFixture, MultipleRegionsKeepPayloadSignalsAndPoisonSeparate) {
     write_req.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::PAYLOAD_WRITE);
     write_req.region_id = first.region_id;
     write_req.host_ptr = reinterpret_cast<uint64_t>(first_src);
-    write_req.nbytes = sizeof(first_src);
+    write_req.payload_bytes = sizeof(first_src);
     EXPECT_EQ(submit(write_req).status, 0);
 
     write_req.region_id = second.region_id;
     write_req.host_ptr = reinterpret_cast<uint64_t>(second_src);
-    write_req.nbytes = sizeof(second_src);
+    write_req.payload_bytes = sizeof(second_src);
     EXPECT_EQ(submit(write_req).status, 0);
 
     L3L2OrchCommRequest read_req{};
     read_req.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::PAYLOAD_READ);
     read_req.region_id = first.region_id;
     read_req.host_ptr = reinterpret_cast<uint64_t>(first_dst);
-    read_req.nbytes = sizeof(first_dst);
+    read_req.payload_bytes = sizeof(first_dst);
     EXPECT_EQ(submit(read_req).status, 0);
 
     read_req.region_id = second.region_id;
     read_req.host_ptr = reinterpret_cast<uint64_t>(second_dst);
-    read_req.nbytes = sizeof(second_dst);
+    read_req.payload_bytes = sizeof(second_dst);
     EXPECT_EQ(submit(read_req).status, 0);
 
     EXPECT_EQ(std::memcmp(first_src, first_dst, sizeof(first_src)), 0);
     EXPECT_EQ(std::memcmp(second_src, second_dst, sizeof(second_src)), 0);
 
-    L3L2OrchCommRequest notify_req{};
-    notify_req.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::SIGNAL_NOTIFY);
-    notify_req.signal_slot = static_cast<uint64_t>(L3L2OrchCommSignalSlot::L2_TO_L3);
-    notify_req.region_id = first.region_id;
-    notify_req.seq = 3;
-    EXPECT_EQ(submit(notify_req).status, 0);
-    notify_req.region_id = second.region_id;
-    notify_req.seq = 7;
-    EXPECT_EQ(submit(notify_req).status, 0);
+    EXPECT_EQ(notify(first, first.counter_base, 3, L3L2OrchNotifyOp::Set).status, 0);
+    EXPECT_EQ(notify(second, second.counter_base, 7, L3L2OrchNotifyOp::Set).status, 0);
+    EXPECT_EQ(wait(first, first.counter_base, 3, L3L2OrchWaitCmp::EQ, 100000000).status, 0);
+    EXPECT_EQ(wait(second, second.counter_base, 7, L3L2OrchWaitCmp::EQ, 100000000).status, 0);
 
-    L3L2OrchCommRequest wait_req{};
-    wait_req.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::SIGNAL_WAIT);
-    wait_req.signal_slot = static_cast<uint64_t>(L3L2OrchCommSignalSlot::L2_TO_L3);
-    wait_req.timeout_ns = 100000000;
-    wait_req.region_id = first.region_id;
-    wait_req.seq = 3;
-    EXPECT_EQ(submit(wait_req).status, 0);
-    wait_req.region_id = second.region_id;
-    wait_req.seq = 7;
-    EXPECT_EQ(submit(wait_req).status, 0);
-
-    notify_req.region_id = first.region_id;
-    notify_req.seq = 9;
-    EXPECT_EQ(submit(notify_req).status, 0);
-    wait_req.region_id = first.region_id;
-    wait_req.seq = 8;
-    L3L2OrchCommResponse first_poison = submit(wait_req);
-    EXPECT_NE(first_poison.status, 0);
-    EXPECT_EQ(first_poison.region_id, first.region_id);
+    L3L2OrchCommResponse first_timeout = wait(first, first.counter_base + 64, 1, L3L2OrchWaitCmp::EQ, 1000000);
+    EXPECT_NE(first_timeout.status, 0);
+    EXPECT_EQ(first_timeout.region_id, first.region_id);
 
     read_req.region_id = first.region_id;
     read_req.host_ptr = reinterpret_cast<uint64_t>(first_dst);
-    EXPECT_NE(submit(read_req).status, 0);
+    EXPECT_EQ(submit(read_req).status, 0);
 
     read_req.region_id = second.region_id;
     read_req.host_ptr = reinterpret_cast<uint64_t>(second_dst);

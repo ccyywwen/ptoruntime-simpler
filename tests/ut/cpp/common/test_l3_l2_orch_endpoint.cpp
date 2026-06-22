@@ -20,15 +20,9 @@
 
 namespace {
 
-struct alignas(64) SignalSlot {
-    volatile uint64_t value;
-    uint8_t padding[L3L2_ORCH_COMM_SIGNAL_BYTES - sizeof(uint64_t)];
-};
-
 struct RegionStorage {
-    std::array<uint8_t, 128> payload{};
-    SignalSlot l3_to_l2{};
-    SignalSlot l2_to_l3{};
+    alignas(64) std::array<uint8_t, 128> payload{};
+    alignas(64) std::array<int32_t, 32> counters{};
 };
 
 L3L2OrchRegionDesc make_desc(RegionStorage *storage) {
@@ -37,12 +31,12 @@ L3L2OrchRegionDesc make_desc(RegionStorage *storage) {
         17,
         reinterpret_cast<uint64_t>(storage->payload.data()),
         storage->payload.size(),
-        reinterpret_cast<uint64_t>(&storage->l3_to_l2),
-        reinterpret_cast<uint64_t>(&storage->l2_to_l3),
+        reinterpret_cast<uint64_t>(storage->counters.data()),
+        storage->counters.size() * sizeof(int32_t),
     };
 }
 
-TEST(L3L2OrchEndpointTest, DecodesDescriptorScalarsAndReturnsPayloadViewWithoutCopying) {
+TEST(L3L2OrchEndpointTest, DecodesDescriptorScalarsAndCounterRange) {
     RegionStorage storage{};
     L3L2OrchRegionDesc desc = make_desc(&storage);
     std::array<uint64_t, L3L2_ORCH_REGION_DESC_SCALAR_COUNT> scalars{};
@@ -51,10 +45,12 @@ TEST(L3L2OrchEndpointTest, DecodesDescriptorScalarsAndReturnsPayloadViewWithoutC
     L3L2OrchEndpoint endpoint(scalars.data(), scalars.size());
 
     ASSERT_EQ(endpoint.error().kind, L3L2EndpointErrorKind::NONE) << endpoint.error().message;
-    L3L2OrchPayloadView view{};
-    ASSERT_TRUE(endpoint.payload_read(8, 16, &view)) << endpoint.error().message;
-    EXPECT_EQ(view.gm_addr, desc.payload_base + 8);
-    EXPECT_EQ(view.nbytes, 16u);
+    EXPECT_EQ(endpoint.descriptor().counter_base, desc.counter_base);
+    EXPECT_EQ(endpoint.descriptor().counter_bytes, desc.counter_bytes);
+
+    uint64_t counter_addr = 0;
+    ASSERT_TRUE(endpoint.counter_addr(8, &counter_addr)) << endpoint.error().message;
+    EXPECT_EQ(counter_addr, desc.counter_base + 8);
 }
 
 TEST(L3L2OrchEndpointTest, PayloadWriteCopiesSmallMetadataIntoPayloadRange) {
@@ -96,58 +92,97 @@ TEST(L3L2OrchEndpointTest, PayloadBoundsErrorCarriesStructuredMetadata) {
     EXPECT_EQ(endpoint.error().kind, L3L2EndpointErrorKind::OUT_OF_BOUNDS);
     EXPECT_STREQ(endpoint.error().op, "payload_read");
     EXPECT_EQ(endpoint.error().region_id, 17u);
-    EXPECT_EQ(endpoint.error().seq, 0u);
+    EXPECT_EQ(endpoint.error().counter_addr, 0u);
     EXPECT_NE(endpoint.error().message, nullptr);
 }
 
-TEST(L3L2OrchEndpointTest, NotifyPublishesOnL2ToL3AndWaitObservesL3ToL2) {
+TEST(L3L2OrchEndpointTest, CounterAddrRejectsBadOffsets) {
     RegionStorage storage{};
     L3L2OrchEndpoint endpoint(make_desc(&storage));
-    storage.l3_to_l2.value = 3;
+    uint64_t counter_addr = 0xCAFE;
 
-    EXPECT_TRUE(endpoint.wait(3, 1'000'000)) << endpoint.error().message;
-    EXPECT_TRUE(endpoint.notify(5)) << endpoint.error().message;
-    EXPECT_EQ(storage.l2_to_l3.value, 5u);
-}
+    EXPECT_FALSE(endpoint.counter_addr(2, &counter_addr));
 
-TEST(L3L2OrchEndpointTest, WaitFutureSequenceIsProtocolError) {
-    RegionStorage storage{};
-    L3L2OrchEndpoint endpoint(make_desc(&storage));
-    storage.l3_to_l2.value = 9;
-
-    EXPECT_FALSE(endpoint.wait(8, 1'000'000));
-
-    EXPECT_EQ(endpoint.error().kind, L3L2EndpointErrorKind::SIGNAL_PROTOCOL);
-    EXPECT_STREQ(endpoint.error().op, "wait");
+    EXPECT_EQ(counter_addr, 0u);
+    EXPECT_EQ(endpoint.error().kind, L3L2EndpointErrorKind::OUT_OF_BOUNDS);
+    EXPECT_STREQ(endpoint.error().op, "counter_addr");
     EXPECT_EQ(endpoint.error().region_id, 17u);
-    EXPECT_EQ(endpoint.error().seq, 8u);
-    EXPECT_EQ(endpoint.error().observed_signal, 9u);
+    EXPECT_EQ(endpoint.error().counter_addr, make_desc(&storage).counter_base + 2);
 }
 
-TEST(L3L2OrchEndpointTest, WaitTimeoutCarriesStructuredMetadata) {
+TEST(L3L2OrchEndpointTest, SignalNotifySetAndAddUpdateCounters) {
     RegionStorage storage{};
     L3L2OrchEndpoint endpoint(make_desc(&storage));
+    uint64_t counter_addr = 0;
+    ASSERT_TRUE(endpoint.counter_addr(0, &counter_addr)) << endpoint.error().message;
 
-    EXPECT_FALSE(endpoint.wait(1, 1));
+    EXPECT_TRUE(endpoint.signal_notify(counter_addr, 5, L3L2OrchNotifyOp::Set)) << endpoint.error().message;
+    EXPECT_EQ(storage.counters[0], 5);
+
+    EXPECT_TRUE(endpoint.signal_notify(counter_addr, -2, L3L2OrchNotifyOp::Add)) << endpoint.error().message;
+    EXPECT_EQ(storage.counters[0], 3);
+}
+
+TEST(L3L2OrchEndpointTest, SignalTestCoversAllComparisonsAndMismatchIsNotError) {
+    RegionStorage storage{};
+    L3L2OrchEndpoint endpoint(make_desc(&storage));
+    uint64_t counter_addr = 0;
+    ASSERT_TRUE(endpoint.counter_addr(4, &counter_addr)) << endpoint.error().message;
+    storage.counters[1] = 7;
+
+    L3L2OrchSignalTestResult result{};
+    EXPECT_TRUE(endpoint.signal_test(counter_addr, 7, L3L2OrchWaitCmp::EQ, &result)) << endpoint.error().message;
+    EXPECT_TRUE(result.matched);
+    EXPECT_EQ(result.observed, 7);
+
+    EXPECT_TRUE(endpoint.signal_test(counter_addr, 8, L3L2OrchWaitCmp::NE, &result)) << endpoint.error().message;
+    EXPECT_TRUE(result.matched);
+    EXPECT_TRUE(endpoint.signal_test(counter_addr, 6, L3L2OrchWaitCmp::GT, &result)) << endpoint.error().message;
+    EXPECT_TRUE(result.matched);
+    EXPECT_TRUE(endpoint.signal_test(counter_addr, 7, L3L2OrchWaitCmp::GE, &result)) << endpoint.error().message;
+    EXPECT_TRUE(result.matched);
+    EXPECT_TRUE(endpoint.signal_test(counter_addr, 8, L3L2OrchWaitCmp::LT, &result)) << endpoint.error().message;
+    EXPECT_TRUE(result.matched);
+    EXPECT_TRUE(endpoint.signal_test(counter_addr, 7, L3L2OrchWaitCmp::LE, &result)) << endpoint.error().message;
+    EXPECT_TRUE(result.matched);
+
+    EXPECT_TRUE(endpoint.signal_test(counter_addr, 8, L3L2OrchWaitCmp::EQ, &result)) << endpoint.error().message;
+    EXPECT_FALSE(result.matched);
+    EXPECT_EQ(result.observed, 7);
+    EXPECT_EQ(endpoint.error().kind, L3L2EndpointErrorKind::NONE);
+}
+
+TEST(L3L2OrchEndpointTest, SignalWaitTimeoutCarriesStructuredMetadata) {
+    RegionStorage storage{};
+    L3L2OrchEndpoint endpoint(make_desc(&storage));
+    uint64_t counter_addr = 0;
+    ASSERT_TRUE(endpoint.counter_addr(0, &counter_addr)) << endpoint.error().message;
+    int32_t observed = 0;
+
+    EXPECT_FALSE(endpoint.signal_wait(counter_addr, 1, L3L2OrchWaitCmp::EQ, 1, &observed));
 
     EXPECT_EQ(endpoint.error().kind, L3L2EndpointErrorKind::SIGNAL_TIMEOUT);
-    EXPECT_STREQ(endpoint.error().op, "wait");
+    EXPECT_STREQ(endpoint.error().op, "signal_wait");
     EXPECT_EQ(endpoint.error().region_id, 17u);
-    EXPECT_EQ(endpoint.error().seq, 1u);
-    EXPECT_EQ(endpoint.error().observed_signal, 0u);
+    EXPECT_EQ(endpoint.error().counter_addr, counter_addr);
+    EXPECT_EQ(endpoint.error().counter_operand, 1);
+    EXPECT_EQ(endpoint.error().observed_counter, 0);
+    EXPECT_EQ(observed, 0);
 }
 
-TEST(L3L2OrchEndpointTest, NotifyRejectsNonMonotonicSequence) {
+TEST(L3L2OrchEndpointTest, SignalWaitDoesNotTreatGreaterObservedValueAsProtocolError) {
     RegionStorage storage{};
     L3L2OrchEndpoint endpoint(make_desc(&storage));
-    ASSERT_TRUE(endpoint.notify(4)) << endpoint.error().message;
+    uint64_t counter_addr = 0;
+    ASSERT_TRUE(endpoint.counter_addr(0, &counter_addr)) << endpoint.error().message;
+    storage.counters[0] = 9;
+    int32_t observed = 0;
 
-    EXPECT_FALSE(endpoint.notify(4));
+    EXPECT_TRUE(endpoint.signal_wait(counter_addr, 8, L3L2OrchWaitCmp::GE, 1'000'000, &observed))
+        << endpoint.error().message;
 
-    EXPECT_EQ(endpoint.error().kind, L3L2EndpointErrorKind::SIGNAL_PROTOCOL);
-    EXPECT_STREQ(endpoint.error().op, "notify");
-    EXPECT_EQ(endpoint.error().region_id, 17u);
-    EXPECT_EQ(endpoint.error().seq, 4u);
+    EXPECT_EQ(observed, 9);
+    EXPECT_EQ(endpoint.error().kind, L3L2EndpointErrorKind::NONE);
 }
 
 TEST(L3L2OrchEndpointTest, RejectsBadDescriptorScalars) {
