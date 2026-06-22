@@ -3278,10 +3278,10 @@ class Worker:
         return poisoned
 
     def _register_l3_l2_orch_comm_host_buffer(self, tensor) -> None:
-        from .task_interface import ContinuousTensor  # noqa: PLC0415
+        from .task_interface import Tensor  # noqa: PLC0415
 
-        if not isinstance(tensor, ContinuousTensor):
-            raise TypeError("L3-L2 host buffer registration expects a ContinuousTensor")
+        if not isinstance(tensor, Tensor):
+            raise TypeError("L3-L2 host buffer registration expects a Tensor")
         if tensor.child_memory:
             raise ValueError("L3-L2 payload buffer must be host storage, not child_memory device storage")
         base = int(tensor.data)
@@ -3294,10 +3294,10 @@ class Worker:
         )
 
     def _validate_l3_l2_orch_comm_host_buffer(self, tensor) -> None:
-        from .task_interface import ContinuousTensor  # noqa: PLC0415
+        from .task_interface import Tensor  # noqa: PLC0415
 
-        if not isinstance(tensor, ContinuousTensor):
-            raise ValueError("L3-L2 payload buffer must be a ContinuousTensor returned by orch.alloc(...)")
+        if not isinstance(tensor, Tensor):
+            raise ValueError("L3-L2 payload buffer must be a Tensor returned by orch.alloc(...)")
         if tensor.child_memory:
             raise ValueError("L3-L2 payload buffer must be host storage, not child_memory device storage")
         base = int(tensor.data)
@@ -3306,12 +3306,10 @@ class Worker:
             raise ValueError("L3-L2 payload buffer must have a nonzero address and size")
         registered_nbytes = self._l3_l2_orch_comm_host_buffers.get(base)
         if registered_nbytes is None:
-            raise ValueError(
-                "L3-L2 payload ContinuousTensor is not registered; use a tensor returned by orch.alloc(...)"
-            )
+            raise ValueError("L3-L2 payload Tensor is not registered; use a tensor returned by orch.alloc(...)")
         if nbytes > int(registered_nbytes):
             raise ValueError(
-                f"L3-L2 payload ContinuousTensor size {nbytes} exceeds registered shared storage {registered_nbytes}"
+                f"L3-L2 payload Tensor size {nbytes} exceeds registered shared storage {registered_nbytes}"
             )
 
     def _create_l3_l2_region(self, worker_id: int, payload_bytes: int, counter_bytes: int):

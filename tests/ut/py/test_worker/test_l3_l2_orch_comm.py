@@ -14,10 +14,10 @@ import time
 from multiprocessing.shared_memory import SharedMemory
 
 import pytest
-import simpler.l3_l2_orch_comm as l3_l2_orch_comm
+from simpler import l3_l2_orch_comm
 from simpler.l3_l2_orch_comm import (
-    L3L2OrchCommCmd,
     L3L2OrchCommClient,
+    L3L2OrchCommCmd,
     L3L2OrchCommRequest,
     L3L2OrchCommResponse,
     L3L2OrchRegionDesc,
@@ -25,7 +25,7 @@ from simpler.l3_l2_orch_comm import (
     SignalTestResult,
     WaitCmp,
 )
-from simpler.task_interface import ContinuousTensor, DataType
+from simpler.task_interface import DataType, Tensor
 from simpler.worker import (
     _IDLE,
     _OFF_STATE,
@@ -150,8 +150,9 @@ def test_control_client_packs_counter_request_and_unpacks_signal_response():
     captured = {}
     try:
         client = L3L2OrchCommClient(shm)
-        assert shm.buf is not None
-        state_addr = ctypes.addressof(ctypes.c_char.from_buffer(shm.buf)) + l3_l2_orch_comm._CONTROL_OFF_STATE
+        buf = shm.buf
+        assert buf is not None
+        state_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf)) + l3_l2_orch_comm._CONTROL_OFF_STATE
 
         def service_once() -> None:
             deadline = time.monotonic() + 1.0
@@ -159,12 +160,10 @@ def test_control_client_packs_counter_request_and_unpacks_signal_response():
                 if time.monotonic() >= deadline:
                     raise TimeoutError("test service timed out waiting for READY")
                 time.sleep(0.00005)
-            captured["request"] = l3_l2_orch_comm._REQUEST.unpack_from(
-                shm.buf, l3_l2_orch_comm._CONTROL_OFF_REQUEST
-            )
+            captured["request"] = l3_l2_orch_comm._REQUEST.unpack_from(buf, l3_l2_orch_comm._CONTROL_OFF_REQUEST)
             message = b"matched"
             l3_l2_orch_comm._RESPONSE.pack_into(
-                shm.buf,
+                buf,
                 l3_l2_orch_comm._CONTROL_OFF_RESPONSE,
                 0,
                 0,
@@ -280,7 +279,7 @@ def test_region_payload_and_counter_commands_use_service_client():
     try:
         region = worker._create_l3_l2_region(0, 16, 128)
 
-        payload = ContinuousTensor.make(0x1000, (16,), DataType.UINT8)
+        payload = Tensor.make(0x1000, (16,), DataType.UINT8)
         worker._register_l3_l2_orch_comm_host_buffer(payload)
 
         region.payload_write(4, payload, nbytes=4)
@@ -320,7 +319,7 @@ def test_precommand_validation_failure_does_not_poison_region():
     try:
         region = worker._create_l3_l2_region(0, 4, 128)
         with pytest.raises(ValueError, match="exceeds region size"):
-            payload = ContinuousTensor.make(0x1000, (1,), DataType.UINT8)
+            payload = Tensor.make(0x1000, (1,), DataType.UINT8)
             worker._register_l3_l2_orch_comm_host_buffer(payload)
             region.payload_write(8, payload)
         assert region.descriptor_scalars()[1] == 1
@@ -335,7 +334,7 @@ def test_private_python_payload_buffer_fails_before_service_submission_without_p
     worker, shm, _fake_c_worker, fake_client = _make_started_worker()
     try:
         region = worker._create_l3_l2_region(0, 4, 128)
-        with pytest.raises(ValueError, match="ContinuousTensor.*orch.alloc"):
+        with pytest.raises(ValueError, match="Tensor.*orch.alloc"):
             region.payload_write(0, bytearray(struct.pack("<I", 0x12345678)))
         assert region.descriptor_scalars()[1] == 1
         assert len(fake_client.requests) == 1
@@ -345,11 +344,11 @@ def test_private_python_payload_buffer_fails_before_service_submission_without_p
         shm.unlink()
 
 
-def test_unregistered_continuous_tensor_fails_before_service_submission_without_poisoning():
+def test_unregistered_tensor_fails_before_service_submission_without_poisoning():
     worker, shm, _fake_c_worker, fake_client = _make_started_worker()
     try:
         region = worker._create_l3_l2_region(0, 4, 128)
-        payload = ContinuousTensor.make(0x1000, (4,), DataType.UINT8)
+        payload = Tensor.make(0x1000, (4,), DataType.UINT8)
         with pytest.raises(ValueError, match="not registered"):
             region.payload_write(0, payload)
         assert region.descriptor_scalars()[1] == 1

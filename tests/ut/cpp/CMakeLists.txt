@@ -375,6 +375,7 @@ add_executable(test_l3_l2_orch_endpoint
 )
 target_include_directories(test_l3_l2_orch_endpoint PRIVATE
     ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
 )
 target_link_libraries(test_l3_l2_orch_endpoint PRIVATE

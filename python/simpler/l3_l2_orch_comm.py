@@ -184,10 +184,10 @@ class L3L2OrchCommClient:
 
 class _PinnedBuffer:
     def __init__(self, obj: Any, owner: Any) -> None:
-        from .task_interface import ContinuousTensor  # noqa: PLC0415
+        from .task_interface import Tensor  # noqa: PLC0415
 
-        if not isinstance(obj, ContinuousTensor):
-            raise ValueError("L3-L2 payload buffer must be a ContinuousTensor returned by orch.alloc(...)")
+        if not isinstance(obj, Tensor):
+            raise ValueError("L3-L2 payload buffer must be a Tensor returned by orch.alloc(...)")
         owner._validate_l3_l2_orch_comm_host_buffer(obj)
         self.addr = int(obj.data)
         self.nbytes = int(obj.nbytes())
@@ -203,7 +203,7 @@ class _PinnedBuffer:
 
 
 class L3L2OrchCounter:
-    def __init__(self, region: "L3L2OrchRegion", offset: int) -> None:
+    def __init__(self, region: L3L2OrchRegion, offset: int) -> None:
         self._region = region
         self._offset = int(offset)
 
@@ -352,9 +352,7 @@ class L3L2OrchRegion:
             raise ValueError(f"L3-L2 payload nbytes={nbytes} exceeds host buffer size {buffer_nbytes}")
         payload_bytes = int(self._descriptor.payload_bytes)
         if offset + nbytes > payload_bytes:
-            raise ValueError(
-                f"L3-L2 payload range [{offset}, {offset + nbytes}) exceeds region size {payload_bytes}"
-            )
+            raise ValueError(f"L3-L2 payload range [{offset}, {offset + nbytes}) exceeds region size {payload_bytes}")
 
     def _submit(
         self,
