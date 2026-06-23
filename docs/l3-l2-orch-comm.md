@@ -180,9 +180,15 @@ ep.signal_wait(counter_addr, cmp_value, L3L2OrchWaitCmp::GE, timeout, &observed)
 - `Add`: add the operand to the current counter value.
 
 `Add` is a convenience read-modify-write operation, not an atomic operation.
-Signal counters are single-writer: callers must ensure each counter has at most
-one writer across L3 and L2. Primitive notify code relies on that ownership
-rule instead of providing multi-writer atomicity.
+The primitive layer requires only 4-byte counter-address alignment and does not
+force 64-byte counter offsets. This leaves room for one writer to pack a batch
+of related counters into the same cache line when that is the right protocol
+shape.
+
+The ownership invariant is still single-writer per 64-byte cache line: all
+counters in one cache line must have the same writer. Counters written by
+different L3/L2 agents must not share one cache line. Wrappers should lay out
+high-frequency or cross-agent signals on separate 64-byte lines.
 
 `WaitCmp` supports `EQ`, `NE`, `GT`, `GE`, `LT`, and `LE`.
 `counter.test(...)` / `signal_test` is a non-blocking snapshot, not a
@@ -205,7 +211,9 @@ acquire semantics.
 Primitive signal code does not impose sequence monotonicity and does not treat
 `observed > cmp_value` as a protocol error. Queue, stream, or channel wrappers
 may still store sequence numbers in counters and enforce wrapper-level
-protocol rules separately.
+protocol rules separately. For monotonic `Add` or sequence counters, wrappers
+should normally wait with `GE` or `GT`; `EQ` is appropriate only when the
+wrapper guarantees the target value cannot be skipped.
 
 Counter reset is expressed as `notify(0, NotifyOp.Set)`.
 
@@ -231,8 +239,17 @@ L3:
   payload_read(output_offset, host_output)
 ```
 
-The `EQ` versus `GE` choice is a wrapper decision. The primitive layer only
-applies the requested comparison.
+The `EQ` versus `GE` choice is a wrapper decision. Prefer `GE`/`GT` for
+monotonic sequence or `Add` counters, because `EQ` can miss a target if the
+counter steps past it before the waiter observes the value. The primitive layer
+only applies the requested comparison.
+
+On onboard builds, correct payload/counter visibility depends on the endpoint
+cache maintenance helpers guarded by
+`L3_L2_ORCH_ENDPOINT_ENABLE_CACHE_MAINTENANCE`. Normal onboard orchestration
+builds define that macro through the toolchain; sim and non-aarch64 helper
+paths are no-ops. See
+[hardware/cache-coherency.md](hardware/cache-coherency.md).
 
 All waits must use finite timeouts. Unbounded waits hide protocol deadlocks.
 
@@ -299,10 +316,12 @@ Pre-command validation failures do not poison the region:
 A poisoned region rejects `payload_write`, `payload_read`, counter operations,
 and `descriptor_scalars`. `free` and orchestration cleanup remain valid.
 
-L2 endpoint errors carry structured metadata including `region_id`, operation,
-counter address, operand, observed counter, kind, and message. When multiple
-live regions exist, the Host poisons only the region identified by that endpoint
-metadata.
+L2 endpoint errors own structured fields inside L2, including `region_id`,
+operation, counter address, operand, observed counter, kind, and message. The
+current Host-side poisoning path does not receive structured cross-process
+fatal metadata; it depends on the wrapper's canonical fatal text format:
+`L3-L2 endpoint error ... region=<id>`. When multiple live regions exist, the
+Host poisons only the region parsed from that text.
 
 ## 9. Platform Support
 

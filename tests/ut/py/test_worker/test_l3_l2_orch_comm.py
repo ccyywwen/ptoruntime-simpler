@@ -14,7 +14,7 @@ import time
 from multiprocessing.shared_memory import SharedMemory
 
 import pytest
-from simpler import l3_l2_orch_comm
+from simpler import l3_l2_orch_comm, task_interface
 from simpler.l3_l2_orch_comm import (
     L3L2OrchCommClient,
     L3L2OrchCommCmd,
@@ -314,6 +314,23 @@ def test_region_payload_and_counter_commands_use_service_client():
         shm.unlink()
 
 
+def test_counter_wait_clamps_extreme_timeout_ns_before_submission():
+    worker, shm, _fake_c_worker, fake_client = _make_started_worker()
+    try:
+        region = worker._create_l3_l2_region(0, 16, 128)
+        observed = region.counter(0).wait(3, WaitCmp.GE, timeout=(2**63 / 1_000_000_000) + 123.0)
+
+        assert observed == 3
+        wait_req, wait_timeout_s = fake_client.requests[-1]
+        assert wait_req.cmd == L3L2OrchCommCmd.SIGNAL_WAIT
+        assert wait_req.timeout_ns == 2**63 - 1
+        assert wait_timeout_s > 0
+    finally:
+        worker._close_l3_l2_orch_comm()
+        shm.close()
+        shm.unlink()
+
+
 def test_precommand_validation_failure_does_not_poison_region():
     worker, shm, _fake_c_worker, fake_client = _make_started_worker()
     try:
@@ -350,6 +367,36 @@ def test_unregistered_tensor_fails_before_service_submission_without_poisoning()
         region = worker._create_l3_l2_region(0, 4, 128)
         payload = Tensor.make(0x1000, (4,), DataType.UINT8)
         with pytest.raises(ValueError, match="not registered"):
+            region.payload_write(0, payload)
+        assert region.descriptor_scalars()[1] == 1
+        assert len(fake_client.requests) == 1
+    finally:
+        worker._close_l3_l2_orch_comm()
+        shm.close()
+        shm.unlink()
+
+
+def test_non_contiguous_host_buffer_fails_before_service_submission(monkeypatch):
+    worker, shm, _fake_c_worker, fake_client = _make_started_worker()
+
+    class _NonContiguousTensor:
+        child_memory = False
+        data = 0x1000
+        is_contiguous = False
+
+        def nbytes(self):
+            return 4
+
+    monkeypatch.setattr(task_interface, "Tensor", _NonContiguousTensor)
+    payload = _NonContiguousTensor()
+    try:
+        with pytest.raises(ValueError, match="contiguous"):
+            worker._register_l3_l2_orch_comm_host_buffer(payload)
+        assert worker._l3_l2_orch_comm_host_buffers == {}
+
+        worker._l3_l2_orch_comm_host_buffers[int(payload.data)] = int(payload.nbytes())
+        region = worker._create_l3_l2_region(0, 4, 128)
+        with pytest.raises(ValueError, match="contiguous"):
             region.payload_write(0, payload)
         assert region.descriptor_scalars()[1] == 1
         assert len(fake_client.requests) == 1

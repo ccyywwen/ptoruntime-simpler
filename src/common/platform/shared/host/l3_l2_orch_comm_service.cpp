@@ -28,10 +28,25 @@ enum class ServiceError : uint32_t {
     ALLOC_FAILED = 5,
     COPY_FAILED = 6,
     SIGNAL_TIMEOUT = 7,
-    SIGNAL_PROTOCOL = 8,
 };
 
 constexpr uint64_t kPollSleepNs = 50000;
+
+std::chrono::nanoseconds clamp_timeout_ns(uint64_t timeout_ns) {
+    const auto max_timeout = std::chrono::nanoseconds::max();
+    if (timeout_ns > static_cast<uint64_t>(max_timeout.count())) {
+        return max_timeout;
+    }
+    return std::chrono::nanoseconds(static_cast<std::chrono::nanoseconds::rep>(timeout_ns));
+}
+
+std::chrono::steady_clock::time_point make_deadline(uint64_t timeout_ns) {
+    const auto timeout = clamp_timeout_ns(timeout_ns);
+    if (timeout == std::chrono::nanoseconds::max()) {
+        return std::chrono::steady_clock::time_point::max();
+    }
+    return std::chrono::steady_clock::now() + timeout;
+}
 
 L3L2OrchCommControlState load_state(L3L2OrchCommControlBlock *control) {
     return static_cast<L3L2OrchCommControlState>(control->state.load(std::memory_order_acquire));
@@ -73,8 +88,7 @@ int L3L2OrchCommClient::submit(
     }
 
     std::lock_guard<std::mutex> lk(mu_);
-    const auto timeout = std::chrono::nanoseconds(timeout_ns);
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    const auto deadline = make_deadline(timeout_ns);
 
     while (load_state(control_) != L3L2OrchCommControlState::IDLE) {
         if (std::chrono::steady_clock::now() >= deadline) {
@@ -352,7 +366,7 @@ void L3L2OrchCommService::signal_wait(const L3L2OrchCommRequest &request, L3L2Or
         return;
     }
 
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(request.timeout_ns);
+    const auto deadline = make_deadline(request.timeout_ns);
     int32_t observed = 0;
     while (true) {
         if (backend_->l3_l2_copy_from_device(&observed, counter, sizeof(observed)) != 0) {
@@ -387,6 +401,8 @@ L3L2OrchCommService::Region *L3L2OrchCommService::find_live_region(uint64_t regi
         set_response(response, -1, ServiceError::POISONED_REGION, region_id, "region is poisoned");
         return nullptr;
     }
+    // The returned raw pointer is used after releasing regions_mu_; callers
+    // rely on the single-threaded service loop.
     return &it->second;
 }
 

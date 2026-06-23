@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -185,6 +186,45 @@ TEST_F(ServiceFixture, PayloadWriteAndReadRoundTripThroughService) {
     EXPECT_EQ(std::memcmp(src, dst, sizeof(src)), 0);
 }
 
+TEST_F(ServiceFixture, PayloadCopyFailurePoisonsOnlyAffectedRegion) {
+    L3L2OrchRegionDesc first = alloc_region();
+    L3L2OrchRegionDesc second = alloc_region();
+    const uint8_t first_src[4] = {2, 4, 6, 8};
+    const uint8_t second_src[4] = {1, 3, 5, 7};
+    uint8_t second_dst[4] = {};
+
+    L3L2OrchCommRequest write_req{};
+    write_req.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::PAYLOAD_WRITE);
+    write_req.region_id = first.region_id;
+    write_req.host_ptr = reinterpret_cast<uint64_t>(first_src);
+    write_req.payload_bytes = sizeof(first_src);
+
+    backend.fail_copy_ = true;
+    L3L2OrchCommResponse failed = submit(write_req);
+    EXPECT_NE(failed.status, 0);
+    EXPECT_EQ(failed.error_kind, 6u);
+    EXPECT_EQ(failed.region_id, first.region_id);
+
+    backend.fail_copy_ = false;
+    L3L2OrchCommResponse poisoned = submit(write_req);
+    EXPECT_NE(poisoned.status, 0);
+    EXPECT_EQ(poisoned.error_kind, 4u);
+    EXPECT_EQ(poisoned.region_id, first.region_id);
+
+    write_req.region_id = second.region_id;
+    write_req.host_ptr = reinterpret_cast<uint64_t>(second_src);
+    write_req.payload_bytes = sizeof(second_src);
+    EXPECT_EQ(submit(write_req).status, 0);
+
+    L3L2OrchCommRequest read_req{};
+    read_req.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::PAYLOAD_READ);
+    read_req.region_id = second.region_id;
+    read_req.host_ptr = reinterpret_cast<uint64_t>(second_dst);
+    read_req.payload_bytes = sizeof(second_dst);
+    EXPECT_EQ(submit(read_req).status, 0);
+    EXPECT_EQ(std::memcmp(second_src, second_dst, sizeof(second_src)), 0);
+}
+
 TEST_F(ServiceFixture, SignalNotifySetAndAddUpdateCounter) {
     L3L2OrchRegionDesc desc = alloc_region();
     uint64_t counter_addr = desc.counter_base + 64;
@@ -244,6 +284,24 @@ TEST_F(ServiceFixture, SignalWaitPollsUntilMatchAndReturnsObserved) {
     L3L2OrchCommResponse wait_resp = wait(desc, counter_addr, 5, L3L2OrchWaitCmp::GE, 100000000);
     EXPECT_EQ(wait_resp.status, 0) << wait_resp.message;
     EXPECT_EQ(wait_resp.observed_counter, 7);
+    EXPECT_EQ(wait_resp.matched, 1u);
+}
+
+TEST_F(ServiceFixture, SignalWaitClampsExtremeTimeoutUntilCounterMatches) {
+    L3L2OrchRegionDesc desc = alloc_region();
+    uint64_t counter_addr = desc.counter_base;
+    L3L2OrchCommResponse wait_resp{};
+
+    std::thread waiter([&]() {
+        wait_resp = wait(desc, counter_addr, 1, L3L2OrchWaitCmp::EQ, std::numeric_limits<uint64_t>::max());
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    *reinterpret_cast<int32_t *>(counter_addr) = 1;
+    waiter.join();
+
+    EXPECT_EQ(wait_resp.status, 0) << wait_resp.message;
+    EXPECT_EQ(wait_resp.observed_counter, 1);
     EXPECT_EQ(wait_resp.matched, 1u);
 }
 
@@ -338,6 +396,47 @@ TEST_F(ServiceFixture, FreeRegionIsIdempotent) {
     free_req.region_id = desc.region_id;
     EXPECT_EQ(submit(free_req).status, 0);
     EXPECT_EQ(submit(free_req).status, 0);
+}
+
+TEST(L3L2OrchCommClientTest, SubmitClampsExtremeTimeoutWhileWaitingForIdleAndDone) {
+    L3L2OrchCommControlBlock control{};
+    control.state.store(static_cast<uint32_t>(L3L2OrchCommControlState::RUNNING), std::memory_order_release);
+
+    L3L2OrchCommClient client;
+    ASSERT_EQ(client.attach(&control, sizeof(control)), 0);
+
+    L3L2OrchCommRequest request{};
+    request.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::ALLOC_REGION);
+    request.payload_bytes = 64;
+    request.counter_bytes = 128;
+    L3L2OrchCommResponse response{};
+    int rc = -1;
+
+    std::thread submitter([&]() {
+        rc = client.submit(request, &response, std::numeric_limits<uint64_t>::max());
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    control.state.store(static_cast<uint32_t>(L3L2OrchCommControlState::IDLE), std::memory_order_release);
+
+    const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (control.state.load(std::memory_order_acquire) != static_cast<uint32_t>(L3L2OrchCommControlState::READY) &&
+           std::chrono::steady_clock::now() < ready_deadline) {
+        std::this_thread::sleep_for(std::chrono::nanoseconds(50000));
+    }
+    if (control.state.load(std::memory_order_acquire) != static_cast<uint32_t>(L3L2OrchCommControlState::READY)) {
+        submitter.join();
+        ADD_FAILURE() << "client returned before the control block became IDLE";
+        EXPECT_EQ(rc, 0);
+        return;
+    }
+    control.response.status = 0;
+    control.state.store(static_cast<uint32_t>(L3L2OrchCommControlState::DONE), std::memory_order_release);
+
+    submitter.join();
+    EXPECT_EQ(rc, 0);
+    EXPECT_EQ(response.status, 0);
+    EXPECT_EQ(control.state.load(std::memory_order_acquire), static_cast<uint32_t>(L3L2OrchCommControlState::IDLE));
 }
 
 }  // namespace

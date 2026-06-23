@@ -3284,6 +3284,8 @@ class Worker:
             raise TypeError("L3-L2 host buffer registration expects a Tensor")
         if tensor.child_memory:
             raise ValueError("L3-L2 payload buffer must be host storage, not child_memory device storage")
+        if not tensor.is_contiguous:
+            raise ValueError("L3-L2 payload buffer must be contiguous")
         base = int(tensor.data)
         nbytes = int(tensor.nbytes())
         if base <= 0 or nbytes <= 0:
@@ -3300,6 +3302,8 @@ class Worker:
             raise ValueError("L3-L2 payload buffer must be a Tensor returned by orch.alloc(...)")
         if tensor.child_memory:
             raise ValueError("L3-L2 payload buffer must be host storage, not child_memory device storage")
+        if not tensor.is_contiguous:
+            raise ValueError("L3-L2 payload buffer must be contiguous")
         base = int(tensor.data)
         nbytes = int(tensor.nbytes())
         if base <= 0 or nbytes <= 0:

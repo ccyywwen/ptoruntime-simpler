@@ -151,7 +151,10 @@ def test_closed_loop_payload_signal_path_while_l2_task_is_in_flight(st_platform,
                 _write_header(header, seq, 1)
                 region.payload_write(0, header, nbytes=_HEADER.size)
                 data_ready.notify(seq, NotifyOp.Set)
-                completion.wait(seq, WaitCmp.GE, timeout=5.0)
+                snapshot = completion.test(seq, WaitCmp.GE)
+                if not snapshot.matched:
+                    assert snapshot.observed < seq
+                    completion.wait(seq, WaitCmp.GE, timeout=5.0)
                 region.payload_read(_OUTPUT_OFFSET, host_output, nbytes=_NBYTES)
                 _assert_output_matches(host_output, expected)
 

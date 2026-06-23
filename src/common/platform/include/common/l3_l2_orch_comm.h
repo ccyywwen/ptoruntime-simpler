@@ -251,6 +251,8 @@ static inline bool l3_l2_orch_comm_compare_counter(int32_t observed, int32_t cmp
 
 static inline L3L2OrchCommValidationError
 l3_l2_orch_comm_validate_counter_addr(const L3L2OrchRegionDesc &desc, uint64_t counter_addr) {
+    // Address validity is 4-byte; wrapper protocols must keep different
+    // counter writers off the same cache line.
     if (!l3_l2_orch_comm_is_aligned(counter_addr, L3L2_ORCH_COMM_COUNTER_BYTES)) {
         return L3L2OrchCommValidationError::BAD_COUNTER_RANGE;
     }

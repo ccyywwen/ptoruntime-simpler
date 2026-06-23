@@ -52,6 +52,7 @@ _STATE_DONE = 3
 _POLL_INTERVAL_S = 0.00005
 _DEFAULT_SUBMIT_TIMEOUT_S = 5.0
 _SIGNAL_TIMEOUT_MARGIN_S = 1.0
+_MAX_SIGNED_CHRONO_TIMEOUT_NS = 2**63 - 1
 
 _REQUEST = struct.Struct("<IIQQQQQQiIQ")
 _DESC = struct.Struct("<6Q")
@@ -247,7 +248,8 @@ class L3L2OrchCounter:
         cmp = WaitCmp(cmp)
         if timeout is None or float(timeout) <= 0:
             raise ValueError("L3-L2 counter wait requires a positive timeout")
-        timeout_ns = int(float(timeout) * 1_000_000_000)
+        timeout_s = float(timeout)
+        timeout_ns = min(int(timeout_s * 1_000_000_000), _MAX_SIGNED_CHRONO_TIMEOUT_NS)
         response = self._region._submit(
             L3L2OrchCommRequest(
                 cmd=L3L2OrchCommCmd.SIGNAL_WAIT,
@@ -257,7 +259,7 @@ class L3L2OrchCounter:
                 counter_operand=int(cmp_value),
                 timeout_ns=timeout_ns,
             ),
-            timeout_s=float(timeout) + _SIGNAL_TIMEOUT_MARGIN_S,
+            timeout_s=timeout_s + _SIGNAL_TIMEOUT_MARGIN_S,
             poison_on_error=False,
         )
         if response.status != 0:
@@ -320,6 +322,7 @@ class L3L2OrchRegion:
     def counter(self, offset: int) -> L3L2OrchCounter:
         self._ensure_live()
         offset = int(offset)
+        # Primitive validation is 4-byte; wrapper-owned writers still need separate 64-byte cache lines.
         if offset < 0 or offset % 4 != 0 or offset + 4 > int(self._descriptor.counter_bytes):
             raise ValueError("L3-L2 counter offset must be 4-byte aligned and inside the counter range")
         return L3L2OrchCounter(self, offset)
