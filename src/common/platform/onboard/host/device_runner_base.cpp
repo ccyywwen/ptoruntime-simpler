@@ -32,6 +32,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 #include "callable.h"
 #include "callable_protocol.h"
@@ -41,6 +42,7 @@
 #include "common/unified_log.h"
 #include "host/raii_scope_guard.h"
 #include "host_log.h"
+#include "pto_runtime_c_api.h"
 #include "utils/elf_build_id.h"
 // `runtime.h` (pulled in via `device_runner_helpers.h` in the base header)
 // supplies the per-arch `Handshake` + `Runtime` types used by
@@ -70,6 +72,64 @@ int DeviceRunnerBase::copy_from_device(void *host_ptr, const void *dev_ptr, std:
 
 int DeviceRunnerBase::device_memset(void *dev_ptr, int value, std::size_t bytes) {
     return aclrtMemset(dev_ptr, bytes, value, bytes);
+}
+
+int DeviceRunnerBase::l3_l2_orch_comm_init(void *control_block, size_t control_block_size) {
+    if (!l3_l2_orch_comm_supported()) {
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    }
+    return l3_l2_orch_comm_service_.start(this, control_block, control_block_size);
+}
+
+int DeviceRunnerBase::l3_l2_orch_comm_shutdown() {
+    if (!l3_l2_orch_comm_supported()) {
+        return 0;
+    }
+    return l3_l2_orch_comm_service_.stop();
+}
+
+void *DeviceRunnerBase::l3_l2_allocate_region_bytes(uint64_t bytes) {
+    if (bytes == 0 || bytes > std::numeric_limits<size_t>::max()) {
+        return nullptr;
+    }
+    void *ptr = allocate_tensor(static_cast<size_t>(bytes));
+    if (ptr == nullptr) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lk(l3_l2_alloc_mu_);
+    l3_l2_allocations_.insert(ptr);
+    return ptr;
+}
+
+void DeviceRunnerBase::l3_l2_free_region_bytes(void *ptr) {
+    if (ptr == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(l3_l2_alloc_mu_);
+    auto it = l3_l2_allocations_.find(ptr);
+    if (it == l3_l2_allocations_.end()) {
+        return;
+    }
+    free_tensor(ptr);
+    l3_l2_allocations_.erase(it);
+}
+
+int DeviceRunnerBase::l3_l2_copy_to_device(void *dev_ptr, const void *host_ptr, uint64_t bytes) {
+    if (bytes > std::numeric_limits<size_t>::max()) {
+        return -1;
+    }
+    return copy_to_device(dev_ptr, host_ptr, static_cast<size_t>(bytes));
+}
+
+int DeviceRunnerBase::l3_l2_copy_from_device(void *host_ptr, const void *dev_ptr, uint64_t bytes) {
+    if (bytes > std::numeric_limits<size_t>::max()) {
+        return -1;
+    }
+    return copy_from_device(host_ptr, dev_ptr, static_cast<size_t>(bytes));
+}
+
+std::thread DeviceRunnerBase::l3_l2_create_service_thread(std::function<void()> fn) {
+    return create_thread(std::move(fn));
 }
 
 void *DeviceRunnerBase::acquire_pooled_gm_heap() {
@@ -707,6 +767,8 @@ int DeviceRunnerBase::finalize_common() {
     auto capture = [&rc](int err) {
         if (err != 0 && rc == 0) rc = err;
     };
+
+    capture(l3_l2_orch_comm_shutdown());
 
     // Streams are persistent for the DeviceRunner's lifetime; destroy them here.
     // Intentionally no pre-destroy sync: when a run hits the AICore op-timeout
