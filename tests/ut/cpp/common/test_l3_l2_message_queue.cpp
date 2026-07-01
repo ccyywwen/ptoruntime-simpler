@@ -576,6 +576,29 @@ TEST(L3L2MessageQueueTest, MultiInflightAcquireAllowsSeveralDataInputs) {
     EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_INPUT_DESC_HEAD_OFFSET)], 0);
 }
 
+TEST(L3L2MessageQueueTest, MultiInflightAcquireAllowsNonZeroPayloadOffsetsBeforeRelease) {
+    RegionStorage storage{};
+    L3L2QueueArgs args = make_args(4, 128, 128);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args, L3L2QueueEndpointConfig{3});
+    ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
+    const uint64_t first_offset = queue.layout().input_arena_offset;
+    const uint64_t second_offset = first_offset + 16;
+    publish_input_desc(&storage, queue.layout(), 1, L3L2QueueOpcode::DATA, first_offset, 16);
+    publish_input_desc(&storage, queue.layout(), 2, L3L2QueueOpcode::DATA, second_offset, 16);
+
+    L3L2QueueInputHandle first{};
+    L3L2QueueInputHandle second{};
+    ASSERT_TRUE(queue.input().try_peek(&first)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(&second)) << queue.error().message;
+
+    EXPECT_EQ(first.payload_offset, first_offset);
+    EXPECT_EQ(first.payload_nbytes, 16u);
+    EXPECT_EQ(second.payload_offset, second_offset);
+    EXPECT_EQ(second.payload_nbytes, 16u);
+    EXPECT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE);
+    EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_INPUT_DESC_HEAD_OFFSET)], 0);
+}
+
 TEST(L3L2MessageQueueTest, ErrorCountsAgainstInputWindowAndFullDoesNotPoison) {
     RegionStorage storage{};
     L3L2QueueArgs args = make_args(4, 128, 128);

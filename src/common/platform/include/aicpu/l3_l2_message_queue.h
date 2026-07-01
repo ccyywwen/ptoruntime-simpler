@@ -399,7 +399,7 @@ public:
                 parent_->poison(L3L2QueueErrorKind::INVALID_DESCRIPTOR, "input.try_peek", "input payload out of arena");
                 return false;
             } else if (!parent_->payload_matches_head(
-                           parent_->input_payload_head_, slot.payload_offset, slot.payload_nbytes,
+                           parent_->input_payload_acquire_head_, slot.payload_offset, slot.payload_nbytes,
                            parent_->layout_.input_arena_offset, parent_->layout_.input_arena_bytes, "input.try_peek"
                        )) {
                 return false;
@@ -408,6 +408,14 @@ public:
                     L3L2QueueErrorKind::ENDPOINT_ERROR, "input.try_peek", parent_->endpoint_.error().message
                 );
                 return false;
+            } else {
+                parent_->advance_payload_head(
+                    parent_->input_payload_acquire_head_, slot.payload_offset, slot.payload_nbytes,
+                    parent_->layout_.input_arena_offset, parent_->layout_.input_arena_bytes, "input.try_peek"
+                );
+                if (parent_->error_.kind != L3L2QueueErrorKind::NONE) {
+                    return false;
+                }
             }
 
             *out = L3L2QueueInputHandle{slot.seq, opcode, slot.payload_offset, slot.payload_nbytes, view};
@@ -840,6 +848,7 @@ private:
     uint64_t output_head_{0};
     uint64_t output_tail_{0};
     uint64_t input_payload_head_{0};
+    uint64_t input_payload_acquire_head_{0};
     uint64_t output_payload_head_{0};
     uint64_t output_payload_tail_{0};
     InputQueue input_queue_;

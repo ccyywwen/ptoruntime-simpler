@@ -32,6 +32,9 @@ enum InputWindowOp : uint64_t {
     ADD_TILES = 2,
 };
 
+// The queue seq is transport ordering only. Payload headers carry the
+// application-level request correlation needed for out-of-order and
+// many-to-one outputs in this example.
 struct InputHeader {
     uint64_t request_id;
     uint64_t mode;
@@ -88,6 +91,7 @@ bool publish_aiv_output(
     uint8_t *dst = reinterpret_cast<uint8_t *>(static_cast<uintptr_t>(output.payload.gm_addr));
     memset(dst, 0, kOutputHeaderBytes);
     memcpy(dst, &header, sizeof(header));
+    l3_l2_orch_endpoint_cache_flush_range(dst, kOutputHeaderBytes);
 
     Tensor first_tensor = make_input_values_tensor(first);
     Tensor second_tensor = make_input_values_tensor(second);
@@ -229,8 +233,11 @@ __attribute__((visibility("default"))) void l3_l2_message_queue_orchestration(co
     for (;;) {
         L3L2QueueInputHandle input{};
         if (!queue.input().peek(kQueueTimeoutNs, &input)) {
-            report_queue_error(queue);
-            return;
+            if (has_queue_error(queue)) {
+                report_queue_error(queue);
+                return;
+            }
+            continue;
         }
         if (input.opcode == L3L2QueueOpcode::STOP) {
             if (!finish_pending_inputs(queue, active)) {

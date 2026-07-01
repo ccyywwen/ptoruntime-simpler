@@ -35,6 +35,8 @@ _INPUT_HEADER = "<QQ"
 _OUTPUT_HEADER = "<QQQ"
 _INPUT_HEADER_BYTES = 64
 _OUTPUT_HEADER_BYTES = 64
+# The queue seq is transport ordering only. This example uses payload headers
+# for application-level request correlation and output kind metadata.
 _TILE_ROWS = 128
 _TILE_COLS = 128
 _TILE_ELEMS = _TILE_ROWS * _TILE_COLS
@@ -82,20 +84,12 @@ def _build_chip_callable(platform: str) -> ChipCallable:
 
 def _pack_input(request_id: int, mode: int, values: list[float]) -> bytes:
     header = struct.pack(_INPUT_HEADER, request_id, mode)
-    return (
-        header
-        + bytes(_INPUT_HEADER_BYTES - len(header))
-        + struct.pack(f"<{len(values)}f", *values)
-    )
+    return header + bytes(_INPUT_HEADER_BYTES - len(header)) + struct.pack(f"<{len(values)}f", *values)
 
 
 def _pack_output(request_id: int, kind: int, aux: int, values: list[float]) -> bytes:
     header = struct.pack(_OUTPUT_HEADER, request_id, kind, aux)
-    return (
-        header
-        + bytes(_OUTPUT_HEADER_BYTES - len(header))
-        + struct.pack(f"<{len(values)}f", *values)
-    )
+    return header + bytes(_OUTPUT_HEADER_BYTES - len(header)) + struct.pack(f"<{len(values)}f", *values)
 
 
 def _tile(base: float) -> list[float]:
