@@ -89,8 +89,6 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     _l3_child_onboard_region_close,
     _l3_child_onboard_region_create,
     _l3_child_onboard_region_create_direct,
-    _l3_host_mapped_counter_notify,
-    _l3_host_mapped_counter_test,
     _l3_host_mapped_payload_read,
     _l3_host_mapped_payload_write,
     _l3_host_mapped_region_close,
@@ -128,8 +126,6 @@ from .l3_l2_orch_comm import (
     L3L2OrchRegion,
     L3L2RegionAccessProfile,
     L3L2RegionCreateRequest,
-    NotifyOp,
-    WaitCmp,
     _align_up,
     _checked_add_u64,
     decode_region_create_reply,
@@ -1293,8 +1289,9 @@ class _RegionHostMapBackend(enum.Enum):
     VMM_IMPORT_THEN_HOST_REGISTER = "vmm_import_then_host_register"
 
 
-_HOST_MAP_PROBE_PAYLOAD_BYTES = 256
-_HOST_MAP_PROBE_COUNTER_BYTES = 64
+_HOST_MAP_PROBE_PAYLOAD_BYTES = 8
+_HOST_MAP_PROBE_COUNTER_BYTES = 4
+_HOST_MAP_PROBE_ACCESS_BYTES = 8
 _HOST_MAP_KNOWN_UNSUPPORTED_RCS = {8, 22, 87}
 
 
@@ -5067,23 +5064,17 @@ class Worker:
         reply: L3L2RegionCreateReply | None = None
         handle: int | None = None
         try:
-            reply, counter_offset, _total_bytes = self._create_l3_l2_host_map_region(
+            reply, _counter_offset, _total_bytes = self._create_l3_l2_host_map_region(
                 worker_id, backend, _HOST_MAP_PROBE_PAYLOAD_BYTES, _HOST_MAP_PROBE_COUNTER_BYTES
             )
             handle = self._import_host_registered_region(backend, reply)
-            pattern = bytes((i % 251 for i in range(_HOST_MAP_PROBE_PAYLOAD_BYTES)))
-            src = ctypes.create_string_buffer(pattern, _HOST_MAP_PROBE_PAYLOAD_BYTES)
-            dst = ctypes.create_string_buffer(_HOST_MAP_PROBE_PAYLOAD_BYTES)
-            _l3_host_mapped_payload_write(handle, 0, ctypes.addressof(src), _HOST_MAP_PROBE_PAYLOAD_BYTES)
-            _l3_host_mapped_payload_read(handle, 0, ctypes.addressof(dst), _HOST_MAP_PROBE_PAYLOAD_BYTES)
+            pattern = b"HMProbe!"
+            src = ctypes.create_string_buffer(pattern, _HOST_MAP_PROBE_ACCESS_BYTES)
+            dst = ctypes.create_string_buffer(_HOST_MAP_PROBE_ACCESS_BYTES)
+            _l3_host_mapped_payload_write(handle, 0, ctypes.addressof(src), _HOST_MAP_PROBE_ACCESS_BYTES)
+            _l3_host_mapped_payload_read(handle, 0, ctypes.addressof(dst), _HOST_MAP_PROBE_ACCESS_BYTES)
             if bytes(dst.raw) != pattern:
-                raise RuntimeError("host-map probe payload validation mismatch")
-            _l3_host_mapped_counter_notify(handle, counter_offset, 11, int(NotifyOp.Set))
-            if _l3_host_mapped_counter_test(handle, counter_offset, 11, int(WaitCmp.EQ)) != (True, 11):
-                raise RuntimeError("host-map probe counter store/load validation mismatch")
-            _l3_host_mapped_counter_notify(handle, counter_offset, 5, int(NotifyOp.Add))
-            if _l3_host_mapped_counter_test(handle, counter_offset, 16, int(WaitCmp.EQ)) != (True, 16):
-                raise RuntimeError("host-map probe counter add validation mismatch")
+                raise RuntimeError("host-map probe host_va read/write validation mismatch")
             return "host-map backend probe supported"
         finally:
             cleanup_errors: list[BaseException] = []

@@ -783,6 +783,60 @@ def test_l3_l2_region_fails_on_probe_infrastructure_error(monkeypatch):
         shm.unlink()
 
 
+def test_l3_l2_region_backend_probe_uses_minimal_host_va_read_write(monkeypatch):
+    worker, shm, fake_c_worker = _make_started_onboard_worker()
+    worker._l3_l2_region_backend_cache.clear()
+    calls: list[tuple] = []
+    try:
+        monkeypatch.setattr(
+            worker,
+            "_create_l3_l2_host_map_region",
+            lambda _worker_id, _backend, payload_bytes, counter_bytes: (
+                calls.append(("create", _worker_id, _backend, payload_bytes, counter_bytes))
+                or (_host_registered_reply(9, 68), 64, 68)
+            ),
+        )
+        monkeypatch.setattr(
+            worker,
+            "_import_host_registered_region",
+            lambda _backend, _reply: calls.append(("import", _backend, _reply.desc.region_id)) or 44,
+        )
+        monkeypatch.setattr(
+            worker_module,
+            "_l3_host_mapped_payload_write",
+            lambda handle, offset, src, nbytes: calls.append(
+                ("write", handle, offset, nbytes, ctypes.string_at(src, nbytes))
+            ),
+        )
+
+        def payload_read(handle, offset, dst, nbytes):
+            calls.append(("read", handle, offset, nbytes))
+            ctypes.memmove(dst, b"HMProbe!", nbytes)
+
+        monkeypatch.setattr(worker_module, "_l3_host_mapped_payload_read", payload_read)
+        monkeypatch.setattr(
+            worker_module, "_l3_host_mapped_region_close", lambda handle: calls.append(("close", handle))
+        )
+
+        reason = worker._probe_selected_l3_l2_host_map_backend(
+            0, worker_module._RegionHostMapBackend.DIRECT_HAL_HOST_REGISTER
+        )
+
+        assert reason == "host-map backend probe supported"
+        assert calls == [
+            ("create", 0, worker_module._RegionHostMapBackend.DIRECT_HAL_HOST_REGISTER, 8, 4),
+            ("import", worker_module._RegionHostMapBackend.DIRECT_HAL_HOST_REGISTER, 9),
+            ("write", 44, 0, 8, b"HMProbe!"),
+            ("read", 44, 0, 8),
+            ("close", 44),
+        ]
+        assert fake_c_worker.release_calls == [(0, 9)]
+    finally:
+        worker._close_l3_l2_orch_comm()
+        shm.close()
+        shm.unlink()
+
+
 def test_l3_l2_region_backend_probe_result_is_cached_per_worker_device(monkeypatch):
     worker, shm, _fake = _make_started_onboard_worker()
     worker._l3_l2_region_backend_cache.clear()
