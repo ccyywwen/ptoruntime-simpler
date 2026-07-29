@@ -19,6 +19,7 @@ enum class L3L2RegionAccessProfile : uint32_t {
     INVALID = 0,
     ONBOARD_VMM = 1,
     SIM_POSIX_SHM = 2,
+    ONBOARD_HOST_REGISTERED = 3,
 };
 
 struct L3HostRegionMappingHandle {

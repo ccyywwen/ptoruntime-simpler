@@ -820,9 +820,10 @@ int DeviceRunner::init_pmu(
 }
 
 int DeviceRunner::init_scope_stats(int num_threads, int device_id) {
-    // a5: register_cb=nullptr, so the collector mallocs a host shadow per
-    // device buffer + rtMemcpy's the zeroed shadow to device (see
-    // ProfilerBase::alloc_paired_buffer). No halHostRegister on a5.
+    // This collector path passes register_cb=nullptr, so it mallocs a host
+    // shadow per device buffer + rtMemcpy's the zeroed shadow to device (see
+    // ProfilerBase::alloc_paired_buffer). Host-map support is decided by the
+    // dedicated capability probe, not by this collector setup.
     int rc = scope_stats_collector_.init(num_threads, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, device_id);
     if (rc != 0) {
         return rc;
@@ -833,9 +834,10 @@ int DeviceRunner::init_scope_stats(int num_threads, int device_id) {
 }
 
 int DeviceRunner::init_dep_gen(int num_threads, int device_id) {
-    // a5: register_cb=nullptr, so the collector mallocs a host shadow per
-    // device buffer + rtMemcpy's the zeroed shadow to device. No
-    // halHostRegister on a5 (matches PMU / L2 swimlane / dump collectors).
+    // This collector path passes register_cb=nullptr, so it mallocs a host
+    // shadow per device buffer + rtMemcpy's the zeroed shadow to device. This
+    // mirrors PMU / L2 swimlane / dump collectors; host-map support is decided
+    // by the dedicated capability probe, not by this collector setup.
     int rc = dep_gen_collector_.init(num_threads, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, device_id);
     if (rc != 0) {
         return rc;

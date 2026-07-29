@@ -46,6 +46,7 @@ class L3L2RegionAccessProfile(IntEnum):
     INVALID = 0
     ONBOARD_VMM = 1
     SIM_POSIX_SHM = 2
+    ONBOARD_HOST_REGISTERED = 3
 
 
 _MAX_SIGNED_CHRONO_TIMEOUT_NS = 2**63 - 1
@@ -213,9 +214,13 @@ def validate_region_create_reply(
     if reply.access_profile == L3L2RegionAccessProfile.SIM_POSIX_SHM and reply.mapping_bytes != total_bytes:
         profile = reply.access_profile.name.lower()
         raise RuntimeError(f"create_l3_l2_region: {profile} reply mapping_bytes does not match descriptor layout")
-    if reply.access_profile == L3L2RegionAccessProfile.ONBOARD_VMM:
+    if reply.access_profile in (
+        L3L2RegionAccessProfile.ONBOARD_VMM,
+        L3L2RegionAccessProfile.ONBOARD_HOST_REGISTERED,
+    ):
         if reply.mapping_bytes < total_bytes:
-            raise RuntimeError("create_l3_l2_region: onboard_vmm reply mapping_bytes is smaller than descriptor layout")
+            profile = reply.access_profile.name.lower()
+            raise RuntimeError(f"create_l3_l2_region: {profile} reply mapping_bytes is smaller than descriptor layout")
     return counter_offset, total_bytes
 
 

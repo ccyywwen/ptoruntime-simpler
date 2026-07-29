@@ -85,10 +85,19 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     RUNTIME_ENV_RING_COUNT,
     TENSOR_CHILD_MEMORY_OFFSET,
     WorkerType,
+    _host_map_capability_probe,
     _l3_child_onboard_region_close,
     _l3_child_onboard_region_create,
+    _l3_child_onboard_region_create_direct,
+    _l3_host_mapped_counter_notify,
+    _l3_host_mapped_counter_test,
+    _l3_host_mapped_payload_read,
+    _l3_host_mapped_payload_write,
+    _l3_host_mapped_region_close,
     _l3_host_mapped_region_import_onboard,
+    _l3_host_mapped_region_import_onboard_host_registered,
     _l3_host_mapped_region_import_sim,
+    _l3_host_mapped_region_register_onboard_direct,
     _mailbox_load_i32,
     _mailbox_store_i32,
     read_args_from_blob,
@@ -119,6 +128,8 @@ from .l3_l2_orch_comm import (
     L3L2OrchRegion,
     L3L2RegionAccessProfile,
     L3L2RegionCreateRequest,
+    NotifyOp,
+    WaitCmp,
     _align_up,
     _checked_add_u64,
     decode_region_create_reply,
@@ -306,6 +317,7 @@ _BLOB_TENSOR_STRIDE = 128
 _BLOB_HEADER_BYTES = 8
 _CTRL_L3_L2_REGION_CREATE = 16
 _CTRL_L3_L2_REGION_RELEASE = 17
+_CTRL_L3_L2_HOST_MAP_PROBE = 18
 
 # Layout of the CTRL_COMM_INIT request shm.
 _COMM_INIT_HEADER = struct.Struct("<II")  # rank (u32), nranks (u32)
@@ -336,6 +348,7 @@ assert _DOMAIN_REQ_HEADER.size == 32
 
 # Domain-allocation reply shm layout: 24-byte header + buffer_ptrs (u64).
 _DOMAIN_REPLY_HEADER = struct.Struct("<QQI4x")
+_HOST_MAP_PROBE_REQUEST = struct.Struct("<QQQ")
 # fields: device_ctx (u64), local_window_base (u64),
 #         buffer_count (u32), padding (4 bytes)
 assert _DOMAIN_REPLY_HEADER.size == 24
@@ -1274,6 +1287,26 @@ class _L2HostL3L2RegionReplyMeta:
     shareable_handle: int
 
 
+class _RegionHostMapBackend(enum.Enum):
+    NONE = "none"
+    DIRECT_HAL_HOST_REGISTER = "direct_hal_host_register"
+    VMM_IMPORT_THEN_HOST_REGISTER = "vmm_import_then_host_register"
+
+
+_HOST_MAP_PROBE_PAYLOAD_BYTES = 256
+_HOST_MAP_PROBE_COUNTER_BYTES = 64
+_HOST_MAP_KNOWN_UNSUPPORTED_RCS = {8, 22, 87}
+
+
+@dataclass(frozen=True)
+class _RegionDataPlaneDecision:
+    access_profile: L3L2RegionAccessProfile
+    backend: _RegionHostMapBackend
+    status: str
+    stage: str
+    reason: str
+
+
 def _release_l2_host_l3_l2_region(region: _L2HostL3L2Region) -> None:
     if region.shm is not None:
         region.shm.close()
@@ -1317,9 +1350,23 @@ def _create_sim_l3_l2_region(
 
 
 def _create_onboard_l3_l2_region(
-    cw: ChipWorker, request: L3L2RegionCreateRequest, region_id: int, counter_offset: int, total_bytes: int
+    cw: ChipWorker,
+    request: L3L2RegionCreateRequest,
+    region_id: int,
+    counter_offset: int,
+    total_bytes: int,
+    access_profile: L3L2RegionAccessProfile = L3L2RegionAccessProfile.ONBOARD_VMM,
+    host_map_backend: _RegionHostMapBackend = _RegionHostMapBackend.NONE,
 ) -> tuple[_L2HostL3L2Region, _L2HostL3L2RegionReplyMeta]:
-    export = _l3_child_onboard_region_create(total_bytes)
+    if access_profile == L3L2RegionAccessProfile.ONBOARD_HOST_REGISTERED:
+        if host_map_backend == _RegionHostMapBackend.DIRECT_HAL_HOST_REGISTER:
+            export = _l3_child_onboard_region_create_direct(total_bytes)
+        elif host_map_backend == _RegionHostMapBackend.VMM_IMPORT_THEN_HOST_REGISTER:
+            export = _l3_child_onboard_region_create(total_bytes)
+        else:
+            raise RuntimeError("ONBOARD_HOST_REGISTERED requires an implemented host-map backend")
+    else:
+        export = _l3_child_onboard_region_create(total_bytes)
     dev_ptr = int(export.device_addr)
     region = _L2HostL3L2Region(
         region_id=region_id,
@@ -1335,7 +1382,7 @@ def _create_onboard_l3_l2_region(
     meta = _L2HostL3L2RegionReplyMeta(
         payload_base=dev_ptr,
         backing_name=b"",
-        access_profile=L3L2RegionAccessProfile.ONBOARD_VMM,
+        access_profile=access_profile,
         mapping_bytes=int(export.mapping_bytes),
         shareable_handle=int(export.shareable_handle),
     )
@@ -1407,6 +1454,65 @@ def _handle_ctrl_l3_l2_region_create(
         del reply_buf
         req_shm.close()
         reply_shm.close()
+
+
+def _handle_ctrl_l3_l2_host_map_probe(cw: ChipWorker, buf: memoryview, store: _L2HostL3L2RegionStore) -> None:
+    staged = SharedMemory(name=_read_ctrl_staged_shm_name(buf))
+    staged_buf = cast(memoryview, staged.buf)
+    region: _L2HostL3L2Region | None = None
+    try:
+        backend_value, payload_bytes, counter_bytes = _HOST_MAP_PROBE_REQUEST.unpack_from(staged_buf, 0)
+        backend = {
+            1: _RegionHostMapBackend.DIRECT_HAL_HOST_REGISTER,
+            2: _RegionHostMapBackend.VMM_IMPORT_THEN_HOST_REGISTER,
+        }.get(int(backend_value))
+        if backend is None:
+            raise RuntimeError(f"CTRL_L3_L2_HOST_MAP_PROBE unknown backend {int(backend_value)}")
+        request = L3L2RegionCreateRequest(
+            magic_version=_REGION_MAGIC_VERSION,
+            request_bytes=_REGION_CREATE_REQUEST_BYTES,
+            payload_bytes=int(payload_bytes),
+            counter_bytes=int(counter_bytes),
+        )
+        counter_offset = _align_up(request.payload_bytes, _REGION_LAYOUT_ALIGNMENT)
+        total_bytes = _checked_add_u64(counter_offset, request.counter_bytes)
+        region_id = store.next_region_id
+        store.next_region_id += 1
+        region, meta = _create_onboard_l3_l2_region(
+            cw,
+            request,
+            region_id,
+            counter_offset,
+            total_bytes,
+            L3L2RegionAccessProfile.ONBOARD_HOST_REGISTERED,
+            backend,
+        )
+        _REGION_CREATE_REPLY.pack_into(
+            staged_buf,
+            _HOST_MAP_PROBE_REQUEST.size,
+            _REGION_MAGIC_VERSION,
+            region_id,
+            meta.payload_base,
+            request.payload_bytes,
+            meta.payload_base + counter_offset,
+            request.counter_bytes,
+            int(meta.access_profile),
+            0,
+            int(getattr(cw, "device_id", -1)),
+            b"\x00" * _CTRL_SHM_TOKEN_BYTES,
+            meta.mapping_bytes,
+            meta.shareable_handle,
+        )
+        store.regions[region_id] = region
+        region = None
+    finally:
+        if region is not None:
+            try:
+                _release_l2_host_l3_l2_region(region)
+            except (BufferError, FileNotFoundError, OSError, RuntimeError):
+                pass
+        del staged_buf
+        staged.close()
 
 
 def _handle_ctrl_l3_l2_region_release(buf: memoryview, store: _L2HostL3L2RegionStore) -> None:
@@ -1641,6 +1747,8 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                 _handle_ctrl_unmap_host(buf, host_buf_table, host_buf_ranges)
             elif sub_cmd == _CTRL_L3_L2_REGION_CREATE:
                 _handle_ctrl_l3_l2_region_create(cw, buf, chip_platform, l3_l2_region_store)
+            elif sub_cmd == _CTRL_L3_L2_HOST_MAP_PROBE:
+                _handle_ctrl_l3_l2_host_map_probe(cw, buf, l3_l2_region_store)
             elif sub_cmd == _CTRL_L3_L2_REGION_RELEASE:
                 _handle_ctrl_l3_l2_region_release(buf, l3_l2_region_store)
             else:
@@ -2332,6 +2440,7 @@ class Worker:
 
         self._live_l3_l2_regions: list[Any] = []
         self._l3_l2_orch_comm_host_buffers: dict[int, int] = {}
+        self._l3_l2_region_backend_cache: dict[tuple[int, int, str], _RegionDataPlaneDecision] = {}
 
         # Live-provenance of child (kind4, device) pointers, keyed on the exact
         # ``(worker_id, device_ptr)`` composite: a raw device VA is not globally
@@ -4888,6 +4997,196 @@ class Worker:
                 f"L3-L2 payload Tensor size {nbytes} exceeds registered shared storage {registered_nbytes}"
             )
 
+    @staticmethod
+    def _host_map_backend_probe_code(backend: _RegionHostMapBackend) -> int:
+        if backend == _RegionHostMapBackend.DIRECT_HAL_HOST_REGISTER:
+            return 1
+        if backend == _RegionHostMapBackend.VMM_IMPORT_THEN_HOST_REGISTER:
+            return 2
+        raise RuntimeError(f"host-map probe has no implementation for backend={backend.value}")
+
+    @staticmethod
+    def _is_known_host_map_unsupported(exc: BaseException) -> bool:
+        text = str(exc)
+        if "returned null host_va" in text or "host_va == nullptr" in text:
+            return True
+        for rc in _HOST_MAP_KNOWN_UNSUPPORTED_RCS:
+            if f"rc={rc}" in text or f"code {rc}" in text:
+                return True
+        return False
+
+    def _create_l3_l2_host_map_region(
+        self, worker_id: int, backend: _RegionHostMapBackend, payload_bytes: int, counter_bytes: int
+    ) -> tuple[L3L2RegionCreateReply, int, int]:
+        assert self._worker is not None
+        size = _HOST_MAP_PROBE_REQUEST.size + _REGION_CREATE_REPLY_BYTES
+        shm = SharedMemory(create=True, size=size)
+        buf = cast(memoryview, shm.buf)
+        try:
+            _HOST_MAP_PROBE_REQUEST.pack_into(
+                buf,
+                0,
+                self._host_map_backend_probe_code(backend),
+                int(payload_bytes),
+                int(counter_bytes),
+            )
+            self._worker.control_generic(int(worker_id), _CTRL_L3_L2_HOST_MAP_PROBE, shm.name, size, self._py_control_timeout_s)
+            reply_buf = bytes(buf[_HOST_MAP_PROBE_REQUEST.size : _HOST_MAP_PROBE_REQUEST.size + _REGION_CREATE_REPLY_BYTES])
+            region_id = peek_region_create_reply_region_id(reply_buf)
+            reply = decode_region_create_reply(reply_buf)
+            counter_offset, total_bytes = validate_region_create_reply(
+                reply, L3L2RegionAccessProfile.ONBOARD_HOST_REGISTERED
+            )
+            return reply, counter_offset, total_bytes
+        finally:
+            del buf
+            try:
+                shm.close()
+                shm.unlink()
+            except (BufferError, FileNotFoundError, OSError):
+                pass
+
+    def _import_host_registered_region(
+        self, backend: _RegionHostMapBackend, reply: L3L2RegionCreateReply
+    ) -> int:
+        if backend == _RegionHostMapBackend.DIRECT_HAL_HOST_REGISTER:
+            return int(
+                _l3_host_mapped_region_register_onboard_direct(
+                    int(reply.device_id), int(reply.desc.payload_base), int(reply.mapping_bytes)
+                )
+            )
+        if backend == _RegionHostMapBackend.VMM_IMPORT_THEN_HOST_REGISTER:
+            return int(
+                _l3_host_mapped_region_import_onboard_host_registered(
+                    int(reply.device_id), int(reply.shareable_handle), int(reply.mapping_bytes)
+                )
+            )
+        raise RuntimeError(f"host-map backend={backend.value} is not implemented")
+
+    def _probe_selected_l3_l2_host_map_backend(self, worker_id: int, backend: _RegionHostMapBackend) -> str:
+        reply: L3L2RegionCreateReply | None = None
+        handle: int | None = None
+        try:
+            reply, counter_offset, _total_bytes = self._create_l3_l2_host_map_region(
+                worker_id, backend, _HOST_MAP_PROBE_PAYLOAD_BYTES, _HOST_MAP_PROBE_COUNTER_BYTES
+            )
+            handle = self._import_host_registered_region(backend, reply)
+            pattern = bytes((i % 251 for i in range(_HOST_MAP_PROBE_PAYLOAD_BYTES)))
+            src = ctypes.create_string_buffer(pattern, _HOST_MAP_PROBE_PAYLOAD_BYTES)
+            dst = ctypes.create_string_buffer(_HOST_MAP_PROBE_PAYLOAD_BYTES)
+            _l3_host_mapped_payload_write(handle, 0, ctypes.addressof(src), _HOST_MAP_PROBE_PAYLOAD_BYTES)
+            _l3_host_mapped_payload_read(handle, 0, ctypes.addressof(dst), _HOST_MAP_PROBE_PAYLOAD_BYTES)
+            if bytes(dst.raw) != pattern:
+                raise RuntimeError("host-map probe payload validation mismatch")
+            _l3_host_mapped_counter_notify(handle, counter_offset, 11, int(NotifyOp.Set))
+            if _l3_host_mapped_counter_test(handle, counter_offset, 11, int(WaitCmp.EQ)) != (True, 11):
+                raise RuntimeError("host-map probe counter store/load validation mismatch")
+            _l3_host_mapped_counter_notify(handle, counter_offset, 5, int(NotifyOp.Add))
+            if _l3_host_mapped_counter_test(handle, counter_offset, 16, int(WaitCmp.EQ)) != (True, 16):
+                raise RuntimeError("host-map probe counter add validation mismatch")
+            return "host-map backend probe supported"
+        finally:
+            cleanup_errors: list[BaseException] = []
+            if handle is not None:
+                try:
+                    _l3_host_mapped_region_close(int(handle))
+                except BaseException as exc:  # noqa: BLE001
+                    cleanup_errors.append(exc)
+            if reply is not None:
+                try:
+                    assert self._worker is not None
+                    self._worker.control_l3_l2_region_release(int(worker_id), int(reply.desc.region_id))
+                except BaseException as exc:  # noqa: BLE001
+                    cleanup_errors.append(exc)
+            if cleanup_errors:
+                raise RuntimeError(f"host-map probe cleanup failed: {cleanup_errors[0]}") from cleanup_errors[0]
+
+    def _cache_l3_l2_region_backend_decision(
+        self,
+        key: tuple[int, int, str],
+        decision: _RegionDataPlaneDecision,
+        *,
+        worker_id: int,
+        device_id: int,
+        platform: str,
+    ) -> _RegionDataPlaneDecision:
+        self._l3_l2_region_backend_cache[key] = decision
+        _simpler_log.get_logger().info(
+            "L3-L2 region backend decision worker_id=%s device_id=%s platform=%s access_profile=%s "
+            "backend=%s status=%s stage=%s reason=%s",
+            int(worker_id),
+            int(device_id),
+            platform,
+            decision.access_profile.name,
+            decision.backend.value,
+            decision.status,
+            decision.stage,
+            decision.reason,
+        )
+        return decision
+
+    def _select_l3_l2_region_backend(self, worker_id: int) -> _RegionDataPlaneDecision:
+        platform = str(self._config.get("platform", ""))
+        if platform.endswith("sim"):
+            return _RegionDataPlaneDecision(
+                L3L2RegionAccessProfile.SIM_POSIX_SHM, _RegionHostMapBackend.NONE, "supported", "sim", "sim path"
+            )
+        device_ids = self._config.get("device_ids", [])
+        device_id = int(device_ids[int(worker_id)])
+        key = (int(worker_id), device_id, platform)
+        cached = self._l3_l2_region_backend_cache.get(key)
+        if cached is not None:
+            return cached
+        primitive = _host_map_capability_probe(device_id)
+        primitive_status = str(primitive.get("status", "probe_error"))
+        if primitive_status == "unsupported":
+            decision = _RegionDataPlaneDecision(
+                L3L2RegionAccessProfile.ONBOARD_VMM,
+                _RegionHostMapBackend.NONE,
+                "unsupported",
+                str(primitive.get("stage", "primitive")),
+                str(primitive.get("reason", "host-map primitive unsupported")),
+            )
+            return self._cache_l3_l2_region_backend_decision(
+                key, decision, worker_id=int(worker_id), device_id=device_id, platform=platform
+            )
+        if primitive_status != "supported":
+            raise RuntimeError(
+                "create_l3_l2_region: host-map primitive probe failed "
+                f"backend={_RegionHostMapBackend.DIRECT_HAL_HOST_REGISTER.value} device_id={device_id} worker_id={int(worker_id)} "
+                f"size=probe stage={primitive.get('stage', 'primitive')} rc={primitive.get('register_rc', 0)} "
+                f"reason={primitive.get('reason', primitive_status)}"
+            )
+        try:
+            reason = self._probe_selected_l3_l2_host_map_backend(int(worker_id), _RegionHostMapBackend.DIRECT_HAL_HOST_REGISTER)
+        except Exception as exc:
+            if self._is_known_host_map_unsupported(exc):
+                decision = _RegionDataPlaneDecision(
+                    L3L2RegionAccessProfile.ONBOARD_VMM,
+                    _RegionHostMapBackend.NONE,
+                    "unsupported",
+                    "backend_probe",
+                    str(exc),
+                )
+                return self._cache_l3_l2_region_backend_decision(
+                    key, decision, worker_id=int(worker_id), device_id=device_id, platform=platform
+                )
+            raise RuntimeError(
+                "create_l3_l2_region: host-map backend probe failed "
+                f"backend={_RegionHostMapBackend.DIRECT_HAL_HOST_REGISTER.value} device_id={device_id} worker_id={int(worker_id)} "
+                f"size=probe stage=backend_probe rc=probe_error reason={exc}"
+            ) from exc
+        decision = _RegionDataPlaneDecision(
+            L3L2RegionAccessProfile.ONBOARD_HOST_REGISTERED,
+            _RegionHostMapBackend.DIRECT_HAL_HOST_REGISTER,
+            "supported",
+            "backend_probe",
+            reason,
+        )
+        return self._cache_l3_l2_region_backend_decision(
+            key, decision, worker_id=int(worker_id), device_id=device_id, platform=platform
+        )
+
     def _create_l3_l2_region(self, worker_id: int, payload_bytes: int, counter_bytes: int):  # noqa: PLR0912
         if payload_bytes <= 0:
             raise ValueError("create_l3_l2_region: payload_bytes must be positive")
@@ -4902,35 +5201,53 @@ class Worker:
         region_id = 0
         l3_host_mapping = None
         try:
-            L3L2RegionCreateRequest(
-                magic_version=_REGION_MAGIC_VERSION,
-                request_bytes=_REGION_CREATE_REQUEST_BYTES,
-                payload_bytes=int(payload_bytes),
-                counter_bytes=int(counter_bytes),
-            ).encode_into(req_buf)
             worker = self._worker
             assert worker is not None
-            worker.control_l3_l2_region_create(int(worker_id), req_shm.name, reply_shm.name)
-            # Peek before decode: decode rejects malformed replies, but the
-            # child has already created the region and the rollback below
-            # still needs the id.
-            region_id = peek_region_create_reply_region_id(reply_buf)
-            reply = decode_region_create_reply(reply_buf)
+            decision = self._select_l3_l2_region_backend(int(worker_id))
             platform = str(self._config.get("platform", ""))
-            expected_access_profile = (
-                L3L2RegionAccessProfile.SIM_POSIX_SHM
-                if platform.endswith("sim")
-                else L3L2RegionAccessProfile.ONBOARD_VMM
-            )
-            counter_offset, total_bytes = validate_region_create_reply(reply, expected_access_profile)
-            if platform.endswith("sim"):
-                handle = _l3_host_mapped_region_import_sim(reply.backing_shm, int(reply.mapping_bytes))
+            if decision.access_profile == L3L2RegionAccessProfile.ONBOARD_HOST_REGISTERED:
+                try:
+                    reply, counter_offset, total_bytes = self._create_l3_l2_host_map_region(
+                        int(worker_id), _RegionHostMapBackend.DIRECT_HAL_HOST_REGISTER, int(payload_bytes), int(counter_bytes)
+                    )
+                    region_id = int(reply.desc.region_id)
+                    handle = int(
+                        _l3_host_mapped_region_register_onboard_direct(
+                            int(reply.device_id), int(reply.desc.payload_base), int(reply.mapping_bytes)
+                        )
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        "create_l3_l2_region: host-registered real region creation failed "
+                        f"backend={decision.backend.value} device_id={self._config.get('device_ids', [None])[int(worker_id)]} "
+                        f"worker_id={int(worker_id)} size={int(payload_bytes) + int(counter_bytes)} "
+                        f"stage=real_create rc=probe_error reason={exc}"
+                    ) from exc
             else:
-                handle = _l3_host_mapped_region_import_onboard(
-                    int(reply.device_id),
-                    int(reply.shareable_handle),
-                    int(reply.mapping_bytes),
+                L3L2RegionCreateRequest(
+                    magic_version=_REGION_MAGIC_VERSION,
+                    request_bytes=_REGION_CREATE_REQUEST_BYTES,
+                    payload_bytes=int(payload_bytes),
+                    counter_bytes=int(counter_bytes),
+                ).encode_into(req_buf)
+                worker.control_l3_l2_region_create(int(worker_id), req_shm.name, reply_shm.name)
+                # Peek before decode: decode rejects malformed replies, but the
+                # child has already created the region and the rollback below
+                # still needs the id.
+                region_id = peek_region_create_reply_region_id(reply_buf)
+                reply = decode_region_create_reply(reply_buf)
+                expected_access_profile = (
+                    L3L2RegionAccessProfile.SIM_POSIX_SHM if platform.endswith("sim") else L3L2RegionAccessProfile.ONBOARD_VMM
                 )
+                counter_offset, total_bytes = validate_region_create_reply(reply, expected_access_profile)
+                if platform.endswith("sim"):
+                    handle = _l3_host_mapped_region_import_sim(reply.backing_shm, int(reply.mapping_bytes))
+                else:
+                    handle = _l3_host_mapped_region_import_onboard(
+                        int(reply.device_id),
+                        int(reply.shareable_handle),
+                        int(reply.mapping_bytes),
+                    )
             l3_host_mapping = L3HostRegionMapping(
                 worker_id=int(worker_id),
                 region_id=region_id,
@@ -4996,7 +5313,11 @@ class Worker:
         if errors:
             raise errors[0]
 
+    def _clear_l3_l2_region_backend_cache(self) -> None:
+        self._l3_l2_region_backend_cache.clear()
+
     def _close_l3_l2_orch_comm(self) -> None:
+        self._clear_l3_l2_region_backend_cache()
         for region in self._live_l3_l2_regions:
             try:
                 region._close_l3_host_mapping()
@@ -5599,6 +5920,7 @@ class Worker:
         """Drop the whole child-pointer provenance table (close-path hygiene)."""
         with self._child_prov_lock:
             self._child_alloc_prov.clear()
+        self._clear_l3_l2_region_backend_cache()
 
     def _check_chip_worker_id(self, worker_id: int) -> None:
         """Range-check ``worker_id`` against the L3-level chip mailbox set.

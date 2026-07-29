@@ -185,6 +185,13 @@ def _make_started_onboard_worker(platform: str = "a2a3") -> tuple[Worker, Shared
     worker._lifecycle = worker_module._Lifecycle.READY
     worker._worker = fake_c_worker
     worker._chip_shms = [shm]
+    worker._l3_l2_region_backend_cache[(0, 2, platform)] = worker_module._RegionDataPlaneDecision(
+        worker_module.L3L2RegionAccessProfile.ONBOARD_VMM,
+        worker_module._RegionHostMapBackend.NONE,
+        "unsupported",
+        "test",
+        "test default acl-copy",
+    )
     return worker, shm, fake_c_worker
 
 
@@ -675,3 +682,214 @@ def test_sim_worker_counter_wait_timeout_does_not_poison_region_and_free_is_idem
         worker.run(orch)
     finally:
         worker.close()
+
+
+def _host_registered_reply(region_id: int = 1, mapping_bytes: int = 192):
+    desc = l3_l2_orch_comm.L3L2OrchRegionDesc(
+        magic_version=0x4C334C3200020000,
+        region_id=region_id,
+        payload_base=0xDEAD_0000,
+        payload_bytes=64,
+        counter_base=0xDEAD_0040,
+        counter_bytes=128,
+    )
+    return l3_l2_orch_comm.L3L2RegionCreateReply(
+        desc=desc,
+        access_profile=l3_l2_orch_comm.L3L2RegionAccessProfile.ONBOARD_HOST_REGISTERED,
+        device_id=2,
+        backing_shm="",
+        mapping_bytes=mapping_bytes,
+        shareable_handle=0xABCDEF,
+    )
+
+
+def test_l3_l2_region_reply_accepts_onboard_host_registered_profile():
+    counter_offset, total_bytes = l3_l2_orch_comm.validate_region_create_reply(
+        _host_registered_reply(), l3_l2_orch_comm.L3L2RegionAccessProfile.ONBOARD_HOST_REGISTERED
+    )
+
+    assert counter_offset == 64
+    assert total_bytes == 192
+
+
+def test_l3_l2_region_reply_rejects_unexpected_profile():
+    with pytest.raises(RuntimeError, match="access_profile must be onboard_vmm"):
+        l3_l2_orch_comm.validate_region_create_reply(
+            _host_registered_reply(), l3_l2_orch_comm.L3L2RegionAccessProfile.ONBOARD_VMM
+        )
+
+
+def test_l3_l2_region_selects_acl_copy_when_primitive_unsupported(monkeypatch):
+    worker, shm, _fake = _make_started_onboard_worker()
+    worker._l3_l2_region_backend_cache.clear()
+    try:
+        monkeypatch.setattr(
+            worker_module,
+            "_host_map_capability_probe",
+            lambda _device_id: {"status": "unsupported", "stage": "hal_load", "reason": "missing"},
+        )
+
+        decision = worker._select_l3_l2_region_backend(0)
+
+        assert decision.access_profile == l3_l2_orch_comm.L3L2RegionAccessProfile.ONBOARD_VMM
+        assert decision.stage == "hal_load"
+    finally:
+        worker._close_l3_l2_orch_comm()
+        shm.close()
+        shm.unlink()
+
+
+def test_l3_l2_region_selects_acl_copy_when_selected_backend_unsupported(monkeypatch):
+    worker, shm, _fake = _make_started_onboard_worker()
+    worker._l3_l2_region_backend_cache.clear()
+    calls = 0
+    try:
+        monkeypatch.setattr(worker_module, "_host_map_capability_probe", lambda _device_id: {"status": "supported"})
+
+        def backend_probe(_worker_id, _backend):
+            assert _backend == worker_module._RegionHostMapBackend.DIRECT_HAL_HOST_REGISTER
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("halHostRegister rc=8")
+
+        monkeypatch.setattr(worker, "_probe_selected_l3_l2_host_map_backend", backend_probe)
+
+        decision = worker._select_l3_l2_region_backend(0)
+
+        assert calls == 1
+        assert decision.access_profile == l3_l2_orch_comm.L3L2RegionAccessProfile.ONBOARD_VMM
+    finally:
+        worker._close_l3_l2_orch_comm()
+        shm.close()
+        shm.unlink()
+
+
+def test_l3_l2_region_fails_on_probe_infrastructure_error(monkeypatch):
+    worker, shm, _fake = _make_started_onboard_worker()
+    worker._l3_l2_region_backend_cache.clear()
+    try:
+        monkeypatch.setattr(worker_module, "_host_map_capability_probe", lambda _device_id: {"status": "supported"})
+        def backend_probe(_worker_id, _backend):
+            assert _backend == worker_module._RegionHostMapBackend.DIRECT_HAL_HOST_REGISTER
+            raise RuntimeError("payload validation mismatch")
+
+        monkeypatch.setattr(worker, "_probe_selected_l3_l2_host_map_backend", backend_probe)
+
+        with pytest.raises(RuntimeError, match="host-map backend probe failed"):
+            worker._select_l3_l2_region_backend(0)
+    finally:
+        worker._close_l3_l2_orch_comm()
+        shm.close()
+        shm.unlink()
+
+
+def test_l3_l2_region_backend_probe_result_is_cached_per_worker_device(monkeypatch):
+    worker, shm, _fake = _make_started_onboard_worker()
+    worker._l3_l2_region_backend_cache.clear()
+    calls = 0
+    try:
+        monkeypatch.setattr(worker_module, "_host_map_capability_probe", lambda _device_id: {"status": "supported"})
+
+        def backend_probe(_worker_id, _backend):
+            assert _backend == worker_module._RegionHostMapBackend.DIRECT_HAL_HOST_REGISTER
+            nonlocal calls
+            calls += 1
+            return "ok"
+
+        monkeypatch.setattr(worker, "_probe_selected_l3_l2_host_map_backend", backend_probe)
+
+        first = worker._select_l3_l2_region_backend(0)
+        second = worker._select_l3_l2_region_backend(0)
+
+        assert first is second
+        assert calls == 1
+        assert first.access_profile == l3_l2_orch_comm.L3L2RegionAccessProfile.ONBOARD_HOST_REGISTERED
+    finally:
+        worker._close_l3_l2_orch_comm()
+        shm.close()
+        shm.unlink()
+
+
+def test_l3_l2_region_backend_probe_cache_cleared_on_worker_close_helper():
+    worker, shm, _fake = _make_started_onboard_worker()
+    try:
+        assert worker._l3_l2_region_backend_cache
+        worker._close_l3_l2_orch_comm()
+        assert worker._l3_l2_region_backend_cache == {}
+    finally:
+        shm.close()
+        shm.unlink()
+
+
+def test_l3_l2_region_host_registered_create_failure_does_not_fallback(monkeypatch):
+    worker, shm, fake_c_worker = _make_started_onboard_worker()
+    worker._l3_l2_region_backend_cache[(0, 2, "a2a3")] = worker_module._RegionDataPlaneDecision(
+        l3_l2_orch_comm.L3L2RegionAccessProfile.ONBOARD_HOST_REGISTERED,
+        worker_module._RegionHostMapBackend.DIRECT_HAL_HOST_REGISTER,
+        "supported",
+        "test",
+        "test",
+    )
+    try:
+        monkeypatch.setattr(worker, "_create_l3_l2_host_map_region", lambda *_args: (_host_registered_reply(3), 64, 192))
+        monkeypatch.setattr(
+            worker_module,
+            "_l3_host_mapped_region_register_onboard_direct",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("register failed")),
+        )
+
+        with pytest.raises(RuntimeError, match="host-registered real region creation failed"):
+            worker._create_l3_l2_region(0, 64, 128)
+
+        assert fake_c_worker.create_calls == []
+        assert fake_c_worker.release_calls == [(0, 3)]
+    finally:
+        worker._close_l3_l2_orch_comm()
+        shm.close()
+        shm.unlink()
+
+
+def test_l3_l2_region_cleanup_reports_unregister_failure():
+    _task_interface_ext._l3_host_mapped_region_close_events_for_test()
+    storage = ctypes.create_string_buffer(64)
+    handle = _task_interface_ext._l3_host_mapped_region_make_host_registered_for_test(
+        0xDEAD_0000, ctypes.addressof(storage), 64, True, True
+    )
+
+    with pytest.raises(RuntimeError, match="halHostUnregister failed"):
+        _task_interface_ext._l3_host_mapped_region_close(handle)
+
+    assert _task_interface_ext._l3_host_mapped_region_close_events_for_test() == ["unregister", "release_import"]
+
+
+def test_l3_host_registered_payload_helpers_use_host_va_plus_offset():
+    device_storage = ctypes.create_string_buffer(b"D" * 64)
+    host_storage = ctypes.create_string_buffer(b"H" * 64)
+    src = ctypes.create_string_buffer(b"abcdefgh")
+    dst = ctypes.create_string_buffer(8)
+    handle = _task_interface_ext._l3_host_mapped_region_make_host_registered_for_test(
+        ctypes.addressof(device_storage), ctypes.addressof(host_storage), 64
+    )
+    try:
+        _task_interface_ext._l3_host_mapped_payload_write(handle, 16, ctypes.addressof(src), 8)
+        _task_interface_ext._l3_host_mapped_payload_read(handle, 16, ctypes.addressof(dst), 8)
+
+        assert bytes(host_storage.raw[16:24]) == b"abcdefgh"
+        assert bytes(device_storage.raw[16:24]) == b"D" * 8
+        assert bytes(dst.raw) == b"abcdefgh"
+    finally:
+        _task_interface_ext._l3_host_mapped_region_close(handle)
+
+
+def test_l3_host_registered_counter_add_remains_read_modify_write():
+    host_storage = ctypes.create_string_buffer(64)
+    handle = _task_interface_ext._l3_host_mapped_region_make_host_registered_for_test(
+        0xDEAD_0000, ctypes.addressof(host_storage), 64
+    )
+    try:
+        _task_interface_ext._l3_host_mapped_counter_notify(handle, 32, 3, int(NotifyOp.Set))
+        _task_interface_ext._l3_host_mapped_counter_notify(handle, 32, 4, int(NotifyOp.Add))
+
+        assert _task_interface_ext._l3_host_mapped_counter_test(handle, 32, 7, int(WaitCmp.EQ)) == (True, 7)
+    finally:
+        _task_interface_ext._l3_host_mapped_region_close(handle)

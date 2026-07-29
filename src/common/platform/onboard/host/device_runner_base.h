@@ -101,10 +101,9 @@ public:
      * host-readable VA (or nullptr on failure); the paired unregister releases
      * it. The returned VA may differ from dev_ptr, so callers must use it, not
      * dev_ptr, for host access. Register/unregister must be paired (unregister
-     * before free_tensor). On a2a3 onboard this wraps
-     * halHostRegister(DEV_SVM_MAP_HOST); a5 onboard has no host-map path and
-     * uses the base default. Base default: unsupported (returns nullptr /
-     * no-op); a2a3 overrides.
+     * before free_tensor). Onboard subclasses provide this only when the
+     * host-map primitive is available. Base default: unsupported (returns
+     * nullptr / no-op).
      */
     virtual void *register_device_memory_to_host(void *dev_ptr, std::size_t bytes) {
         (void)dev_ptr;

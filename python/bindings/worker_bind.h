@@ -746,6 +746,11 @@ inline void bind_worker(nb::module_ &m) {
             "Drive one NEXT_LEVEL chip child through CTRL_COMM_INIT (lazy base comm init)."
         )
         .def(
+            "control_generic", &Worker::control_generic, nb::arg("worker_id"), nb::arg("sub_cmd"),
+            nb::arg("shm_name"), nb::arg("payload_size"), nb::arg("timeout_s"), nb::call_guard<nb::gil_scoped_release>(),
+            "Drive one NEXT_LEVEL chip child through an internal generic control command."
+        )
+        .def(
             "control_l3_l2_region_create", &Worker::control_l3_l2_region_create, nb::arg("worker_id"),
             nb::arg("request_shm_name"), nb::arg("reply_shm_name"), nb::call_guard<nb::gil_scoped_release>(),
             "Drive one NEXT_LEVEL chip child through CTRL_L3_L2_REGION_CREATE."

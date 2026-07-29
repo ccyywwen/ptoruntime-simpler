@@ -22,6 +22,7 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
+#include <nanobind/stl/unordered_map.h>
 
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -55,6 +56,7 @@
 #include "dma_workspace.h"
 #include "l3_l2_orch_comm.h"
 #include "l3_l2_orch_region_access.h"
+#include "host_map_capability.h"
 #include "worker_bind.h"
 #include "task_args.h"
 #include "tensor.h"
@@ -109,6 +111,8 @@ public:
     int (*aclrtSetDevice)(int){nullptr};
     int (*aclrtGetDevice)(int *){nullptr};
     int (*aclrtMemcpy)(void *, size_t, const void *, size_t, int){nullptr};
+    int (*aclrtMalloc)(void **, size_t, int){nullptr};
+    int (*aclrtFree)(void *){nullptr};
     int (*aclrtMemGetAllocationGranularity)(LocalAclPhysicalMemProp *, int, size_t *){nullptr};
     int (*aclrtMallocPhysical)(void **, size_t, const LocalAclPhysicalMemProp *, uint64_t){nullptr};
     int (*aclrtFreePhysical)(void *){nullptr};
@@ -133,6 +137,8 @@ public:
         aclrtGetDevice = reinterpret_cast<int (*)(int *)>(resolve_symbol("aclrtGetDevice"));
         aclrtMemcpy =
             reinterpret_cast<int (*)(void *, size_t, const void *, size_t, int)>(resolve_symbol("aclrtMemcpy"));
+        aclrtMalloc = reinterpret_cast<int (*)(void **, size_t, int)>(resolve_symbol("aclrtMalloc"));
+        aclrtFree = reinterpret_cast<int (*)(void *)>(resolve_symbol("aclrtFree"));
         aclrtMemGetAllocationGranularity = reinterpret_cast<int (*)(LocalAclPhysicalMemProp *, int, size_t *)>(
             resolve_symbol("aclrtMemGetAllocationGranularity")
         );
@@ -163,7 +169,7 @@ public:
             return;
         }
         int rc = aclInit(nullptr);
-        if (rc != kAclSuccess) {
+        if (rc != kAclSuccess && rc != kAclErrorRepeatInitialize) {
             throw std::runtime_error("aclInit failed with code " + std::to_string(rc));
         }
         initialized_ = true;
@@ -184,6 +190,17 @@ public:
     void memcpy_d2h_with_check(void *dst, size_t dst_size, const void *src, size_t count) const {
         acl_check(aclrtMemcpy(dst, dst_size, src, count, kAclMemcpyDeviceToHost), "aclrtMemcpy D2H");
     }
+
+    void *device_malloc_with_check(uint64_t bytes) const {
+        void *dev_ptr = nullptr;
+        acl_check(aclrtMalloc(&dev_ptr, static_cast<size_t>(bytes), kAclMemMallocHugeFirst), "aclrtMalloc");
+        if (dev_ptr == nullptr) {
+            throw std::runtime_error("aclrtMalloc returned null");
+        }
+        return dev_ptr;
+    }
+
+    int device_free(void *dev_ptr) const { return aclrtFree(dev_ptr); }
 
     uint64_t vmm_granularity_with_check(int device_id) const {
         LocalAclPhysicalMemProp prop{};
@@ -270,9 +287,11 @@ public:
 
 private:
     static constexpr int kAclSuccess = 0;
+    static constexpr int kAclErrorRepeatInitialize = 100002;
     static constexpr int kAclMemcpyHostToDevice = 1;
     static constexpr int kAclMemcpyDeviceToHost = 2;
     static constexpr int kAclMemHandleTypeNone = 0;
+    static constexpr int kAclMemMallocHugeFirst = 0;
     static constexpr int kAclMemAllocationTypePinned = 0;
     static constexpr int kAclHbmMemNormal = 5;
     static constexpr int kAclMemLocationTypeDevice = 1;
@@ -313,6 +332,104 @@ AclRuntimeApi &acl_api() {
     return *api;
 }
 
+class HostMapHalApi {
+public:
+    bool load() {
+        if (loaded_) {
+            return true;
+        }
+        lib_ = dlopen("libascend_hal.so", RTLD_NOW | RTLD_LOCAL);
+        if (lib_ == nullptr) {
+            const char *err = dlerror();
+            last_error_ = err ? err : "dlopen failed";
+            return false;
+        }
+        loaded_ = true;
+        register_fn_ = reinterpret_cast<simpler::host_map::HalHostRegisterFn>(dlsym(lib_, "halHostRegister"));
+        unregister_fn_ = reinterpret_cast<simpler::host_map::HalHostUnregisterFn>(dlsym(lib_, "halHostUnregister"));
+        return true;
+    }
+
+    simpler::host_map::HalHostRegisterFn register_fn() const { return register_fn_; }
+    simpler::host_map::HalHostUnregisterFn unregister_fn() const { return unregister_fn_; }
+    const std::string &last_error() const { return last_error_; }
+
+private:
+    void *lib_{nullptr};
+    bool loaded_{false};
+    simpler::host_map::HalHostRegisterFn register_fn_{nullptr};
+    simpler::host_map::HalHostUnregisterFn unregister_fn_{nullptr};
+    std::string last_error_;
+};
+
+HostMapHalApi &host_map_hal_api() {
+    static HostMapHalApi api;
+    return api;
+}
+
+void *host_map_register_with_check(void *dev_ptr, uint64_t bytes, int device_id, const char *stage) {
+    HostMapHalApi &hal = host_map_hal_api();
+    if (!hal.load()) {
+        throw std::runtime_error(
+            std::string("L3-L2 host-registered mapping failed: backend=onboard_host_registered stage=") + stage +
+            " rc=hal_load reason=" + hal.last_error()
+        );
+    }
+    auto fn = hal.register_fn();
+    if (fn == nullptr) {
+        throw std::runtime_error(
+            std::string("L3-L2 host-registered mapping failed: backend=onboard_host_registered stage=") + stage +
+            " rc=symbol reason=halHostRegister missing"
+        );
+    }
+    void *host_va = nullptr;
+    int rc = fn(dev_ptr, static_cast<size_t>(bytes), simpler::host_map::DEV_SVM_MAP_HOST_FLAG, device_id, &host_va);
+    if (rc != 0 || host_va == nullptr) {
+        throw std::runtime_error(
+            std::string("L3-L2 host-registered mapping failed: backend=onboard_host_registered stage=") + stage +
+            " rc=" + std::to_string(rc) + " reason=halHostRegister failed"
+        );
+    }
+    return host_va;
+}
+
+void host_map_unregister_collecting(void *dev_ptr, int device_id, std::string &cleanup_error) {
+    if (dev_ptr == nullptr) {
+        return;
+    }
+    HostMapHalApi &hal = host_map_hal_api();
+    if (!hal.load()) {
+        append_cleanup_error(cleanup_error, "halHostUnregister load failed: " + hal.last_error());
+        return;
+    }
+    auto fn = hal.unregister_fn();
+    if (fn == nullptr) {
+        append_cleanup_error(cleanup_error, "halHostUnregister symbol missing");
+        return;
+    }
+    int rc = fn(dev_ptr, device_id);
+    if (rc != 0) {
+        append_cleanup_error(cleanup_error, "halHostUnregister failed with code " + std::to_string(rc));
+    }
+}
+
+nb::dict host_map_capability_to_dict(const simpler::host_map::HostMapCapability &cap) {
+    nb::dict d;
+    d["status"] = simpler::host_map::status_name(cap.status);
+    d["hal_loaded"] = cap.hal_loaded;
+    d["register_symbol_found"] = cap.register_symbol_found;
+    d["unregister_symbol_found"] = cap.unregister_symbol_found;
+    d["register_rc"] = cap.register_rc;
+    d["unregister_rc"] = cap.unregister_rc;
+    d["device_va"] = static_cast<uint64_t>(cap.device_va);
+    d["host_va"] = static_cast<uint64_t>(cap.host_va);
+    d["identity_va"] = cap.identity_va;
+    d["cleanup_ok"] = cap.cleanup_ok;
+    d["stage"] = cap.stage;
+    d["reason"] = cap.reason;
+    return d;
+}
+
 class L3HostMappedRegion {
 public:
     L3L2RegionAccessProfile profile{L3L2RegionAccessProfile::SIM_POSIX_SHM};
@@ -322,6 +439,12 @@ public:
     uint64_t shareable_handle{0};
     void *vmm_handle{nullptr};
     uint64_t mapping_bytes{0};
+    uint64_t host_va{0};
+    uint64_t host_register_key{0};
+    bool host_registered{false};
+    bool test_mode{false};
+    bool test_unregister_fails{false};
+    bool test_has_imported_state{false};
 
     void bind_acl_device() const {
         if (device_id < 0) {
@@ -343,6 +466,14 @@ public:
             std::memcpy(dst + offset, host_ptr, static_cast<size_t>(nbytes));
             return;
         }
+        if (profile == L3L2RegionAccessProfile::ONBOARD_HOST_REGISTERED) {
+            if (host_va == 0) {
+                throw std::runtime_error("L3-L2 host-registered mapped-region handle has no host_va");
+            }
+            auto *dst = reinterpret_cast<uint8_t *>(static_cast<uintptr_t>(host_va));
+            std::memcpy(dst + offset, host_ptr, static_cast<size_t>(nbytes));
+            return;
+        }
         bind_acl_device();
         void *dst = reinterpret_cast<void *>(static_cast<uintptr_t>(device_addr + offset));
         acl_api().memcpy_h2d_with_check(dst, static_cast<size_t>(nbytes), host_ptr, static_cast<size_t>(nbytes));
@@ -352,6 +483,14 @@ public:
         validate_mapping_range_or_throw(offset, nbytes);
         if (profile == L3L2RegionAccessProfile::SIM_POSIX_SHM) {
             const auto *src = reinterpret_cast<const uint8_t *>(static_cast<uintptr_t>(device_addr));
+            std::memcpy(host_ptr, src + offset, static_cast<size_t>(nbytes));
+            return;
+        }
+        if (profile == L3L2RegionAccessProfile::ONBOARD_HOST_REGISTERED) {
+            if (host_va == 0) {
+                throw std::runtime_error("L3-L2 host-registered mapped-region handle has no host_va");
+            }
+            const auto *src = reinterpret_cast<const uint8_t *>(static_cast<uintptr_t>(host_va));
             std::memcpy(host_ptr, src + offset, static_cast<size_t>(nbytes));
             return;
         }
@@ -434,6 +573,7 @@ public:
     uint64_t mapping_bytes{0};
     uint64_t shareable_handle{0};
     void *vmm_handle{nullptr};
+    bool direct_allocation{false};
 
     void bind_acl_device() const {
         if (device_id < 0) {
@@ -514,6 +654,13 @@ private:
 };
 
 L2ChildOnboardRegionRegistry g_l2_child_onboard_regions;
+std::mutex g_l3_host_mapped_region_test_events_mu;
+std::vector<std::string> g_l3_host_mapped_region_test_events;
+
+void record_l3_host_mapping_test_event(const std::string &event) {
+    std::lock_guard<std::mutex> lk(g_l3_host_mapped_region_test_events_mu);
+    g_l3_host_mapped_region_test_events.push_back(event);
+}
 
 uint64_t align_vmm_bytes(uint64_t bytes, uint64_t granularity) {
     if (bytes == 0 || bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
@@ -1560,6 +1707,14 @@ NB_MODULE(_task_interface, m) {
         .def_ro("registry_handle", &L2ChildOnboardRegionExport::registry_handle);
 
     m.def(
+        "_host_map_capability_probe",
+        [](int device_id) -> nb::dict {
+            return host_map_capability_to_dict(simpler::host_map::query_host_map_capability(device_id));
+        },
+        nb::arg("device_id"), "Probe HAL host-map primitive support for one device."
+    );
+
+    m.def(
         "_l3_host_mapped_region_import_sim",
         [](const std::string &token, uint64_t mapping_bytes) -> uint64_t {
             if (mapping_bytes == 0 || mapping_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
@@ -1622,6 +1777,110 @@ NB_MODULE(_task_interface, m) {
         nb::call_guard<nb::gil_scoped_release>(), "Import an onboard VMM L3-L2 region for L3 Host mapped-region access."
     );
     m.def(
+        "_l3_host_mapped_region_register_onboard_direct",
+        [](int device_id, uint64_t device_addr, uint64_t mapping_bytes) -> uint64_t {
+            if (device_id < 0) {
+                throw std::invalid_argument("L3-L2 direct host-register import requires a non-negative device id");
+            }
+            if (device_addr == 0) {
+                throw std::invalid_argument("L3-L2 direct host-register import requires a nonzero device address");
+            }
+            if (mapping_bytes == 0 || mapping_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+                throw std::invalid_argument("L3-L2 direct host-register import requires a positive mapping size");
+            }
+            L3HostMappedRegion mapping{};
+            mapping.profile = L3L2RegionAccessProfile::ONBOARD_HOST_REGISTERED;
+            mapping.device_id = device_id;
+            mapping.device_addr = device_addr;
+            mapping.mapping_bytes = mapping_bytes;
+            mapping.bind_acl_device();
+            void *key = reinterpret_cast<void *>(static_cast<uintptr_t>(device_addr));
+            mapping.host_va = reinterpret_cast<uint64_t>(host_map_register_with_check(key, mapping_bytes, device_id, "direct_register"));
+            mapping.host_register_key = device_addr;
+            mapping.host_registered = true;
+            return g_l3_host_mapped_regions.emplace(mapping);
+        },
+        nb::arg("device_id"), nb::arg("device_addr"), nb::arg("mapping_bytes"), nb::call_guard<nb::gil_scoped_release>(),
+        "Register a child-owned onboard device VA for host CPU L3-L2 access."
+    );
+    m.def(
+        "_l3_host_mapped_region_import_onboard_host_registered",
+        [](int device_id, uint64_t shareable_handle, uint64_t mapping_bytes) -> uint64_t {
+            if (device_id < 0) {
+                throw std::invalid_argument("L3-L2 onboard host-register import requires a non-negative device id");
+            }
+            if (mapping_bytes == 0 || mapping_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+                throw std::invalid_argument("L3-L2 onboard host-register import requires a positive mapping size");
+            }
+            L3HostMappedRegion mapping{};
+            mapping.profile = L3L2RegionAccessProfile::ONBOARD_HOST_REGISTERED;
+            mapping.device_id = device_id;
+            mapping.mapping_bytes = mapping_bytes;
+            mapping.bind_acl_device();
+            AclRuntimeApi &api = acl_api();
+            mapping.shareable_handle = shareable_handle;
+            mapping.vmm_handle = api.vmm_import_shareable_with_check(shareable_handle, device_id);
+            void *mapped_addr = nullptr;
+            try {
+                mapped_addr = api.vmm_reserve_with_check(mapping_bytes);
+                api.vmm_map_with_check(mapped_addr, mapping_bytes, mapping.vmm_handle);
+                api.vmm_set_access_with_check(mapped_addr, mapping_bytes, device_id);
+                mapping.device_addr = reinterpret_cast<uint64_t>(mapped_addr);
+                mapping.host_register_key = mapping.device_addr;
+                mapping.host_va = reinterpret_cast<uint64_t>(
+                    host_map_register_with_check(mapped_addr, mapping_bytes, device_id, "vmm_import_register")
+                );
+                mapping.host_registered = true;
+            } catch (...) {
+                std::string cleanup_error;
+                if (mapping.host_registered) {
+                    host_map_unregister_collecting(
+                        reinterpret_cast<void *>(static_cast<uintptr_t>(mapping.host_register_key)), device_id,
+                        cleanup_error
+                    );
+                }
+                api.vmm_release_collecting(mapped_addr, mapping.vmm_handle, cleanup_error);
+                throw;
+            }
+            return g_l3_host_mapped_regions.emplace(mapping);
+        },
+        nb::arg("device_id"), nb::arg("shareable_handle"), nb::arg("mapping_bytes"),
+        nb::call_guard<nb::gil_scoped_release>(),
+        "Import an onboard VMM L3-L2 region and register it for host CPU access."
+    );
+    m.def(
+        "_l3_host_mapped_region_make_host_registered_for_test",
+        [](uint64_t device_addr, uint64_t host_va, uint64_t mapping_bytes, bool has_imported_state,
+           bool unregister_fails) -> uint64_t {
+            if (mapping_bytes == 0) {
+                throw std::invalid_argument("test host-registered mapping requires a positive mapping size");
+            }
+            L3HostMappedRegion mapping{};
+            mapping.profile = L3L2RegionAccessProfile::ONBOARD_HOST_REGISTERED;
+            mapping.device_addr = device_addr;
+            mapping.host_register_key = device_addr;
+            mapping.host_va = host_va;
+            mapping.mapping_bytes = mapping_bytes;
+            mapping.test_mode = true;
+            mapping.test_has_imported_state = has_imported_state;
+            mapping.test_unregister_fails = unregister_fails;
+            return g_l3_host_mapped_regions.emplace(mapping);
+        },
+        nb::arg("device_addr"), nb::arg("host_va"), nb::arg("mapping_bytes"), nb::arg("has_imported_state") = false,
+        nb::arg("unregister_fails") = false,
+        "Create a test-only host-registered mapped-region handle."
+    );
+    m.def(
+        "_l3_host_mapped_region_close_events_for_test",
+        []() -> std::vector<std::string> {
+            std::lock_guard<std::mutex> lk(g_l3_host_mapped_region_test_events_mu);
+            std::vector<std::string> events = g_l3_host_mapped_region_test_events;
+            g_l3_host_mapped_region_test_events.clear();
+            return events;
+        },
+        "Return and clear test-only mapped-region close events."
+    );
+    m.def(
         "_l3_host_mapped_region_close",
         [](uint64_t handle) {
             std::optional<L3HostMappedRegion> removed = g_l3_host_mapped_regions.remove(handle);
@@ -1629,6 +1888,34 @@ NB_MODULE(_task_interface, m) {
                 return;
             }
             L3HostMappedRegion mapping = *removed;
+            if (mapping.profile == L3L2RegionAccessProfile::ONBOARD_HOST_REGISTERED) {
+                std::string cleanup_error;
+                if (mapping.test_mode) {
+                    record_l3_host_mapping_test_event("unregister");
+                    if (mapping.test_unregister_fails) {
+                        append_cleanup_error(cleanup_error, "halHostUnregister failed with code -7");
+                    }
+                    if (mapping.test_has_imported_state) {
+                        record_l3_host_mapping_test_event("release_import");
+                    }
+                } else {
+                    mapping.bind_acl_device();
+                    host_map_unregister_collecting(
+                        reinterpret_cast<void *>(static_cast<uintptr_t>(mapping.host_register_key)), mapping.device_id,
+                        cleanup_error
+                    );
+                    if (mapping.vmm_handle != nullptr) {
+                        acl_api().vmm_release_collecting(
+                            reinterpret_cast<void *>(static_cast<uintptr_t>(mapping.device_addr)), mapping.vmm_handle,
+                            cleanup_error
+                        );
+                    }
+                }
+                if (!cleanup_error.empty()) {
+                    throw std::runtime_error(cleanup_error);
+                }
+                return;
+            }
             if (mapping.profile == L3L2RegionAccessProfile::ONBOARD_VMM) {
                 mapping.bind_acl_device();
                 std::string cleanup_error;
@@ -1752,6 +2039,25 @@ NB_MODULE(_task_interface, m) {
         "Create and export a child-owned onboard VMM region."
     );
     m.def(
+        "_l3_child_onboard_region_create_direct",
+        [](uint64_t nbytes) -> L2ChildOnboardRegionExport {
+            if (nbytes == 0 || nbytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+                throw std::invalid_argument("L3-L2 onboard direct child region requires a positive mapping size");
+            }
+            AclRuntimeApi &api = acl_api();
+            int device_id = api.current_device_with_check();
+            L2ChildOnboardRegion region{};
+            region.device_id = device_id;
+            region.mapping_bytes = nbytes;
+            region.direct_allocation = true;
+            region.device_addr = reinterpret_cast<uint64_t>(api.device_malloc_with_check(nbytes));
+            uint64_t registry_handle = g_l2_child_onboard_regions.emplace(region);
+            return L2ChildOnboardRegionExport{region.device_addr, region.mapping_bytes, 0, registry_handle};
+        },
+        nb::arg("nbytes"), nb::call_guard<nb::gil_scoped_release>(),
+        "Create a child-owned onboard direct device allocation for host-map probing."
+    );
+    m.def(
         "_l3_child_onboard_region_close",
         [](uint64_t registry_handle) {
             std::optional<L2ChildOnboardRegion> removed = g_l2_child_onboard_regions.remove(registry_handle);
@@ -1761,9 +2067,17 @@ NB_MODULE(_task_interface, m) {
             L2ChildOnboardRegion region = *removed;
             region.bind_acl_device();
             std::string cleanup_error;
-            acl_api().vmm_release_collecting(
-                reinterpret_cast<void *>(static_cast<uintptr_t>(region.device_addr)), region.vmm_handle, cleanup_error
-            );
+            if (region.direct_allocation) {
+                int rc = acl_api().device_free(reinterpret_cast<void *>(static_cast<uintptr_t>(region.device_addr)));
+                if (rc != 0) {
+                    append_cleanup_error(cleanup_error, "aclrtFree failed with code " + std::to_string(rc));
+                }
+            } else {
+                acl_api().vmm_release_collecting(
+                    reinterpret_cast<void *>(static_cast<uintptr_t>(region.device_addr)), region.vmm_handle,
+                    cleanup_error
+                );
+            }
             if (!cleanup_error.empty()) {
                 throw std::runtime_error(cleanup_error);
             }

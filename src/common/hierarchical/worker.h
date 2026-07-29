@@ -116,6 +116,15 @@ public:
     void control_comm_init(int worker_id, const std::string &request_shm_name) {
         manager_.control_comm_init(worker_id, request_shm_name.c_str());
     }
+    void control_generic(
+        int worker_id, uint64_t sub_cmd, const std::string &shm_name, size_t payload_size, double timeout_s
+    ) {
+        auto *wt = manager_.get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
+        if (wt == nullptr) {
+            throw std::runtime_error("control_generic: invalid worker_id " + std::to_string(worker_id));
+        }
+        wt->control_generic(sub_cmd, shm_name.c_str(), payload_size, timeout_s, nullptr);
+    }
     void
     control_l3_l2_region_create(int worker_id, const std::string &request_shm_name, const std::string &reply_shm_name) {
         manager_.control_l3_l2_region_create(worker_id, request_shm_name.c_str(), reply_shm_name.c_str());

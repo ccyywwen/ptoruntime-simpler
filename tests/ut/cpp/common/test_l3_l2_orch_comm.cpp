@@ -18,8 +18,21 @@
 
 #include "common/l3_l2_orch_comm.h"
 #include "host/l3_l2_orch_region_access.h"
+#include "host/host_map_capability.h"
 
 namespace {
+
+
+void *g_fake_host_va = reinterpret_cast<void *>(0xC0FFEE00);
+int g_fake_register_rc = 0;
+int g_fake_unregister_rc = 0;
+
+int fake_hal_register(void *, std::size_t, unsigned int, int, void **host_ptr) {
+    *host_ptr = g_fake_host_va;
+    return g_fake_register_rc;
+}
+
+int fake_hal_unregister(void *, int) { return g_fake_unregister_rc; }
 
 L3L2OrchRegionDesc valid_desc() {
     return L3L2OrchRegionDesc{
@@ -229,6 +242,100 @@ TEST(L3L2OrchCommTest, LifecycleCreateWireStructsHaveFixedLayout) {
     EXPECT_EQ(offsetof(L3L2RegionCreateReply, mapping_bytes), 96u);
     EXPECT_EQ(offsetof(L3L2RegionCreateReply, shareable_handle), 104u);
     EXPECT_EQ(sizeof(L3L2RegionCreateReply), 112u);
+}
+
+
+TEST(L3L2OrchCommTest, HostMapPrimitiveProbeClassifiesSupported) {
+    int device_backing = 0;
+    g_fake_host_va = reinterpret_cast<void *>(0xC0FFEE00);
+    g_fake_register_rc = 0;
+    g_fake_unregister_rc = 0;
+
+    auto result = simpler::host_map::classify_host_map_primitive_probe(
+        true, fake_hal_register, fake_hal_unregister, &device_backing, sizeof(device_backing), 2
+    );
+
+    EXPECT_EQ(result.status, simpler::host_map::CapabilityStatus::Supported);
+    EXPECT_TRUE(result.hal_loaded);
+    EXPECT_TRUE(result.register_symbol_found);
+    EXPECT_TRUE(result.unregister_symbol_found);
+    EXPECT_EQ(result.register_rc, 0);
+    EXPECT_EQ(result.unregister_rc, 0);
+    EXPECT_EQ(result.host_va, reinterpret_cast<uintptr_t>(g_fake_host_va));
+    EXPECT_TRUE(result.cleanup_ok);
+}
+
+TEST(L3L2OrchCommTest, HostMapPrimitiveProbeClassifiesHalLoadFailureAsUnsupported) {
+    int device_backing = 0;
+
+    auto result = simpler::host_map::classify_host_map_primitive_probe(
+        false, fake_hal_register, fake_hal_unregister, &device_backing, sizeof(device_backing), 2
+    );
+
+    EXPECT_EQ(result.status, simpler::host_map::CapabilityStatus::Unsupported);
+    EXPECT_EQ(result.stage, "hal_load");
+}
+
+TEST(L3L2OrchCommTest, HostMapPrimitiveProbeClassifiesMissingSymbolAsUnsupported) {
+    int device_backing = 0;
+
+    auto missing_register = simpler::host_map::classify_host_map_primitive_probe(
+        true, nullptr, fake_hal_unregister, &device_backing, sizeof(device_backing), 2
+    );
+    auto missing_unregister = simpler::host_map::classify_host_map_primitive_probe(
+        true, fake_hal_register, nullptr, &device_backing, sizeof(device_backing), 2
+    );
+
+    EXPECT_EQ(missing_register.status, simpler::host_map::CapabilityStatus::Unsupported);
+    EXPECT_EQ(missing_unregister.status, simpler::host_map::CapabilityStatus::Unsupported);
+    EXPECT_FALSE(missing_register.register_symbol_found);
+    EXPECT_FALSE(missing_unregister.unregister_symbol_found);
+}
+
+TEST(L3L2OrchCommTest, HostMapPrimitiveProbeClassifiesKnownUnsupportedRcAsUnsupported) {
+    int device_backing = 0;
+    g_fake_register_rc = 8;
+    g_fake_unregister_rc = 0;
+
+    auto result = simpler::host_map::classify_host_map_primitive_probe(
+        true, fake_hal_register, fake_hal_unregister, &device_backing, sizeof(device_backing), 2
+    );
+
+    EXPECT_EQ(result.status, simpler::host_map::CapabilityStatus::Unsupported);
+    EXPECT_EQ(result.register_rc, 8);
+    EXPECT_EQ(result.stage, "register");
+    g_fake_register_rc = 0;
+}
+
+TEST(L3L2OrchCommTest, HostMapPrimitiveProbeClassifiesUnknownRcAsProbeError) {
+    int device_backing = 0;
+    g_fake_register_rc = 123456;
+    g_fake_unregister_rc = 0;
+
+    auto result = simpler::host_map::classify_host_map_primitive_probe(
+        true, fake_hal_register, fake_hal_unregister, &device_backing, sizeof(device_backing), 2
+    );
+
+    EXPECT_EQ(result.status, simpler::host_map::CapabilityStatus::ProbeError);
+    EXPECT_EQ(result.register_rc, 123456);
+    EXPECT_EQ(result.stage, "register");
+    g_fake_register_rc = 0;
+}
+
+TEST(L3L2OrchCommTest, HostMapPrimitiveProbeClassifiesUnregisterFailureAsProbeError) {
+    int device_backing = 0;
+    g_fake_register_rc = 0;
+    g_fake_unregister_rc = 77;
+
+    auto result = simpler::host_map::classify_host_map_primitive_probe(
+        true, fake_hal_register, fake_hal_unregister, &device_backing, sizeof(device_backing), 2
+    );
+
+    EXPECT_EQ(result.status, simpler::host_map::CapabilityStatus::ProbeError);
+    EXPECT_EQ(result.unregister_rc, 77);
+    EXPECT_EQ(result.stage, "unregister");
+    EXPECT_FALSE(result.cleanup_ok);
+    g_fake_unregister_rc = 0;
 }
 
 }  // namespace

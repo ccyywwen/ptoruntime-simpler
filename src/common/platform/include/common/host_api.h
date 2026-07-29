@@ -37,9 +37,8 @@ struct HostApi {
     // may differ from dev_ptr, so callers must use it, not dev_ptr, for host
     // access, and pair every register with an unregister before free. Used by a
     // host-side orchestrator (host_build_graph) to read control tensors whose
-    // buffer.addr is a device address. a2a3 onboard wraps
-    // halHostRegister(DEV_SVM_MAP_HOST); sim is identity; a5 onboard and any
-    // backend without a host-map path return nullptr / no-op.
+    // buffer.addr is a device address. Onboard platforms provide this only when
+    // the host-map primitive is available; sim is identity.
     void *(*register_device_memory_to_host)(void *dev_ptr, size_t bytes);
     void (*unregister_device_memory_from_host)(void *dev_ptr);
     // Set a device buffer to a byte value (device-side, no PCIe). Used to
