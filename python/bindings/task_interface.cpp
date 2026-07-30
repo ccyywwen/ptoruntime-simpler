@@ -57,6 +57,7 @@
 #include "l3_l2_orch_comm.h"
 #include "l3_l2_orch_region_access.h"
 #include "host_map_capability.h"
+#include "memory_barrier.h"
 #include "worker_bind.h"
 #include "task_args.h"
 #include "tensor.h"
@@ -1713,6 +1714,8 @@ NB_MODULE(_task_interface, m) {
         },
         nb::arg("device_id"), "Probe HAL host-map primitive support for one device."
     );
+
+    m.def("_memory_wmb_for_test", []() { wmb(); }, "Issue the host-side write barrier used by DFX-style tests.");
 
     m.def(
         "_l3_host_mapped_region_import_sim",

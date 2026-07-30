@@ -5199,14 +5199,10 @@ class Worker:
             if decision.access_profile == L3L2RegionAccessProfile.ONBOARD_HOST_REGISTERED:
                 try:
                     reply, counter_offset, total_bytes = self._create_l3_l2_host_map_region(
-                        int(worker_id), _RegionHostMapBackend.DIRECT_HAL_HOST_REGISTER, int(payload_bytes), int(counter_bytes)
+                        int(worker_id), decision.backend, int(payload_bytes), int(counter_bytes)
                     )
                     region_id = int(reply.desc.region_id)
-                    handle = int(
-                        _l3_host_mapped_region_register_onboard_direct(
-                            int(reply.device_id), int(reply.desc.payload_base), int(reply.mapping_bytes)
-                        )
-                    )
+                    handle = self._import_host_registered_region(decision.backend, reply)
                 except Exception as exc:
                     raise RuntimeError(
                         "create_l3_l2_region: host-registered real region creation failed "
