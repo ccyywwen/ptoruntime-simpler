@@ -75,7 +75,7 @@ from .remote_l3_protocol import (
     send_frame,
 )
 from .task_interface import ChipCallable, TaskArgs, Tensor
-from .worker import Worker
+from .worker import Worker, _NoHostBufferChildrenError
 
 sys.modules.setdefault("simpler.remote_l3_session", sys.modules[__name__])
 
@@ -111,6 +111,7 @@ class _RemoteBufferEntry:
     nbytes: int
     generation: int
     address_space: RemoteAddressSpace
+    owner: Worker | None = None
     offset: int = 0
     released: bool = False
 
@@ -120,6 +121,8 @@ class _RemoteBufferEntry:
             buf = self.data.buf
             assert buf is not None
             return ctypes.addressof(ctypes.c_char.from_buffer(buf))
+        if hasattr(self.data, "data_ptr"):
+            return int(self.data.data_ptr)
         return ctypes.addressof(self.data)
 
     @property
@@ -130,6 +133,10 @@ class _RemoteBufferEntry:
 
     def close(self, *, unlink: bool = False) -> None:
         if not isinstance(self.data, shared_memory.SharedMemory):
+            if self.owner is not None:
+                owner, self.owner = self.owner, None
+                self.data.buffer.release()
+                owner.free_host_buffer(self.data)
             return
         self.data.close()
         if unlink:
@@ -656,9 +663,19 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                         buffer_id = next_buffer_id
                         next_buffer_id += 1
                         generation = 1
-                        buf = shared_memory.SharedMemory(create=True, size=int(nbytes))
+                        try:
+                            buf = inner_worker.create_host_buffer(int(nbytes))
+                            entry = _RemoteBufferEntry(
+                                buf,
+                                int(nbytes),
+                                generation,
+                                RemoteAddressSpace.REMOTE_DEVICE,
+                                owner=inner_worker,
+                            )
+                        except _NoHostBufferChildrenError:
+                            buf = shared_memory.SharedMemory(create=True, size=int(nbytes))
+                            entry = _RemoteBufferEntry(buf, int(nbytes), generation, RemoteAddressSpace.REMOTE_DEVICE)
                         key = _buffer_key(buffer_id, generation)
-                        entry = _RemoteBufferEntry(buf, int(nbytes), generation, RemoteAddressSpace.REMOTE_DEVICE)
                         buffers[key] = entry
                         remote_addr = entry.addr
                         result = struct.pack(
