@@ -127,6 +127,7 @@ from .l3_l2_orch_comm import (
     validate_region_create_reply,
 )
 from .orchestrator import Orchestrator
+from .remote_l3_protocol import HOST_TCP_TRANSPORT_PROFILE
 from .task_interface import (
     MAILBOX_ERROR_MSG_SIZE,
     MAILBOX_OFF_ERROR_MSG,
@@ -397,8 +398,8 @@ class RemoteCallable:
 class RemoteWorkerSpec:
     """Describes a remote L3 worker to attach via ``Worker.add_remote_worker``.
 
-    ``transport`` selects the data plane and is simulation-backed today; the
-    daemon rejects any other value.
+    ``transport`` selects the data plane. The shipped daemon accepts
+    only the host_tcp profile today.
     """
 
     # endpoint is "host:port"; host must be a numeric IP (or "localhost").
@@ -409,7 +410,7 @@ class RemoteWorkerSpec:
     runtime: str = "tensormap_and_ringbuffer"
     device_ids: tuple[int, ...] = ()
     num_sub_workers: int = 0
-    transport: str = "sim"
+    transport: str = HOST_TCP_TRANSPORT_PROFILE
     session_listen_host: str | None = None
     allow_wildcard_session_bind: bool = False
 
@@ -2990,7 +2991,7 @@ class Worker:
         offset: int = 0,
         nbytes: int | None = None,
         access: str | int = "readwrite",
-        transport_profile: str = "sim",
+        transport_profile: str = HOST_TCP_TRANSPORT_PROFILE,
     ) -> RemoteBufferExport:
         """Export a range of an owner buffer so another worker can import it.
 
@@ -3010,7 +3011,7 @@ class Worker:
         offset: int = 0,
         nbytes: int | None = None,
         access: str | int = "readwrite",
-        transport_profile: str = "sim",
+        transport_profile: str = HOST_TCP_TRANSPORT_PROFILE,
     ) -> RemoteBufferExport:
         self._require_live_remote_buffer(handle)
         if handle.is_imported:

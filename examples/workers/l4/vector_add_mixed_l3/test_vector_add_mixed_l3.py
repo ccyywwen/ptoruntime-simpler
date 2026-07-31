@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from simpler.callable_identity import CallableHandle
+from simpler.remote_l3_protocol import HOST_TCP_TRANSPORT_PROFILE
 from simpler.task_interface import (
     ArgDirection,
     CallConfig,
@@ -256,7 +257,7 @@ def main() -> int:
                 platform=args.platform,
                 runtime=args.runtime,
                 device_ids=remote_devices,
-                transport="sim",
+                transport=HOST_TCP_TRANSPORT_PROFILE,
                 session_listen_host=args.session_listen_host,
                 allow_wildcard_session_bind=True,
             )
