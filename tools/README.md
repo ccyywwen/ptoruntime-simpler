@@ -7,6 +7,13 @@ End-user profiling / debug CLIs live in
 [`simpler_setup/tools/`](../simpler_setup/tools/) and ship with the wheel —
 invoke them via `python -m simpler_setup.tools.<name>`.
 
+## host_map_test/
+
+Driver-facing L3-L2 host-map reproduction package. It contains the
+host-register minimal tests (`host_map_test.py`), the VMM+ACL-COPY stream
+baseline wrapper (`run_acl_copy_stream_test.py`), and the Chinese runbook
+[host_map_test_readme.md](./host_map_test/host_map_test_readme.md).
+
 ## benchmark_rounds.sh
 
 Batch-run a predefined set of ST examples on hardware, parse `orch_start` /

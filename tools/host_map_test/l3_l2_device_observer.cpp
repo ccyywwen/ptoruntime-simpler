@@ -58,7 +58,7 @@ uint32_t wait_tail_or_die(volatile uint32_t *tail, uint32_t expected_tail) {
     return observed;
 }
 
-void observe_dfx_slot_tail(
+void observe_payload_tail(
     uint64_t payload_addr, uint64_t tail_addr, uint64_t completion_addr, uint64_t expected_payload,
     uint32_t expected_tail
 ) {
@@ -91,7 +91,7 @@ __attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestrati
     return PTO2OrchestrationConfig{.expected_arg_count = kExpectedArgCount};
 }
 
-__attribute__((visibility("default"))) void phase0_host_map_device_observer(const L2TaskArgs &orch_args) {
+__attribute__((visibility("default"))) void host_map_device_observer(const L2TaskArgs &orch_args) {
     const auto mode = static_cast<ObserverMode>(orch_args.scalar(0));
     const uint64_t payload_offset = orch_args.scalar(7);
     const uint64_t expected_payload = orch_args.scalar(8);
@@ -101,7 +101,7 @@ __attribute__((visibility("default"))) void phase0_host_map_device_observer(cons
 
     if (mode == ObserverMode::RawDeviceAddress) {
         const uint64_t base = orch_args.scalar(1);
-        observe_dfx_slot_tail(base + payload_offset, base + tail_offset, base + completion_offset, expected_payload, expected_tail);
+        observe_payload_tail(base + payload_offset, base + tail_offset, base + completion_offset, expected_payload, expected_tail);
         return;
     }
 
@@ -127,7 +127,7 @@ __attribute__((visibility("default"))) void phase0_host_map_device_observer(cons
             report_endpoint_error(endpoint);
             return;
         }
-        observe_dfx_slot_tail(payload.gm_addr, tail_addr, completion_addr, expected_payload, expected_tail);
+        observe_payload_tail(payload.gm_addr, tail_addr, completion_addr, expected_payload, expected_tail);
         return;
     }
 
