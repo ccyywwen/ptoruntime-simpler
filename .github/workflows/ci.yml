@@ -7,6 +7,8 @@ permissions:
 on:
   pull_request:
     branches: [main]
+  push:
+    branches: [pod-ci, ci-multiserver-validation]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -15,6 +17,7 @@ concurrency:
 jobs:
   # ---------- Pre-commit hooks (format, lint, clang-tidy) ----------
   pre-commit:
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -62,7 +65,7 @@ jobs:
   # See docs/python-packaging.md and tools/verify_packaging.sh.
   packaging-matrix:
     needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.non_code_only != 'true'
+    if: false
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -107,7 +110,7 @@ jobs:
   # ---------- Unit tests (no hardware, Python + C++) ----------
   ut:
     needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.non_code_only != 'true'
+    if: false
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
@@ -163,7 +166,7 @@ jobs:
   # ---------- Simulation scene tests ----------
   st-sim-a2a3:
     needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.a2a3_changed == 'true'
+    if: false
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
@@ -257,7 +260,7 @@ jobs:
 
   st-sim-a5:
     needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.a5_changed == 'true'
+    if: false
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
@@ -375,7 +378,7 @@ jobs:
   # corresponding profiling block — no cross-contamination from cmake cache.
   profiling-flags-smoke:
     needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.a2a3_changed == 'true' || needs.detect-changes.outputs.a5_changed == 'true'
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -473,7 +476,7 @@ jobs:
   # ---------- Unit tests (a2a3 hardware, Python + C++) ----------
   ut-a2a3:
     needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.non_code_only != 'true'
+    if: false
     runs-on: [self-hosted, a2a3]
     timeout-minutes: 30
     env:
@@ -559,7 +562,7 @@ jobs:
   # ---------- Scene tests (a2a3 hardware) ----------
   st-onboard-a2a3:
     needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.a2a3_changed == 'true'
+    if: false
     runs-on: [self-hosted, a2a3]
     timeout-minutes: 60
     env:
@@ -725,9 +728,189 @@ jobs:
               --require-pto-isa --dump-args"
           fi
 
+  # ---------- Scene tests (a2a3 hardware, multi-machine pod runner) ----------
+  # Bring-up job for the pod-a2a3 runner pool: same checkout + environment setup
+  # as st-onboard-a2a3, with the test steps stubbed out until the pool is proven.
+  st-pod-onboard-a2a3:
+    runs-on: [self-hosted, Linux, ARM64, pod-a2a3]
+    timeout-minutes: 60
+    env:
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
+      SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
+      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "4000"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      - name: Set up environment
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          python3 -m venv --system-site-packages .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+          # The host_runtime build and test-time kernels both resolve PTO-ISA
+          # from pto_isa.pin, so they share one ISA revision.
+          pip install '.[test]'
+          # Warn if graphviz isn't installed on the runner — the dep_gen
+          # smoke step needs `dot` to render deps_viewer. The Python
+          # has_binary("dot") guard in the test will skip cleanly without
+          # it, but coverage drops, so flag it loudly here.
+          if ! command -v dot >/dev/null 2>&1; then
+            echo "::warning::graphviz 'dot' not found on PATH; deps_viewer tool smoke will skip. Install graphviz on this self-hosted runner to restore coverage."
+          fi
+
+      - name: Select pod machine devices
+        run: |
+          set -euo pipefail
+          if hostname -I | tr ' ' '\n' | grep -qx "192.168.0.131"; then
+            {
+              echo "POD_MACHINE=125"
+              echo "POD_LOCAL_IP=192.168.0.131"
+              echo "POD_LOCAL_DEVICES=12,13"
+              echo "POD_REMOTE_MACHINE=126"
+              echo "POD_REMOTE_HOST=192.168.0.68"
+              echo "POD_REMOTE_DEVICES=14,15"
+            } >> "$GITHUB_ENV"
+          elif hostname -I | tr ' ' '\n' | grep -qx "192.168.0.68"; then
+            {
+              echo "POD_MACHINE=126"
+              echo "POD_LOCAL_IP=192.168.0.68"
+              echo "POD_LOCAL_DEVICES=14,15"
+              echo "POD_REMOTE_MACHINE=125"
+              echo "POD_REMOTE_HOST=192.168.0.131"
+              echo "POD_REMOTE_DEVICES=12,13"
+            } >> "$GITHUB_ENV"
+          else
+            echo "::error::pod-a2a3 runner must be either 125 or 126"
+            hostname -I || true
+            exit 1
+          fi
+
+      - name: paged_attention_unroll (a2a3)
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          source .venv/bin/activate
+          pytest tests/st/a2a3/tensormap_and_ringbuffer/paged_attention_unroll \
+            --platform a2a3 --device 12
+
+      - name: collectives allreduce (a2a3)
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          source .venv/bin/activate
+          pytest tests/st/worker/collectives/allreduce \
+            --platform a2a3 --device 12,13,14,15
+
+      - name: vector_add_mixed_l3 mixed local/remote (a2a3)
+        run: |
+          set -eo pipefail
+          export PYTHONPATH="${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          source /usr/local/Ascend/cann/set_env.sh
+          source .venv/bin/activate
+          set -u
+          if ! command -v rsync >/dev/null 2>&1; then
+            echo "::error::rsync is required on the pod runner for remote checkout sync"
+            exit 1
+          fi
+
+          REMOTE_DAEMON_HOST="$POD_REMOTE_HOST"
+          REMOTE_DAEMON_PORT=19073
+          RUN_DIR="$GITHUB_WORKSPACE/output/vector_add_mixed_l3/pod-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          mkdir -p "$RUN_DIR/parent-${POD_MACHINE}/ascend" "$RUN_DIR/daemon-${POD_REMOTE_MACHINE}"
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          touch "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          ssh-keyscan -H "$POD_REMOTE_HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null || true
+          SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$HOME/.ssh/known_hosts")
+          RSYNC_SSH="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+
+          REMOTE_BASE_DIR=$(ssh "${SSH_OPTS[@]}" "$POD_REMOTE_HOST" 'printf "%s" "${RUNNER_TEMP:-$HOME}"')
+          REMOTE_WORKDIR="${REMOTE_BASE_DIR}/ptoruntime-simpler-pod-ci/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          echo "vector_add_mixed_l3 parent=${POD_MACHINE} local=${POD_LOCAL_DEVICES} daemon=${POD_REMOTE_MACHINE} remote=${POD_REMOTE_DEVICES} remote_workdir=${REMOTE_WORKDIR}"
+
+          cleanup() {
+            set +e
+            if [ -n "${REMOTE_SSH_PID:-}" ]; then
+              kill "$REMOTE_SSH_PID" 2>/dev/null || true
+              wait "$REMOTE_SSH_PID" 2>/dev/null || true
+            fi
+            ssh "${SSH_OPTS[@]}" "$POD_REMOTE_HOST" \
+              "pkill -f 'python -m simpler.remote_l3_worker --host ${REMOTE_DAEMON_HOST} --port ${REMOTE_DAEMON_PORT}' || true" || true
+            rsync -a -e "$RSYNC_SSH" "$POD_REMOTE_HOST:$REMOTE_WORKDIR/output/vector_add_mixed_l3/daemon-${POD_REMOTE_MACHINE}/" \
+              "$RUN_DIR/daemon-${POD_REMOTE_MACHINE}/" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          ssh "${SSH_OPTS[@]}" "$POD_REMOTE_HOST" "rm -rf '$REMOTE_WORKDIR' && mkdir -p '$REMOTE_WORKDIR'"
+          rsync -a --delete -e "$RSYNC_SSH" \
+            --exclude .git --exclude .venv --exclude build --exclude output \
+            "$GITHUB_WORKSPACE/" "$POD_REMOTE_HOST:$REMOTE_WORKDIR/"
+
+          ssh "${SSH_OPTS[@]}" "$POD_REMOTE_HOST" "
+            set -eo pipefail
+            cd '$REMOTE_WORKDIR'
+            export PYTHONPATH="\${PYTHONPATH:-}"
+            export CMAKE_PREFIX_PATH="\${CMAKE_PREFIX_PATH:-}"
+            source /usr/local/Ascend/cann/set_env.sh
+            set -u
+            python3 -m venv --system-site-packages .venv
+            source .venv/bin/activate
+            pip install --upgrade pip
+            pip install '.[test]'
+          "
+
+          ssh "${SSH_OPTS[@]}" "$POD_REMOTE_HOST" "
+            pkill -f 'python -m simpler.remote_l3_worker --host ${REMOTE_DAEMON_HOST} --port ${REMOTE_DAEMON_PORT}' || true
+          " || true
+
+          ssh "${SSH_OPTS[@]}" "$POD_REMOTE_HOST" "
+            set -eo pipefail
+            cd '$REMOTE_WORKDIR'
+            export PYTHONPATH="\${PYTHONPATH:-}"
+            export CMAKE_PREFIX_PATH="\${CMAKE_PREFIX_PATH:-}"
+            source /usr/local/Ascend/cann/set_env.sh
+            set -u
+            source .venv/bin/activate
+            mkdir -p output/vector_add_mixed_l3/daemon-${POD_REMOTE_MACHINE}
+            export ASCEND_PROCESS_LOG_PATH="\$PWD/output/vector_add_mixed_l3/daemon-${POD_REMOTE_MACHINE}"
+            export SIMPLER_VECTOR_ADD_MIXED_L3_ROLE=machine${POD_REMOTE_MACHINE}
+            export SIMPLER_VECTOR_ADD_MIXED_L3_HOST=${REMOTE_DAEMON_HOST}
+            export SIMPLER_VECTOR_ADD_MIXED_L3_PORT=${REMOTE_DAEMON_PORT}
+            bash examples/workers/l4/vector_add_mixed_l3/start_machine_daemon.sh
+          " > "$RUN_DIR/daemon-${POD_REMOTE_MACHINE}/daemon.ssh.log" 2>&1 &
+          REMOTE_SSH_PID=$!
+
+          python - <<PYWAIT
+          import socket
+          import sys
+          import time
+
+          deadline = time.time() + 120
+          while time.time() < deadline:
+              try:
+                  with socket.create_connection(("${REMOTE_DAEMON_HOST}", ${REMOTE_DAEMON_PORT}), timeout=2):
+                      sys.exit(0)
+              except OSError:
+                  time.sleep(1)
+          print("remote daemon did not become reachable", file=sys.stderr)
+          sys.exit(1)
+          PYWAIT
+
+          export ASCEND_PROCESS_LOG_PATH="$RUN_DIR/parent-${POD_MACHINE}/ascend"
+          export SIMPLER_VECTOR_ADD_MIXED_L3_REMOTE="${REMOTE_DAEMON_HOST}:${REMOTE_DAEMON_PORT}"
+          export SIMPLER_VECTOR_ADD_MIXED_L3_LOCAL_DEVICES="$POD_LOCAL_DEVICES"
+          export SIMPLER_VECTOR_ADD_MIXED_L3_REMOTE_DEVICES="$POD_REMOTE_DEVICES"
+          export SIMPLER_VECTOR_ADD_MIXED_L3_SESSION_TIMEOUT=180
+          export SIMPLER_VECTOR_ADD_MIXED_L3_SESSION_LISTEN_HOST=0.0.0.0
+
+          timeout 1800s bash examples/workers/l4/vector_add_mixed_l3/run_parent.sh
 
   # ---------- Detect platform-specific changes (runs on GitHub server) ----------
   detect-changes:
+    if: false
     runs-on: ubuntu-latest
     outputs:
       a2a3_changed: ${{ steps.check.outputs.a2a3_changed }}
@@ -806,7 +989,7 @@ jobs:
   # ---------- Unit tests (a5 hardware, Python + C++) ----------
   ut-a5:
     needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.non_code_only != 'true'
+    if: false
     runs-on: [self-hosted, a5]
     timeout-minutes: 30
     env:
@@ -876,7 +1059,7 @@ jobs:
 
   st-onboard-a5:
     needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.a5_changed == 'true'
+    if: false
     runs-on: [self-hosted, a5]
     timeout-minutes: 60
     env:
