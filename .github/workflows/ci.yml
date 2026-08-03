@@ -786,20 +786,6 @@ jobs:
             exit 1
           fi
 
-      - name: paged_attention_unroll (a2a3)
-        run: |
-          source /usr/local/Ascend/cann/set_env.sh
-          source .venv/bin/activate
-          pytest tests/st/a2a3/tensormap_and_ringbuffer/paged_attention_unroll \
-            --platform a2a3 --device 12
-
-      - name: collectives allreduce (a2a3)
-        run: |
-          source /usr/local/Ascend/cann/set_env.sh
-          source .venv/bin/activate
-          pytest tests/st/worker/collectives/allreduce \
-            --platform a2a3 --device 12,13,14,15
-
       - name: vector_add_mixed_l3 mixed local/remote (a2a3)
         run: |
           set -eo pipefail
@@ -907,6 +893,20 @@ jobs:
           export SIMPLER_VECTOR_ADD_MIXED_L3_SESSION_LISTEN_HOST=0.0.0.0
 
           timeout 1800s bash examples/workers/l4/vector_add_mixed_l3/run_parent.sh
+
+      - name: paged_attention_unroll (a2a3)
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          source .venv/bin/activate
+          pytest tests/st/a2a3/tensormap_and_ringbuffer/paged_attention_unroll \
+            --platform a2a3 --device "${POD_LOCAL_DEVICES%%,*}"
+
+      - name: collectives allreduce (a2a3)
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          source .venv/bin/activate
+          pytest tests/st/worker/collectives/allreduce \
+            --platform a2a3 --device "$POD_LOCAL_DEVICES"
 
   # ---------- Detect platform-specific changes (runs on GitHub server) ----------
   detect-changes:
