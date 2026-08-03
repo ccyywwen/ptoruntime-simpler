@@ -248,6 +248,7 @@ def main() -> int:
     remote_buffers: list[RemoteBufferHandle] = []
     local_shms: list[shared_memory.SharedMemory] = []
     local_views: list[Any] = []
+    local_outputs: dict[str, tuple[Any, float]] = {}
     parent_keepalive: list[TaskArgs] = []
     try:
         local_worker = worker.add_worker(local_l3)
@@ -295,9 +296,9 @@ def main() -> int:
         worker.remote_copy_from(remote_handles[2], remote_outputs["f0"][0], TENSOR_NBYTES)
         worker.remote_copy_from(remote_handles[5], remote_outputs["f1"][0], TENSOR_NBYTES)
 
-        for worker_label, outputs in (("local", local_outputs), ("remote", remote_outputs)):
-            for name, (array, expected) in outputs.items():
-                max_diff = max(abs(float(array[index]) - expected) for index in range(ELEMENTS))
+        for worker_label, output_map in (("local", local_outputs), ("remote", remote_outputs)):
+            for name, (output_array, expected) in output_map.items():
+                max_diff = max(abs(float(output_array[index]) - expected) for index in range(ELEMENTS))
                 print(f"[vector-add-mixed-l3] {worker_label} output={name} max_diff={max_diff:.3e}")
                 if max_diff > 1e-4:
                     raise AssertionError(f"{worker_label} {name} golden mismatch: max_diff={max_diff}")
@@ -318,6 +319,9 @@ def main() -> int:
             except Exception:  # noqa: BLE001
                 pass
         worker.close()
+        output_array = None
+        output_map = None
+        local_outputs.clear()
         local_views.clear()
         _free_local_shms(local_shms)
 
