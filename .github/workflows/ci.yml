@@ -729,8 +729,10 @@ jobs:
           fi
 
   # ---------- Scene tests (a2a3 hardware, multi-machine pod runner) ----------
-  # Bring-up job for the pod-a2a3 runner pool: same checkout + environment setup
-  # as st-onboard-a2a3, with the test steps stubbed out until the pool is proven.
+  # Runs on a pair of self-hosted a2a3 machines. Every value that identifies a
+  # machine — addresses, device split, ports, staging root, proxy — comes from
+  # the runner's own .env, loaded by the first step. Nothing machine-specific
+  # belongs in this file.
   st-pod-onboard-a2a3:
     runs-on: [self-hosted, Linux, ARM64, pod-a2a3]
     timeout-minutes: 60
@@ -740,11 +742,131 @@ jobs:
       SIMPLER_STREAM_SYNC_TIMEOUT_MS: "4000"
 
     steps:
+      # Each pod machine carries one .env describing itself and its peer, so
+      # this job never has to work out which machine it landed on. Runs before
+      # checkout so the proxy settings are available to every later step.
+      - name: Load pod machine config
+        run: |
+          set -euo pipefail
+
+          # The runner root holds .env and sits two levels above
+          # RUNNER_WORKSPACE (<root>/_work/<repo>). POD_ENV_FILE overrides the
+          # derivation for a runner laid out differently.
+          ENV_FILE="${POD_ENV_FILE:-$(dirname "$(dirname "$RUNNER_WORKSPACE")")/.env}"
+          if [ ! -r "$ENV_FILE" ]; then
+            echo "::error::pod config not readable: $ENV_FILE (set POD_ENV_FILE to override)"
+            exit 1
+          fi
+          echo "pod config: $ENV_FILE"
+
+          # The runner service reads this same file for its own settings, so
+          # only POD_* is accepted here — an unrelated key in it must not reach
+          # the job environment through this step.
+          while IFS= read -r line || [ -n "$line" ]; do
+            line=${line%$'\r'}
+            line=${line#"${line%%[![:space:]]*}"}
+            case "$line" in ''|'#'*) continue ;; esac
+            [[ "$line" == *=* ]] || continue
+            key=${line%%=*}
+            value=${line#*=}
+            [[ "$key" =~ ^POD_[A-Z0-9_]+$ ]] || continue
+            value=${value%"${value##*[![:space:]]}"}
+            case "$value" in
+              \"*\") value=${value#\"}; value=${value%\"} ;;
+              \'*\') value=${value#\'}; value=${value%\'} ;;
+            esac
+            printf -v "$key" '%s' "$value"
+          done < "$ENV_FILE"
+
+          set_default() {
+            local name=$1
+            shift
+            [ -n "${!name-}" ] || printf -v "$name" '%s' "$*"
+          }
+          set_default POD_LOCAL_IP ""
+          set_default POD_REMOTE_USER ""
+          set_default POD_REMOTE_SSH_PORT 22
+          set_default POD_L3_DAEMON_PORT 19073
+          set_default POD_L3_SESSION_TIMEOUT_S 180
+          set_default POD_L3_SESSION_LISTEN_HOST 0.0.0.0
+          set_default POD_REMOTE_STAGING_ROOT /data/workspace/ci-runner/pod-ci
+          set_default POD_REMOTE_STAGING_TTL_DAYS 2
+          set_default POD_DAEMON_WAIT_S 120
+          set_default POD_SMOKE_TIMEOUT_S 1800
+          set_default POD_CANN_ENV /usr/local/Ascend/cann/set_env.sh
+          set_default POD_REMOTE_CANN_ENV "$POD_CANN_ENV"
+          set_default POD_HTTP_PROXY ""
+          set_default POD_HTTPS_PROXY ""
+          set_default POD_NO_PROXY ""
+          # Each machine runs its own proxy on its own port, and the peer's
+          # values are evaluated on the peer — a loopback address here and
+          # there name two different proxies. Unset means "same as this
+          # machine's", which only holds for a shared LAN proxy.
+          set_default POD_REMOTE_HTTP_PROXY "$POD_HTTP_PROXY"
+          set_default POD_REMOTE_HTTPS_PROXY "$POD_HTTPS_PROXY"
+          set_default POD_REMOTE_NO_PROXY "$POD_NO_PROXY"
+
+          # A proxy nothing listens on turns every pip call into five retries
+          # ending in an opaque ProxyError, several steps from the setting that
+          # caused it. Name the address here instead.
+          proxy_reachable() {
+            local hostport=${1#*://} host port
+            hostport=${hostport##*@}
+            hostport=${hostport%%/*}
+            host=${hostport%:*}
+            port=${hostport##*:}
+            [ "$host" != "$port" ] || port=80
+            (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null
+          }
+          for key in POD_HTTP_PROXY POD_HTTPS_PROXY; do
+            if [ -n "${!key}" ] && ! proxy_reachable "${!key}"; then
+              echo "::error::$key=${!key} is not reachable from this machine"
+              exit 1
+            fi
+          done
+
+          MISSING=0
+          for key in POD_MACHINE POD_LOCAL_DEVICES POD_REMOTE_MACHINE POD_REMOTE_HOST POD_REMOTE_DEVICES; do
+            if [ -z "${!key-}" ]; then
+              echo "::error::$key is missing from $ENV_FILE"
+              MISSING=1
+            fi
+          done
+          [ "$MISSING" = 0 ] || exit 1
+
+          # The file is the source of truth for identity; this only catches the
+          # wrong machine's .env having been copied onto this runner.
+          if [ -n "$POD_LOCAL_IP" ] && ! hostname -I | tr ' ' '\n' | grep -qx "$POD_LOCAL_IP"; then
+            echo "::error::POD_LOCAL_IP=$POD_LOCAL_IP is not an address of this host"
+            hostname -I || true
+            exit 1
+          fi
+
+          for key in POD_MACHINE POD_LOCAL_IP POD_LOCAL_DEVICES \
+                     POD_REMOTE_MACHINE POD_REMOTE_HOST POD_REMOTE_DEVICES \
+                     POD_REMOTE_USER POD_REMOTE_SSH_PORT \
+                     POD_L3_DAEMON_PORT POD_L3_SESSION_TIMEOUT_S POD_L3_SESSION_LISTEN_HOST \
+                     POD_REMOTE_STAGING_ROOT POD_REMOTE_STAGING_TTL_DAYS \
+                     POD_DAEMON_WAIT_S POD_SMOKE_TIMEOUT_S \
+                     POD_CANN_ENV POD_REMOTE_CANN_ENV \
+                     POD_HTTP_PROXY POD_HTTPS_PROXY POD_NO_PROXY \
+                     POD_REMOTE_HTTP_PROXY POD_REMOTE_HTTPS_PROXY POD_REMOTE_NO_PROXY; do
+            printf '%s=%s\n' "$key" "${!key-}" >> "$GITHUB_ENV"
+          done
+
+          echo "pod machine=${POD_MACHINE} ip=${POD_LOCAL_IP:-unset} devices=${POD_LOCAL_DEVICES}"
+          echo "pod peer=${POD_REMOTE_MACHINE} host=${POD_REMOTE_HOST}:${POD_REMOTE_SSH_PORT} devices=${POD_REMOTE_DEVICES}"
+
       - name: Checkout repository
         uses: actions/checkout@v5
       - name: Set up environment
         run: |
-          source /usr/local/Ascend/cann/set_env.sh
+          source "$POD_CANN_ENV"
+          # Proxy is applied to the pip steps only, not exported job-wide: the
+          # runner already reaches GitHub without it, and routing the actions
+          # through it would put an untested hop in front of checkout.
+          export http_proxy="$POD_HTTP_PROXY" https_proxy="$POD_HTTPS_PROXY" no_proxy="$POD_NO_PROXY"
+          export HTTP_PROXY="$POD_HTTP_PROXY" HTTPS_PROXY="$POD_HTTPS_PROXY" NO_PROXY="$POD_NO_PROXY"
           python3 -m venv --system-site-packages .venv
           source .venv/bin/activate
           pip install --upgrade pip
@@ -759,39 +881,12 @@ jobs:
             echo "::warning::graphviz 'dot' not found on PATH; deps_viewer tool smoke will skip. Install graphviz on this self-hosted runner to restore coverage."
           fi
 
-      - name: Select pod machine devices
-        run: |
-          set -euo pipefail
-          if hostname -I | tr ' ' '\n' | grep -qx "192.168.0.131"; then
-            {
-              echo "POD_MACHINE=125"
-              echo "POD_LOCAL_IP=192.168.0.131"
-              echo "POD_LOCAL_DEVICES=12,13"
-              echo "POD_REMOTE_MACHINE=126"
-              echo "POD_REMOTE_HOST=192.168.0.68"
-              echo "POD_REMOTE_DEVICES=14,15"
-            } >> "$GITHUB_ENV"
-          elif hostname -I | tr ' ' '\n' | grep -qx "192.168.0.68"; then
-            {
-              echo "POD_MACHINE=126"
-              echo "POD_LOCAL_IP=192.168.0.68"
-              echo "POD_LOCAL_DEVICES=14,15"
-              echo "POD_REMOTE_MACHINE=125"
-              echo "POD_REMOTE_HOST=192.168.0.131"
-              echo "POD_REMOTE_DEVICES=12,13"
-            } >> "$GITHUB_ENV"
-          else
-            echo "::error::pod-a2a3 runner must be either 125 or 126"
-            hostname -I || true
-            exit 1
-          fi
-
       - name: vector_add_mixed_l3 mixed local/remote (a2a3)
         run: |
           set -eo pipefail
           export PYTHONPATH="${PYTHONPATH:-}"
           export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
-          source /usr/local/Ascend/cann/set_env.sh
+          source "$POD_CANN_ENV"
           source .venv/bin/activate
           set -u
           if ! command -v rsync >/dev/null 2>&1; then
@@ -800,22 +895,34 @@ jobs:
           fi
 
           REMOTE_DAEMON_HOST="$POD_REMOTE_HOST"
-          REMOTE_DAEMON_PORT=19073
+          REMOTE_DAEMON_PORT="$POD_L3_DAEMON_PORT"
+          REMOTE_TARGET="${POD_REMOTE_USER:+$POD_REMOTE_USER@}$POD_REMOTE_HOST"
+          REMOTE_WORKDIR="$POD_REMOTE_STAGING_ROOT/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          # The peer's proxy is only reachable from the peer, so its liveness
+          # check has to run there; split the address here where the parsing
+          # is readable.
+          REMOTE_PROXY_HOST=""
+          REMOTE_PROXY_PORT=""
+          if [ -n "$POD_REMOTE_HTTP_PROXY" ]; then
+            REMOTE_PROXY_HOSTPORT=${POD_REMOTE_HTTP_PROXY#*://}
+            REMOTE_PROXY_HOSTPORT=${REMOTE_PROXY_HOSTPORT##*@}
+            REMOTE_PROXY_HOSTPORT=${REMOTE_PROXY_HOSTPORT%%/*}
+            REMOTE_PROXY_HOST=${REMOTE_PROXY_HOSTPORT%:*}
+            REMOTE_PROXY_PORT=${REMOTE_PROXY_HOSTPORT##*:}
+            [ "$REMOTE_PROXY_HOST" != "$REMOTE_PROXY_PORT" ] || REMOTE_PROXY_PORT=80
+          fi
           RUN_DIR="$GITHUB_WORKSPACE/output/vector_add_mixed_l3/pod-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          echo "vector_add_mixed_l3 parent=${POD_MACHINE} local=${POD_LOCAL_DEVICES} daemon=${POD_REMOTE_MACHINE} remote=${POD_REMOTE_DEVICES}"
 
           mkdir -p "$RUN_DIR/parent-${POD_MACHINE}/ascend" "$RUN_DIR/daemon-${POD_REMOTE_MACHINE}"
           mkdir -p "$HOME/.ssh"
           chmod 700 "$HOME/.ssh"
           touch "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
-          ssh-keyscan -H "$POD_REMOTE_HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null || true
-          SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$HOME/.ssh/known_hosts")
-          RSYNC_SSH="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
-
-          REMOTE_BASE_DIR=$(ssh "${SSH_OPTS[@]}" "$POD_REMOTE_HOST" 'printf "%s" "${RUNNER_TEMP:-$HOME}"')
-          REMOTE_WORKDIR="${REMOTE_BASE_DIR}/ptoruntime-simpler-pod-ci/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-
-          echo "vector_add_mixed_l3 parent=${POD_MACHINE} local=${POD_LOCAL_DEVICES} daemon=${POD_REMOTE_MACHINE} remote=${POD_REMOTE_DEVICES} remote_workdir=${REMOTE_WORKDIR}"
+          ssh-keyscan -H -p "$POD_REMOTE_SSH_PORT" "$POD_REMOTE_HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null || true
+          SSH_OPTS=(-p "$POD_REMOTE_SSH_PORT" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$HOME/.ssh/known_hosts")
+          RSYNC_SSH="ssh -p $POD_REMOTE_SSH_PORT -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
 
           cleanup() {
             set +e
@@ -823,24 +930,51 @@ jobs:
               kill "$REMOTE_SSH_PID" 2>/dev/null || true
               wait "$REMOTE_SSH_PID" 2>/dev/null || true
             fi
-            ssh "${SSH_OPTS[@]}" "$POD_REMOTE_HOST" \
-              "pkill -f 'python -m simpler.remote_l3_worker --host ${REMOTE_DAEMON_HOST} --port ${REMOTE_DAEMON_PORT}' || true" || true
-            rsync -a -e "$RSYNC_SSH" "$POD_REMOTE_HOST:$REMOTE_WORKDIR/output/vector_add_mixed_l3/daemon-${POD_REMOTE_MACHINE}/" \
+            # The daemon's chip children keep writing into the workdir after the
+            # daemon itself is signalled, and rm -rf on a tree still being
+            # written fails with ENOTEMPTY — so wait for the daemon to actually
+            # go before removing, and retry once for a straggler.
+            ssh "${SSH_OPTS[@]}" "$REMOTE_TARGET" "
+              pkill -f 'python -m simpler.remote_l3_worker --host ${REMOTE_DAEMON_HOST} --port ${REMOTE_DAEMON_PORT}' || true
+              for _ in \$(seq 1 20); do
+                pgrep -f 'python -m simpler.remote_l3_worker --host ${REMOTE_DAEMON_HOST} --port ${REMOTE_DAEMON_PORT}' >/dev/null || break
+                sleep 0.5
+              done
+            " || true
+            rsync -a -e "$RSYNC_SSH" "$REMOTE_TARGET:$REMOTE_WORKDIR/output/vector_add_mixed_l3/daemon-${POD_REMOTE_MACHINE}/" \
               "$RUN_DIR/daemon-${POD_REMOTE_MACHINE}/" 2>/dev/null || true
+            ssh "${SSH_OPTS[@]}" "$REMOTE_TARGET" \
+              "rm -rf '$REMOTE_WORKDIR' 2>/dev/null || { sleep 5; rm -rf '$REMOTE_WORKDIR'; }" || true
           }
           trap cleanup EXIT
 
-          ssh "${SSH_OPTS[@]}" "$POD_REMOTE_HOST" "rm -rf '$REMOTE_WORKDIR' && mkdir -p '$REMOTE_WORKDIR'"
+          # Each run stages a full source tree plus its own venv on the peer, so
+          # the staging root grows without a reclaim step. cleanup() removes this
+          # run's directory, but a cancelled job is SIGKILLed and never reaches
+          # its EXIT trap — the age sweep is what reclaims those. The TTL must
+          # stay well above this job's 60-minute timeout so a live run is never
+          # swept out from under itself.
+          ssh "${SSH_OPTS[@]}" "$REMOTE_TARGET" "
+            mkdir -p '$POD_REMOTE_STAGING_ROOT'
+            find '$POD_REMOTE_STAGING_ROOT' -mindepth 1 -maxdepth 1 -type d -mtime +${POD_REMOTE_STAGING_TTL_DAYS} -exec rm -rf {} + || true
+            rm -rf '$REMOTE_WORKDIR' && mkdir -p '$REMOTE_WORKDIR'
+          "
           rsync -a --delete -e "$RSYNC_SSH" \
             --exclude .git --exclude .venv --exclude build --exclude output \
-            "$GITHUB_WORKSPACE/" "$POD_REMOTE_HOST:$REMOTE_WORKDIR/"
+            "$GITHUB_WORKSPACE/" "$REMOTE_TARGET:$REMOTE_WORKDIR/"
 
-          ssh "${SSH_OPTS[@]}" "$POD_REMOTE_HOST" "
+          ssh "${SSH_OPTS[@]}" "$REMOTE_TARGET" "
             set -eo pipefail
             cd '$REMOTE_WORKDIR'
+            if [ -n '$REMOTE_PROXY_HOST' ] && ! (exec 3<>'/dev/tcp/$REMOTE_PROXY_HOST/$REMOTE_PROXY_PORT') 2>/dev/null; then
+              echo '::error::POD_REMOTE_HTTP_PROXY=$POD_REMOTE_HTTP_PROXY is not reachable from machine $POD_REMOTE_MACHINE'
+              exit 1
+            fi
             export PYTHONPATH="\${PYTHONPATH:-}"
             export CMAKE_PREFIX_PATH="\${CMAKE_PREFIX_PATH:-}"
-            source /usr/local/Ascend/cann/set_env.sh
+            export http_proxy='$POD_REMOTE_HTTP_PROXY' https_proxy='$POD_REMOTE_HTTPS_PROXY' no_proxy='$POD_REMOTE_NO_PROXY'
+            export HTTP_PROXY='$POD_REMOTE_HTTP_PROXY' HTTPS_PROXY='$POD_REMOTE_HTTPS_PROXY' NO_PROXY='$POD_REMOTE_NO_PROXY'
+            source '$POD_REMOTE_CANN_ENV'
             set -u
             python3 -m venv --system-site-packages .venv
             source .venv/bin/activate
@@ -848,18 +982,25 @@ jobs:
             pip install '.[test]'
           "
 
-          ssh "${SSH_OPTS[@]}" "$POD_REMOTE_HOST" "
+          ssh "${SSH_OPTS[@]}" "$REMOTE_TARGET" "
             pkill -f 'python -m simpler.remote_l3_worker --host ${REMOTE_DAEMON_HOST} --port ${REMOTE_DAEMON_PORT}' || true
           " || true
 
-          ssh "${SSH_OPTS[@]}" "$POD_REMOTE_HOST" "
+          ssh "${SSH_OPTS[@]}" "$REMOTE_TARGET" "
             set -eo pipefail
             cd '$REMOTE_WORKDIR'
             export PYTHONPATH="\${PYTHONPATH:-}"
             export CMAKE_PREFIX_PATH="\${CMAKE_PREFIX_PATH:-}"
-            source /usr/local/Ascend/cann/set_env.sh
+            source '$POD_REMOTE_CANN_ENV'
             set -u
             source .venv/bin/activate
+            # The job-level timeouts are the parent's environment; ssh carries
+            # no environment, so the peer would otherwise schedule against the
+            # built-in defaults and the two halves of one run would disagree on
+            # how long a stall may last.
+            export SIMPLER_SCHEDULER_TIMEOUT_MS='$SIMPLER_SCHEDULER_TIMEOUT_MS'
+            export SIMPLER_OP_EXECUTE_TIMEOUT_US='$SIMPLER_OP_EXECUTE_TIMEOUT_US'
+            export SIMPLER_STREAM_SYNC_TIMEOUT_MS='$SIMPLER_STREAM_SYNC_TIMEOUT_MS'
             mkdir -p output/vector_add_mixed_l3/daemon-${POD_REMOTE_MACHINE}
             export ASCEND_PROCESS_LOG_PATH="\$PWD/output/vector_add_mixed_l3/daemon-${POD_REMOTE_MACHINE}"
             export SIMPLER_VECTOR_ADD_MIXED_L3_ROLE=machine${POD_REMOTE_MACHINE}
@@ -874,7 +1015,7 @@ jobs:
           import sys
           import time
 
-          deadline = time.time() + 120
+          deadline = time.time() + ${POD_DAEMON_WAIT_S}
           while time.time() < deadline:
               try:
                   with socket.create_connection(("${REMOTE_DAEMON_HOST}", ${REMOTE_DAEMON_PORT}), timeout=2):
@@ -889,24 +1030,24 @@ jobs:
           export SIMPLER_VECTOR_ADD_MIXED_L3_REMOTE="${REMOTE_DAEMON_HOST}:${REMOTE_DAEMON_PORT}"
           export SIMPLER_VECTOR_ADD_MIXED_L3_LOCAL_DEVICES="$POD_LOCAL_DEVICES"
           export SIMPLER_VECTOR_ADD_MIXED_L3_REMOTE_DEVICES="$POD_REMOTE_DEVICES"
-          export SIMPLER_VECTOR_ADD_MIXED_L3_SESSION_TIMEOUT=180
-          export SIMPLER_VECTOR_ADD_MIXED_L3_SESSION_LISTEN_HOST=0.0.0.0
+          export SIMPLER_VECTOR_ADD_MIXED_L3_SESSION_TIMEOUT="$POD_L3_SESSION_TIMEOUT_S"
+          export SIMPLER_VECTOR_ADD_MIXED_L3_SESSION_LISTEN_HOST="$POD_L3_SESSION_LISTEN_HOST"
 
-          timeout 1800s bash examples/workers/l4/vector_add_mixed_l3/run_parent.sh
+          timeout "${POD_SMOKE_TIMEOUT_S}s" bash examples/workers/l4/vector_add_mixed_l3/run_parent.sh
 
-      - name: paged_attention_unroll (a2a3)
-        run: |
-          source /usr/local/Ascend/cann/set_env.sh
-          source .venv/bin/activate
-          pytest tests/st/a2a3/tensormap_and_ringbuffer/paged_attention_unroll \
-            --platform a2a3 --device "${POD_LOCAL_DEVICES%%,*}"
-
-      - name: collectives allreduce (a2a3)
-        run: |
-          source /usr/local/Ascend/cann/set_env.sh
-          source .venv/bin/activate
-          pytest tests/st/worker/collectives/allreduce \
-            --platform a2a3 --device "$POD_LOCAL_DEVICES"
+      # Both sides' device logs and the peer's daemon output land under the run
+      # directory and stay on the runner otherwise. A device-side failure — a
+      # scheduler timeout on the peer, say — names its sub-class only there, so
+      # without this the run page shows the host traceback and nothing that
+      # explains it.
+      - name: Upload vector_add_mixed_l3 logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector-add-mixed-l3-${{ github.run_id }}-${{ github.run_attempt }}
+          path: output/vector_add_mixed_l3/pod-ci-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: warn
+          retention-days: 7
 
   # ---------- Detect platform-specific changes (runs on GitHub server) ----------
   detect-changes:
