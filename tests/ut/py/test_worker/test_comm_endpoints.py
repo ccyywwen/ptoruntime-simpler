@@ -162,6 +162,16 @@ def _attachments_by_member(part: ce.RegionPartPlan) -> dict[ce.EndpointIdentity,
             ce.AdapterProfile.DEVICE_LOCAL,
             True,
         ),
+        # Shareable-handle overlay, not a local VA, so same-endpoint still offers peer import.
+        (
+            ce.BackendKind.VMM_SHAREABLE,
+            ce.DEVICE_AICPU,
+            True,
+            True,
+            ce.AdapterKind.DEVICE_PEER,
+            ce.AdapterProfile.DEVICE_VMM_PEER_IMPORT,
+            False,
+        ),
         # Offered as the same-node peer mechanism, and refused: nothing materializes a device peer
         # import, so admitting it would name an attachment no materializer can carry out.
         (

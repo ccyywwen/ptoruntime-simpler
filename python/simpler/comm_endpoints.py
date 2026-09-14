@@ -1015,11 +1015,11 @@ def _device_consumer_candidates(
 
     ``same_endpoint`` is what separates a backing already local to this chip from a same-node peer's:
     backend and deployment alone cannot tell ``DEVICE_LOCAL`` from ``DEVICE_PEER``.
+    ``VMM_SHAREABLE`` is never ``DEVICE_LOCAL``: its body is a shareable-handle overlay, not a VA.
     """
     if same_endpoint and backend_kind in (
         BackendKind.DEVICE_MALLOC,
         BackendKind.VMM_WINDOW,
-        BackendKind.VMM_SHAREABLE,
     ):
         return (_AdapterCandidate(AdapterKind.DIRECT_MAP, AdapterProfile.DEVICE_LOCAL),)
     if backend_kind in (BackendKind.VMM_WINDOW, BackendKind.VMM_SHAREABLE):
