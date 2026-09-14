@@ -586,12 +586,10 @@ def _require_shm_buf(shm: SharedMemory) -> memoryview:
     return buf
 
 
-def _shm_local_base(shm: SharedMemory) -> int:
-    exported = ctypes.c_char.from_buffer(_require_shm_buf(shm))
-    try:
-        return ctypes.addressof(exported)
-    finally:
-        del exported
+def _shm_local_base(shm: SharedMemory) -> tuple[int, tuple[memoryview, Any]]:
+    buf = _require_shm_buf(shm)
+    exported = ctypes.c_char.from_buffer(buf)
+    return ctypes.addressof(exported), (buf, exported)
 
 
 class SimPosixShmAllocation:
@@ -618,6 +616,7 @@ class SimPosixShmAllocation:
         self._mapping_available = False
         self._shm: SharedMemory | None = None
         self._local_base: int | None = None
+        self._mapping_keepalive: tuple[memoryview, Any] | None = None
         self._physical_bytes = (
             _align_up(self._spec.logical_bytes, _COUNTER_BASE_ALIGNMENT)
             if self._part is RegionPartKind.COUNTER
@@ -659,7 +658,7 @@ class SimPosixShmAllocation:
         self._shm = shm
         self._name_ownership_known = True
         self._shm_object_installed = True
-        self._local_base = _shm_local_base(shm)
+        self._local_base, self._mapping_keepalive = _shm_local_base(shm)
         self._mapping_available = True
         if self._part is RegionPartKind.COUNTER and self._local_base % _COUNTER_BASE_ALIGNMENT != 0:
             raise RegionControlError(
@@ -701,6 +700,7 @@ class SimPosixShmAllocation:
             return self._first_cleanup_failure
         if self._shm_object_installed and not self._close_attempted:
             self._close_attempted = True
+            self._mapping_keepalive = None
             try:
                 if self._shm is not None:
                     self._shm.close()

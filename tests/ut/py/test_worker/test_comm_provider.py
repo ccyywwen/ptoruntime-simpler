@@ -34,6 +34,7 @@ from simpler.comm_provider import (
     DeviceAllocationTarget,
     HostAllocationTarget,
     ImportCapability,
+    LocalEndpointBufferIdentityAllocator,
     PosixShmImport,
     ProviderCleanupFailure,
     ProviderPartResourceState,
@@ -58,20 +59,29 @@ from simpler.comm_provider import (
     RegionPartLocalView,
     SimPosixShmAllocation,
     VmmAllocation,
-    VmmShareableHandleImport,
+    _vmm_shareable_facts,
     validate_independent_local_views,
 )
 
 _COMM_PROVIDER_PATH = Path(comm_provider_module.__file__).resolve()
 _UINT64_MAX = (1 << 64) - 1
 _INT32_MAX = (1 << 31) - 1
+_TEST_OWNER_NONCE = b"\x11\x22\x33\x44\x55\x66\x77\x88"
 
 
-def _payload_spec(logical_bytes: int = 64, backing=BackendKind.VMM_WINDOW) -> RegionPartAllocationSpec:
+def _identity_allocator() -> LocalEndpointBufferIdentityAllocator:
+    return LocalEndpointBufferIdentityAllocator(_TEST_OWNER_NONCE)
+
+
+def _burn_identity() -> CanonicalIdentity:
+    return _identity_allocator().burn_identity()
+
+
+def _payload_spec(logical_bytes: int = 64, backing=BackendKind.VMM_SHAREABLE) -> RegionPartAllocationSpec:
     return RegionPartAllocationSpec(planned_backing_kind=backing, logical_bytes=logical_bytes)
 
 
-def _counter_spec(logical_bytes: int = 8, backing=BackendKind.VMM_WINDOW) -> RegionPartAllocationSpec:
+def _counter_spec(logical_bytes: int = 8, backing=BackendKind.VMM_SHAREABLE) -> RegionPartAllocationSpec:
     return RegionPartAllocationSpec(planned_backing_kind=backing, logical_bytes=logical_bytes)
 
 
@@ -377,6 +387,7 @@ class FakeRegionPartAllocation:
         self.zero_calls: list[tuple[int, int]] = []
         self.fail_materialize: BaseException | type[BaseException] | None = None
         self.fail_zero: BaseException | type[BaseException] | None = None
+        self.fail_describe: BaseException | type[BaseException] | None = None
         self.fail_mapping_bytes: BaseException | type[BaseException] | None = None
         self.fail_import_capability: BaseException | type[BaseException] | None = None
         self.fail_local_base: BaseException | type[BaseException] | None = None
@@ -419,6 +430,24 @@ class FakeRegionPartAllocation:
             base=int(self._local_base),
         )
         self._buffer = buffer
+        if self.fail_describe is not None:
+            fail = self.fail_describe
+
+            def _boom_describe() -> BufferDescriptor:
+                self._raise_configured(fail)
+                raise AssertionError("fail_describe did not raise")
+
+            buffer.to_descriptor = _boom_describe  # type: ignore[method-assign]
+        if self.fail_local_base is not None:
+            fail = self.fail_local_base
+            fake = self
+
+            class _BoomBase:
+                def __int__(self) -> int:
+                    fake._raise_configured(fail)
+                    raise AssertionError("fail_local_base did not raise")
+
+            buffer.base = _BoomBase()  # type: ignore[assignment]
         return buffer
 
     def mapping_bytes(self) -> int:
@@ -551,7 +580,7 @@ def _allocation_spec() -> RegionAllocationSpec:
 
 def _open_store(factory: FakeShellFactory | None = None) -> tuple[ProviderRegionStore, FakeShellFactory]:
     factory = FakeShellFactory() if factory is None else factory
-    store = ProviderRegionStore(_sim_context(), _shell_factory=factory)
+    store = ProviderRegionStore(_sim_context(), _identity_allocator(), _shell_factory=factory)
     return store, factory
 
 
@@ -606,9 +635,9 @@ def test_allocate_and_export_installs_both_shells_before_materialize():
     counter = store.local_view(1, RegionPartKind.COUNTER)
     validate_independent_local_views(payload, counter)
     descriptor = store.describe(1)
-    assert isinstance(descriptor.payload.import_capability, PosixShmImport)
-    assert isinstance(descriptor.counter.import_capability, PosixShmImport)
-    assert descriptor.payload.import_capability.shm_name != descriptor.counter.import_capability.shm_name
+    assert descriptor.payload.backend_kind is BackendKind.POSIX_SHM
+    assert descriptor.counter.backend_kind is BackendKind.POSIX_SHM
+    assert bytes(descriptor.payload.body) != bytes(descriptor.counter.body)
 
 
 def test_ids_are_monotonic_nonzero_and_never_reused_after_burned_create_failure():
@@ -708,11 +737,13 @@ def test_counter_materialize_failure_cleans_both_installed_shells_and_stays_open
         if kind is RegionPartKind.COUNTER:
             shell.fail_materialize = RuntimeError("counter materialize")
 
-    store = ProviderRegionStore(_sim_context(), _shell_factory=_mutating_shell_factory(factory, _mutate))
+    store = ProviderRegionStore(
+        _sim_context(), _identity_allocator(), _shell_factory=_mutating_shell_factory(factory, _mutate)
+    )
     with pytest.raises(RegionAllocationError) as exc_info:
         store.allocate_and_export(_allocation_spec())
     error = exc_info.value
-    assert error.control_kind is RegionControlErrorKind.BACKEND_FAILURE
+    assert error.control_kind is RegionControlErrorKind.INTERNAL_INVARIANT
     assert error.failed_part is RegionPartKind.COUNTER
     assert error.failed_operation is RegionOperationKind.MATERIALIZE
     assert error.cleanup_debt_remaining is False
@@ -727,10 +758,8 @@ def test_counter_materialize_failure_cleans_both_installed_shells_and_stays_open
     ("attr", "exc", "part", "operation"),
     [
         ("fail_zero", RuntimeError("zero"), RegionPartKind.COUNTER, RegionOperationKind.ZERO_BYTES),
-        ("fail_mapping_bytes", RuntimeError("map"), RegionPartKind.PAYLOAD, RegionOperationKind.DESCRIBE),
-        ("fail_mapping_bytes", RuntimeError("map"), RegionPartKind.COUNTER, RegionOperationKind.DESCRIBE),
-        ("fail_import_capability", RuntimeError("import"), RegionPartKind.PAYLOAD, RegionOperationKind.DESCRIBE),
-        ("fail_import_capability", RuntimeError("import"), RegionPartKind.COUNTER, RegionOperationKind.DESCRIBE),
+        ("fail_describe", RuntimeError("describe"), RegionPartKind.PAYLOAD, RegionOperationKind.DESCRIBE),
+        ("fail_describe", RuntimeError("describe"), RegionPartKind.COUNTER, RegionOperationKind.DESCRIBE),
         ("fail_local_base", RuntimeError("base"), RegionPartKind.PAYLOAD, RegionOperationKind.LOCAL_VIEW),
         ("fail_local_base", RuntimeError("base"), RegionPartKind.COUNTER, RegionOperationKind.LOCAL_VIEW),
         ("fail_materialize", KeyboardInterrupt(), RegionPartKind.PAYLOAD, RegionOperationKind.MATERIALIZE),
@@ -743,13 +772,15 @@ def test_create_path_failures_are_classified_and_cleanup_runs_once(attr, exc, pa
         if kind is part:
             setattr(shell, attr, exc)
 
-    store = ProviderRegionStore(_sim_context(), _shell_factory=_mutating_shell_factory(factory, _mutate))
+    store = ProviderRegionStore(
+        _sim_context(), _identity_allocator(), _shell_factory=_mutating_shell_factory(factory, _mutate)
+    )
     with pytest.raises(RegionAllocationError) as exc_info:
         store.allocate_and_export(_allocation_spec())
     error = exc_info.value
     assert error.failed_part is part
     assert error.failed_operation is operation
-    assert error.control_kind is RegionControlErrorKind.BACKEND_FAILURE
+    assert error.control_kind is RegionControlErrorKind.INTERNAL_INVARIANT
     assert error.cleanup_debt_remaining is False
     assert factory.payloads[0].release_count == 1
     assert factory.counters[0].release_count == 1
@@ -765,7 +796,9 @@ def test_create_cleanup_failure_retains_record_and_close_failed():
         if kind is RegionPartKind.PAYLOAD:
             shell.release_step_failures = [_backend_failure(RegionPartKind.PAYLOAD)]
 
-    store = ProviderRegionStore(_sim_context(), _shell_factory=_mutating_shell_factory(factory, _mutate))
+    store = ProviderRegionStore(
+        _sim_context(), _identity_allocator(), _shell_factory=_mutating_shell_factory(factory, _mutate)
+    )
     with pytest.raises(RegionAllocationError) as exc_info:
         store.allocate_and_export(_allocation_spec())
     error = exc_info.value
@@ -800,7 +833,9 @@ def test_overlapping_local_views_are_an_internal_invariant_and_are_cleaned():
     def _mutate(shell, _kind):
         shell._local_base = 0
 
-    store = ProviderRegionStore(_sim_context(), _shell_factory=_mutating_shell_factory(factory, _mutate))
+    store = ProviderRegionStore(
+        _sim_context(), _identity_allocator(), _shell_factory=_mutating_shell_factory(factory, _mutate)
+    )
     with pytest.raises(RegionAllocationError) as exc_info:
         store.allocate_and_export(_allocation_spec())
     error = exc_info.value
@@ -816,7 +851,8 @@ def test_closed_dispatcher_is_an_internal_invariant_and_burns_the_id():
         RegionAllocationContext(
             environment_kind=RegionEnvironmentKind.SIM,
             target=HostAllocationTarget(),
-        )
+        ),
+        _identity_allocator(),
     )
     with pytest.raises(RegionAllocationError) as exc_info:
         store.allocate_and_export(_allocation_spec())
@@ -876,7 +912,7 @@ def test_unmaterialized_fake_facts_fail_and_materialize_does_not_release():
     with pytest.raises(RegionControlError) as exc_info:
         payload.mapping_bytes()
     assert exc_info.value.kind is RegionControlErrorKind.INTERNAL_INVARIANT
-    payload.materialize()
+    payload.materialize(_burn_identity())
     assert payload.release_count == 0
     assert payload.mapping_bytes() == spec.payload.logical_bytes
 
@@ -899,13 +935,13 @@ def test_successful_sweep_releases_active_resources_in_id_order():
 
 
 def test_sim_posix_store_creates_two_distinct_named_objects_and_zeros_only_counter():
-    store = ProviderRegionStore(_sim_context())
+    store = ProviderRegionStore(_sim_context(), _identity_allocator())
     result = store.allocate_and_export(_allocation_spec())
     try:
-        from simpler.comm_provider import _posix_shm_create_name
+        from simpler.comm_provider import _posix_shm_create_name, _posix_token_from_descriptor
 
-        payload_name = result.export_descriptor.payload.import_capability.shm_name
-        counter_name = result.export_descriptor.counter.import_capability.shm_name
+        payload_name = _posix_token_from_descriptor(result.export_descriptor.payload)
+        counter_name = _posix_token_from_descriptor(result.export_descriptor.counter)
         assert payload_name != counter_name
         payload_shm = SharedMemory(name=_posix_shm_create_name(payload_name))
         counter_shm = SharedMemory(name=_posix_shm_create_name(counter_name))
@@ -939,7 +975,7 @@ def test_sim_posix_collision_does_not_open_or_unlink_the_existing_object():
             candidate_name=token,
         )
         with pytest.raises(RegionControlError) as exc_info:
-            shell.materialize()
+            shell.materialize(_burn_identity())
         assert exc_info.value.kind is RegionControlErrorKind.BACKEND_FAILURE
         assert shell.release_once() is None
         still_there = SharedMemory(name=_posix_shm_create_name(token))
@@ -982,7 +1018,7 @@ def test_sim_posix_interrupted_create_unlinks_owned_name_once():
         shm_cls=_CreateThenInterrupt,
     )
     with pytest.raises(KeyboardInterrupt):
-        shell.materialize()
+        shell.materialize(_burn_identity())
     failure = shell.release_once()
     assert failure is None
     assert shell.release_once() is None
@@ -996,7 +1032,7 @@ def test_sim_posix_close_failure_still_unlinks_and_keeps_later_detail():
     from simpler.comm_provider import _posix_shm_create_name
 
     shell = SimPosixShmAllocation(_sim_context(), RegionPartKind.PAYLOAD, _payload_spec(8))
-    shell.materialize()
+    shell.materialize(_burn_identity())
     token = shell.candidate_name
 
     def _boom_close():
@@ -1015,7 +1051,7 @@ def test_sim_posix_close_failure_still_unlinks_and_keeps_later_detail():
 
 def test_sim_posix_unlink_failure_is_summarized_after_successful_close():
     shell = SimPosixShmAllocation(_sim_context(), RegionPartKind.COUNTER, _counter_spec())
-    shell.materialize()
+    shell.materialize(_burn_identity())
 
     def _boom_unlink():
         raise OSError("unlink failed")
@@ -1044,12 +1080,14 @@ def test_posix_token_has_no_slash_on_linux_and_macos(monkeypatch, platform):
     assert _posix_shm_create_name(token) == token
     shell = SimPosixShmAllocation(_sim_context(), RegionPartKind.PAYLOAD, _payload_spec(8, BackendKind.POSIX_SHM))
     try:
-        shell.materialize()
-        capability = shell.import_capability()
+        buffer = shell.materialize(_burn_identity())
+        from simpler.comm_provider import _posix_token_from_descriptor
+
+        token = _posix_token_from_descriptor(buffer.to_descriptor())
         assert "/" not in shell.candidate_name
-        assert capability.shm_name == shell.candidate_name
-        assert "/" not in capability.shm_name
-        consumer = SharedMemory(name=_posix_shm_create_name(capability.shm_name))
+        assert token == shell.candidate_name
+        assert "/" not in token
+        consumer = SharedMemory(name=_posix_shm_create_name(token))
         try:
             assert consumer.buf is not None
         finally:
@@ -1129,11 +1167,21 @@ def test_posix_unregister_failure_warns_without_changing_result(monkeypatch, cap
     assert "tracker boom" in caplog.text
 
 
+def test_sim_posix_release_succeeds_after_materialize_exports_local_base():
+    shell = SimPosixShmAllocation(_sim_context(), RegionPartKind.PAYLOAD, _payload_spec(64))
+    buffer = shell.materialize(_burn_identity())
+    assert buffer.shm is None
+    assert int(buffer.base) != 0
+    assert buffer.closed is False
+    assert shell.release_once() is None
+    assert shell.release_once() is None
+
+
 def test_sim_posix_first_cleanup_failure_is_close_when_both_steps_fail():
     from simpler.comm_provider import _posix_shm_create_name
 
     shell = SimPosixShmAllocation(_sim_context(), RegionPartKind.PAYLOAD, _payload_spec(8))
-    shell.materialize()
+    shell.materialize(_burn_identity())
     token = shell.candidate_name
     assert shell._shm is not None
     real_unlink = shell._shm.unlink
@@ -1571,7 +1619,7 @@ def test_vmm_allocation_stores_handle_before_allocate_and_zeros_only_logical_byt
     assert shell.registry_handle is None
     _region_vmm_test_fail_stage("export", "before")
     with pytest.raises(RegionControlError) as exc_info:
-        shell.materialize()
+        shell.materialize(_burn_identity())
     assert exc_info.value.kind is RegionControlErrorKind.BACKEND_FAILURE
     handle = shell.registry_handle
     assert handle is not None
@@ -1585,16 +1633,18 @@ def test_vmm_allocation_stores_handle_before_allocate_and_zeros_only_logical_byt
     assert shell.release_once() is None
 
     ready = VmmAllocation(_onboard_context(4), RegionPartKind.COUNTER, _counter_spec(8))
-    ready.materialize()
+    buffer = ready.materialize(_burn_identity())
     try:
         ready.zero_bytes(0, 8)
         backing = bytes(_region_vmm_test_fake_bytes(ready.registry_handle))
         assert backing[:8] == b"\x00" * 8
         assert backing[8:] == b"\xff" * (len(backing) - 8)
-        capability = ready.import_capability()
-        assert capability.device_id == 4
-        assert ready.mapping_bytes() == 64
-        assert ready.local_base() == int(_region_vmm_inspect(ready.registry_handle).device_addr)
+        from simpler.comm_provider import _vmm_shareable_facts
+
+        device_id, _shareable_handle, mapping_bytes = _vmm_shareable_facts(buffer.to_descriptor())
+        assert device_id == 4
+        assert mapping_bytes == 64
+        assert buffer.base == int(_region_vmm_inspect(ready.registry_handle).device_addr)
     finally:
         assert ready.release_once() is None
 
@@ -1605,7 +1655,7 @@ def test_onboard_store_creates_two_independent_vmm_handles_and_zeros_only_counte
         _region_vmm_test_fake_bytes,
     )
 
-    store = ProviderRegionStore(_onboard_context(5))
+    store = ProviderRegionStore(_onboard_context(5), _identity_allocator())
     result = store.allocate_and_export(_allocation_spec())
     resource = store._resources[result.provider_resource_id]
     payload_shell = resource.parts[RegionPartKind.PAYLOAD].allocation
@@ -1615,12 +1665,11 @@ def test_onboard_store_creates_two_independent_vmm_handles_and_zeros_only_counte
     payload_handle = payload_shell.registry_handle
     counter_handle = counter_shell.registry_handle
     try:
-        payload = result.export_descriptor.payload.import_capability
-        counter = result.export_descriptor.counter.import_capability
-        assert isinstance(payload, VmmShareableHandleImport)
-        assert isinstance(counter, VmmShareableHandleImport)
-        assert payload.shareable_handle != counter.shareable_handle
-        assert payload.device_id == 5
+        payload_device, payload_shareable, _payload_mapping = _vmm_shareable_facts(result.export_descriptor.payload)
+        counter_device, counter_shareable, _counter_mapping = _vmm_shareable_facts(result.export_descriptor.counter)
+        assert payload_shareable != counter_shareable
+        assert payload_device == 5
+        assert counter_device == 5
         assert payload_handle != counter_handle
         payload_view = store.local_view(result.provider_resource_id, RegionPartKind.PAYLOAD)
         counter_view = store.local_view(result.provider_resource_id, RegionPartKind.COUNTER)
