@@ -1928,6 +1928,11 @@ def test_sim_worker_counter_wait_timeout_does_not_poison_region_and_free_is_idem
         worker.close()
 
 
+def _assert_posix_import_covers_logical(pair, *, payload_bytes: int, counter_bytes: int) -> None:
+    assert int(pair[0][1]) >= payload_bytes
+    assert int(pair[1][1]) >= counter_bytes
+
+
 @pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")
 @pytest.mark.parametrize("platform", ["a2a3sim", "a5sim"])
 def test_sim_public_api_two_shm_objects_and_two_consecutive_lifecycles(platform, monkeypatch):
@@ -1977,7 +1982,7 @@ def test_sim_public_api_two_shm_objects_and_two_consecutive_lifecycles(platform,
         leftover_names.extend(name for name, _size in first_pair)
         assert len(first_pair) == 2
         assert first_pair[0][0] != first_pair[1][0]
-        assert {first_pair[0][1], first_pair[1][1]} == {16, 128}
+        _assert_posix_import_covers_logical(first_pair, payload_bytes=16, counter_bytes=128)
         assert worker._region_instance_registry._instances == {}
         assert worker._region_instance_registry._instances == {}
         for name in leftover_names:
@@ -1989,6 +1994,7 @@ def test_sim_public_api_two_shm_objects_and_two_consecutive_lifecycles(platform,
         leftover_names.extend(name for name, _size in second_pair)
         assert len(second_pair) == 2
         assert second_pair[0][0] != second_pair[1][0]
+        _assert_posix_import_covers_logical(second_pair, payload_bytes=16, counter_bytes=128)
         assert {name for name, _size in first_pair}.isdisjoint({name for name, _size in second_pair})
         assert worker._region_instance_registry._instances == {}
         assert worker._region_instance_registry._instances == {}

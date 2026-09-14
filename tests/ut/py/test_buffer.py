@@ -1068,8 +1068,8 @@ def test_vmm_shareable_stays_closed_dispatch_in_importer_paths():
     assert all(c.profile is not AdapterProfile.HOST_VMM_COPY for c in candidates)
 
     chip = ImportContext(deployment=DEVICE_AICPU, device_owner_instance_id=bytes(identity.owner_instance_id))
-    with pytest.raises(ValueError, match="unsupported backend"):
+    with pytest.raises(ValueError, match="direct map probe is not implemented"):
         select_adapter(desc, chip)
     reg = ImportRegistry(chip)
-    with pytest.raises(ValueError, match="unsupported backend"):
+    with pytest.raises(ValueError, match="direct map probe is not implemented"):
         reg.materialize(desc)
