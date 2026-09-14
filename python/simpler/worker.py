@@ -2586,6 +2586,16 @@ def _open_ctrl_payload(buf: memoryview, *, what: str) -> tuple[SharedMemory, mem
     return staged, staged_buf, payload_size
 
 
+def _release_ctrl_payload(staged: SharedMemory, payload: memoryview, view: memoryview) -> None:
+    try:
+        view.release()
+    finally:
+        try:
+            payload.release()
+        finally:
+            staged.close()
+
+
 def _open_global_domain_payload(buf: memoryview) -> tuple[SharedMemory, memoryview, int]:
     return _open_ctrl_payload(buf, what="Global CommDomain")
 
@@ -2637,22 +2647,22 @@ def _forward_delegated_region(worker: Worker, current_path: str, staged: memoryv
 
 def _handle_ctrl_delegated_region_hop(buf: memoryview, inner_worker: Worker, current_path: str) -> None:
     staged, payload, payload_size = _open_ctrl_payload(buf, what="delegated region")
+    view = payload[:payload_size]
     try:
-        _forward_delegated_region(inner_worker, current_path, payload[:payload_size])
+        _forward_delegated_region(inner_worker, current_path, view)
     finally:
-        payload.release()
-        staged.close()
+        _release_ctrl_payload(staged, payload, view)
 
 
 def _handle_ctrl_delegated_region_terminal(
     buf: memoryview, table: ProviderTransactionTable, store: ProviderRegionStore
 ) -> None:
     staged, payload, payload_size = _open_ctrl_payload(buf, what="delegated region")
+    view = payload[:payload_size]
     try:
-        handle_terminal_delegated_region(payload[:payload_size], table, store)
+        handle_terminal_delegated_region(view, table, store)
     finally:
-        payload.release()
-        staged.close()
+        _release_ctrl_payload(staged, payload, view)
 
 
 def _delegated_allocate_outcome_is_fatal(outcome: DelegatedAllocateReply) -> bool:
@@ -6978,6 +6988,13 @@ class Worker:
                     self._device_endpoint_identities[key] = (mint_owner_instance_id(), has_allocator)
         return self._device_endpoint_identities
 
+    def _freeze_subtree_device_endpoint_identities(self) -> None:
+        if int(self.level) == 3:
+            self._ensure_local_device_endpoint_identities()
+            return
+        for child in self._next_level_workers:
+            child._freeze_subtree_device_endpoint_identities()
+
     def _node_identity_from_remote_endpoint(self, endpoint: str) -> str:
         host, _port = self._parse_remote_endpoint(endpoint)
         return _normalize_node_identity(host)
@@ -8544,6 +8561,12 @@ class Worker:
         # readiness before returning — so the process tree nests correctly (L4 →
         # L3 child → L3's chip/sub grandchildren) and INIT_READY propagates up
         # only after the whole subtree is ready.
+        #
+        # AICPU/AICORE nonces are topology facts: freeze them on the in-process
+        # L3 objects before fork so the parent registry and the child chip
+        # allocator share one reverse-binding.
+        for inner_worker in self._next_level_workers:
+            inner_worker._freeze_subtree_device_endpoint_identities()
         for idx, inner_worker in enumerate(self._next_level_workers):
             worker_id = self._next_level_worker_ids[idx]
             global_node = global_nodes.get(worker_id)
@@ -9034,6 +9057,7 @@ class Worker:
         *,
         part: RegionPartKind | None = None,
         worker_id: int = 0,
+        expected_device_id: int | None = None,
     ):
         expected = self._provider_import_backend_kind()
         if descriptor.backend_kind is not expected:
@@ -9049,7 +9073,12 @@ class Worker:
             return _worker_host_mapped_region_import_sim(token, int(mapping_bytes), self._owner_id)
         if expected is BackendKind.VMM_SHAREABLE:
             device_id, shareable_handle, mapping_bytes = _vmm_shareable_facts(descriptor)
-            if int(device_id) != int(self._provider_import_device_id(int(worker_id))):
+            namespace_id = (
+                int(expected_device_id)
+                if expected_device_id is not None
+                else int(self._provider_import_device_id(int(worker_id)))
+            )
+            if int(device_id) != int(namespace_id):
                 raise RuntimeError("committed VMM device_id is outside this worker's device namespace")
             try:
                 granularity = int(_region_vmm_granularity(int(device_id)))
@@ -9072,8 +9101,11 @@ class Worker:
         return BackendKind.POSIX_SHM if platform.endswith("sim") else BackendKind.VMM_SHAREABLE
 
     def _provider_import_device_id(self, worker_id: int) -> int:
-        device_ids = self._config.get("device_ids", [])
-        return int(device_ids[int(worker_id)])
+        device_ids = list(self._config.get("device_ids", []))
+        index = int(worker_id)
+        if index < 0 or index >= len(device_ids):
+            raise RuntimeError("committed VMM device_id is outside this worker's device namespace")
+        return int(device_ids[index])
 
     def _import_region_part_lease(
         self,
@@ -9082,9 +9114,15 @@ class Worker:
         descriptor: BufferDescriptor,
         *,
         part: RegionPartKind | None = None,
+        expected_device_id: int | None = None,
     ):
         del resource_id
-        return self._import_provider_part(descriptor, part=part, worker_id=int(worker_id))
+        return self._import_provider_part(
+            descriptor,
+            part=part,
+            worker_id=int(worker_id),
+            expected_device_id=expected_device_id,
+        )
 
     def _create_worker_chip_region(self, worker_id: int, payload_bytes: int, counter_bytes: int):
         if payload_bytes <= 0:

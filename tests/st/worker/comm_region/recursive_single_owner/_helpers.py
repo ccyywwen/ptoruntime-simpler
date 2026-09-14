@@ -19,6 +19,7 @@ from collections.abc import Callable
 from enum import IntEnum
 from typing import Any
 
+from _task_interface import _worker_host_mapped_region_close  # pyright: ignore[reportMissingImports]
 from simpler import comm_provider
 from simpler.comm_endpoints import DEVICE_AICPU, HOST_CPU, RegionLayoutSpec, SingleOwner, at
 from simpler.comm_provider import ProviderRegionStore, RegionPartKind
@@ -357,6 +358,8 @@ class _LeaseProxy:
         closer = getattr(inner, "close", None)
         if closer is not None:
             closer()
+        else:
+            _worker_host_mapped_region_close(int(inner))
         part = object.__getattribute__(self, "_part")
         kind = (
             _LifecycleEventKind.CLOSE_PAYLOAD if part is RegionPartKind.PAYLOAD else _LifecycleEventKind.CLOSE_COUNTER
@@ -375,8 +378,8 @@ class _ShellProxy:
         object.__setattr__(self, "_part", part)
         object.__setattr__(self, "_recorder", recorder)
 
-    def materialize(self) -> Any:
-        return object.__getattribute__(self, "_inner").materialize()
+    def materialize(self, identity, diagnostics=None) -> Any:
+        return object.__getattribute__(self, "_inner").materialize(identity, diagnostics)
 
     def mapping_bytes(self) -> Any:
         return object.__getattribute__(self, "_inner").mapping_bytes()

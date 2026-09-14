@@ -1027,6 +1027,7 @@ def materialize_region_instance(ctx: MaterializationContext) -> RegionInstance: 
                     instance._provider_resource_id,
                     payload_desc,
                     part=RegionPartKind.PAYLOAD,
+                    expected_device_id=int(shape.provider_device_id),
                 )
                 _validate_imported_lease(
                     payload_desc,
@@ -1043,6 +1044,7 @@ def materialize_region_instance(ctx: MaterializationContext) -> RegionInstance: 
                     instance._provider_resource_id,
                     counter_desc,
                     part=RegionPartKind.COUNTER,
+                    expected_device_id=int(shape.provider_device_id),
                 )
                 _validate_imported_lease(
                     counter_desc,

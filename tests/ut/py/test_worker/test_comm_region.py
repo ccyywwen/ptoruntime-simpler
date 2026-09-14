@@ -670,7 +670,7 @@ def region_worker(monkeypatch):
         )
         monkeypatch.setattr(worker, "_consume_worker_host_mapped_cleanup_error", lambda _api: None)
 
-        def fake_import(_worker_id, _resource_id, descriptor, *, part=None):
+        def fake_import(_worker_id, _resource_id, descriptor, *, part=None, expected_device_id=None):
             name = "payload" if not leases else "counter"
             lease = _FakeLease(
                 calls,
@@ -1582,7 +1582,7 @@ def test_compatibility_create_uses_projection_result_not_a_fabricated_spec(monke
     monkeypatch.setattr(
         worker,
         "_import_region_part_lease",
-        lambda _worker_id, _resource_id, _desc, *, part=None: _FakeLease(
+        lambda _worker_id, _resource_id, _desc, *, part=None, expected_device_id=None: _FakeLease(
             [],
             "payload" if part is RegionPartKind.PAYLOAD else "counter",
             1,
@@ -2059,6 +2059,39 @@ def test_delegated_shape_accepts_l3_and_l4():
     assert l4_shape.provider.path == "L4/L3[0]/L2[0]"
     assert l4_shape.first_hop_child_id == 0
     assert l4_shape.provider_device_id == 4
+
+
+def test_l4_onboard_import_uses_provider_device_id_not_local_device_list(monkeypatch):
+    from simpler import worker as worker_mod
+
+    worker = _l4_with_local_l3(device_ids=[4])
+    worker._config = {**worker._config, "platform": "a2a3", "device_ids": []}
+    imported: list[tuple[int, int, int]] = []
+    monkeypatch.setattr(worker_mod, "_region_vmm_granularity", lambda _device_id: 64)
+    monkeypatch.setattr(
+        worker_mod,
+        "_worker_host_mapped_region_import_onboard",
+        lambda device_id, handle, mapping_bytes, owner: imported.append((device_id, handle, mapping_bytes)) or 21,
+    )
+    body = (
+        (4).to_bytes(4, "little", signed=True)
+        + (0).to_bytes(4, "little")
+        + (21).to_bytes(8, "little")
+        + (64).to_bytes(8, "little")
+    )
+    descriptor = BufferDescriptor(
+        CanonicalIdentity(b"\x11\x22\x33\x44\x55\x66\x77\x88", 1, 1),
+        AddressSpace.DEVICE,
+        AccessMode.READWRITE,
+        BackendKind.VMM_SHAREABLE,
+        8,
+        body,
+    )
+    with pytest.raises(RuntimeError, match="outside this worker's device namespace"):
+        worker._import_provider_part(descriptor, part=RegionPartKind.PAYLOAD, worker_id=0)
+    handle = worker._import_region_part_lease(0, 11, descriptor, part=RegionPartKind.PAYLOAD, expected_device_id=4)
+    assert handle == 21
+    assert imported == [(4, 21, 64)]
 
 
 def test_delegated_shape_refuses_aicore_without_dispatch():
