@@ -591,6 +591,53 @@ def test_allocate_reply_tags_and_unique_error_kind():
     assert parsed_alloc.cleanup_debt_remaining is True
 
 
+def test_allocated_reply_counter_nbytes_not_multiple_of_four_is_typed():
+    frame = bytearray(encode_reply(_allocated_reply()))
+    struct.pack_into("<Q", frame, ALLOCATE_COUNTER_DESCRIPTOR_OFFSET + 40, 5)
+    with pytest.raises(RegionControlError) as exc:
+        parse_reply(frame).decode_outcome()
+    assert _kind(exc.value) is RegionControlErrorKind.INVALID_FIELD_VALUE
+    assert exc.type is RegionControlError
+
+
+def test_allocated_reply_overlapping_local_views_is_typed():
+    frame = bytearray(encode_reply(_allocated_reply()))
+    struct.pack_into("<IIQQ", frame, ALLOCATE_COUNTER_VIEW_OFFSET, int(RegionPartKind.COUNTER), 0, 0x1000, 8)
+    with pytest.raises(RegionControlError) as exc:
+        parse_reply(frame).decode_outcome()
+    assert _kind(exc.value) is RegionControlErrorKind.INVALID_FIELD_VALUE
+    assert exc.type is RegionControlError
+
+
+def test_allocated_reply_single_descriptor_malformed_keeps_invalid_field_value():
+    frame = bytearray(encode_reply(_allocated_reply()))
+    struct.pack_into("<Q", frame, ALLOCATE_COUNTER_DESCRIPTOR_OFFSET + 56 + 8, 0)
+    with pytest.raises(RegionControlError) as exc:
+        parse_reply(frame).decode_outcome()
+    assert _kind(exc.value) is RegionControlErrorKind.INVALID_FIELD_VALUE
+    assert exc.type is RegionControlError
+
+
+def test_allocated_reply_v2_layout_and_legal_decode_are_unchanged():
+    committed = encode_reply(_allocated_reply())
+    assert len(committed) == ALLOCATE_REPLY_BYTES
+    assert ALLOCATE_PAYLOAD_DESCRIPTOR_OFFSET == 64
+    assert ALLOCATE_COUNTER_DESCRIPTOR_OFFSET == 152
+    assert ALLOCATE_PAYLOAD_VIEW_OFFSET == 240
+    assert ALLOCATE_COUNTER_VIEW_OFFSET == 264
+    assert DELEGATED_REGION_CTRL_MAGIC_VERSION == 0x4452435400020000
+    decoded = parse_reply(committed).decode_outcome()
+    assert decoded.tag is DelegatedAllocateReplyTag.ALLOCATED
+    assert decoded.result is not None
+    assert decoded.result.provider_resource_id == 11
+    assert decoded.result.export_descriptor.payload.nbytes == 64
+    assert decoded.result.export_descriptor.counter.nbytes == 8
+    assert decoded.payload_view is not None
+    assert decoded.counter_view is not None
+    assert decoded.payload_view.local_base == 0x1000
+    assert decoded.counter_view.local_base == 0x2000
+
+
 def test_release_reply_tags_and_unknown_transaction_zero_outcome():
     clean = {
         DelegatedReleaseReplyTag.RELEASED: ProviderReleaseStatus.RELEASED,

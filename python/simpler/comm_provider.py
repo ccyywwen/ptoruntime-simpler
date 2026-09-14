@@ -23,7 +23,7 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from multiprocessing.shared_memory import SharedMemory
-from typing import Any, Callable, Protocol, TypeVar, Union
+from typing import Any, Callable, NoReturn, Protocol, TypeVar, Union
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     AccessMode,
@@ -1276,10 +1276,127 @@ class ProviderRegionStore:
                     failed_part=kind,
                     failed_operation=RegionOperationKind.DESCRIBE,
                 )
-        return RegionExportDescriptor(
-            payload=exports[RegionPartKind.PAYLOAD],
-            counter=exports[RegionPartKind.COUNTER],
-        )
+        try:
+            descriptor = RegionExportDescriptor(
+                payload=exports[RegionPartKind.PAYLOAD],
+                counter=exports[RegionPartKind.COUNTER],
+            )
+        except RegionControlError:
+            raise
+        except (TypeError, ValueError) as exc:
+            raise RegionControlError(
+                RegionControlErrorKind.INTERNAL_INVARIANT,
+                str(exc) or "export descriptor pair is invalid",
+                failed_part=RegionPartKind.INVALID,
+                failed_operation=RegionOperationKind.DESCRIBE,
+            ) from exc
+        self._validate_frozen_descriptor_pair(resource, descriptor, stage)
+        return descriptor
+
+    def _validate_frozen_descriptor_pair(  # noqa: PLR0912 -- one store-private publication gate before ACTIVE
+        self,
+        resource: ProviderRegionResource,
+        descriptor: RegionExportDescriptor,
+        stage: _AllocateStage,
+    ) -> None:
+        stage.operation = RegionOperationKind.DESCRIBE
+        descriptors = {
+            RegionPartKind.PAYLOAD: descriptor.payload,
+            RegionPartKind.COUNTER: descriptor.counter,
+        }
+        environment = self._context.environment_kind
+        if environment is RegionEnvironmentKind.SIM:
+            expected_actual = BackendKind.POSIX_SHM
+            expected_space = AddressSpace.HOST
+        elif environment is RegionEnvironmentKind.ONBOARD:
+            expected_actual = BackendKind.VMM_SHAREABLE
+            expected_space = AddressSpace.DEVICE
+        else:
+            raise RegionControlError(
+                RegionControlErrorKind.INTERNAL_INVARIANT,
+                "publication requires a known provider environment",
+                failed_part=RegionPartKind.INVALID,
+                failed_operation=RegionOperationKind.DESCRIBE,
+            )
+
+        def _fail(message: str, *, failed_part: RegionPartKind, cause: BaseException | None = None) -> NoReturn:
+            error = RegionControlError(
+                RegionControlErrorKind.INTERNAL_INVARIANT,
+                message,
+                failed_part=failed_part,
+                failed_operation=RegionOperationKind.DESCRIBE,
+            )
+            if cause is not None:
+                raise error from cause
+            raise error
+
+        for kind in REGION_PARTS:
+            stage.part = kind
+            part = resource.parts.get(kind)
+            if part is None:
+                _fail("READY part record is missing", failed_part=kind)
+            buffer = part.buffer
+            if buffer is None:
+                _fail("READY part is missing its canonical Buffer", failed_part=kind)
+            if buffer.closed:
+                _fail("Region-private Buffer is already closed", failed_part=kind)
+            if buffer.shm is not None:
+                _fail("Region-private Buffer.shm must be None", failed_part=kind)
+            exported = descriptors[kind]
+            if exported.identity != part.identity:
+                _fail("Buffer identity must match the burned part identity", failed_part=kind)
+            if bytes(exported.identity.owner_instance_id) != self._allocator_nonce:
+                _fail("Buffer identity owner must be the Store allocator nonce", failed_part=kind)
+            if int(exported.identity.generation) != 1:
+                _fail("Buffer identity generation must be 1", failed_part=kind)
+            if exported.access is not AccessMode.READWRITE:
+                _fail("Buffer access must be READWRITE", failed_part=kind)
+            if int(exported.nbytes) != int(resource.spec.part(kind).logical_bytes):
+                _fail("Buffer nbytes must match the admitted logical_bytes", failed_part=kind)
+            if part.spec.planned_backing_kind is not BackendKind.VMM_SHAREABLE:
+                _fail("planned backing must be VMM_SHAREABLE", failed_part=kind)
+            if exported.backend_kind is not expected_actual or exported.address_space is not expected_space:
+                _fail("actual backend is not the legal lowering of the admitted plan", failed_part=kind)
+
+        stage.part = RegionPartKind.INVALID
+        if descriptor.payload.identity == descriptor.counter.identity:
+            _fail("PAYLOAD and COUNTER identities must differ", failed_part=RegionPartKind.INVALID)
+        if bytes(descriptor.payload.identity.owner_instance_id) != bytes(descriptor.counter.identity.owner_instance_id):
+            _fail("PAYLOAD and COUNTER must share one owner nonce", failed_part=RegionPartKind.INVALID)
+        if expected_actual is BackendKind.POSIX_SHM:
+            tokens: dict[RegionPartKind, str] = {}
+            for kind in REGION_PARTS:
+                stage.part = kind
+                try:
+                    tokens[kind] = _posix_token_from_descriptor(descriptors[kind])
+                except (TypeError, ValueError) as exc:
+                    _fail("POSIX shm token is invalid", failed_part=kind, cause=exc)
+            stage.part = RegionPartKind.INVALID
+            if tokens[RegionPartKind.PAYLOAD] == tokens[RegionPartKind.COUNTER]:
+                _fail("POSIX shm tokens must be distinct", failed_part=RegionPartKind.INVALID)
+            return
+        target = self._context.target
+        if not isinstance(target, DeviceAllocationTarget):
+            _fail("ONBOARD publication requires a device allocation target", failed_part=RegionPartKind.INVALID)
+        facts: dict[RegionPartKind, tuple[int, int, int]] = {}
+        for kind in REGION_PARTS:
+            stage.part = kind
+            try:
+                facts[kind] = _vmm_shareable_facts(descriptors[kind])
+            except (TypeError, ValueError) as exc:
+                _fail("VMM_SHAREABLE descriptor body is invalid", failed_part=kind, cause=exc)
+            device_id, shareable_handle, mapping_bytes = facts[kind]
+            if int(device_id) != int(target.device_id):
+                _fail("VMM device_id must match the Store target", failed_part=kind)
+            if int(shareable_handle) == 0:
+                _fail("VMM shareable handle must be nonzero", failed_part=kind)
+            if kind is RegionPartKind.COUNTER and int(mapping_bytes) < _align_up(
+                int(descriptors[kind].nbytes), _COUNTER_BASE_ALIGNMENT
+            ):
+                _fail("COUNTER VMM mapping_bytes must cover 64-byte alignment", failed_part=kind)
+        stage.part = RegionPartKind.INVALID
+        if int(facts[RegionPartKind.PAYLOAD][1]) == int(facts[RegionPartKind.COUNTER][1]):
+            _fail("VMM shareable handles must be distinct", failed_part=RegionPartKind.INVALID)
 
     def _freeze_local_views(
         self, resource: ProviderRegionResource, stage: _AllocateStage
