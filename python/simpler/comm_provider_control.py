@@ -961,14 +961,28 @@ def _decode_allocate_reply(envelope: DelegatedRegionReplyEnvelope) -> DelegatedA
                 RegionControlErrorKind.INVALID_FIELD_VALUE,
                 "ALLOCATED requires a resource id and zero error fields",
             )
-        descriptor = RegionExportDescriptor(
-            payload=_decode_buffer_descriptor(envelope.frame, ALLOCATE_PAYLOAD_DESCRIPTOR_OFFSET),
-            counter=_decode_buffer_descriptor(envelope.frame, ALLOCATE_COUNTER_DESCRIPTOR_OFFSET),
-        )
+        try:
+            descriptor = RegionExportDescriptor(
+                payload=_decode_buffer_descriptor(envelope.frame, ALLOCATE_PAYLOAD_DESCRIPTOR_OFFSET),
+                counter=_decode_buffer_descriptor(envelope.frame, ALLOCATE_COUNTER_DESCRIPTOR_OFFSET),
+            )
+        except RegionControlError:
+            raise
+        except (TypeError, ValueError) as exc:
+            raise RegionControlError(
+                RegionControlErrorKind.INVALID_FIELD_VALUE,
+                str(exc) or "allocate reply descriptors are invalid",
+            ) from exc
         _validate_decoded_descriptor_pair(descriptor)
         payload_view = _decode_local_view(envelope.frame, ALLOCATE_PAYLOAD_VIEW_OFFSET, RegionPartKind.PAYLOAD)
         counter_view = _decode_local_view(envelope.frame, ALLOCATE_COUNTER_VIEW_OFFSET, RegionPartKind.COUNTER)
-        validate_independent_local_views(payload_view, counter_view)
+        try:
+            validate_independent_local_views(payload_view, counter_view)
+        except (TypeError, ValueError) as exc:
+            raise RegionControlError(
+                RegionControlErrorKind.INVALID_FIELD_VALUE,
+                str(exc) or "allocate reply local views are invalid",
+            ) from exc
         result = RegionAllocationResult(provider_resource_id=int(resource_id), export_descriptor=descriptor)
         return DelegatedAllocateReply(
             tag=tag,

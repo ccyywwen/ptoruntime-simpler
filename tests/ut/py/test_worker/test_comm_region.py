@@ -22,6 +22,7 @@ from simpler.comm_provider import (
     ProviderReleaseResult,
     ProviderReleaseStatus,
     RegionAllocationError,
+    RegionControlError,
     RegionControlErrorKind,
     RegionOperationKind,
     RegionPartKind,
@@ -502,12 +503,18 @@ def test_shape_validation_rejects_duplicate_attachment_members():
 
 class _FakeLease:
     def __init__(
-        self, calls: list[tuple], name: str, handle: int, *, fail_close: bool = False, mapped_base: int = 0
+        self,
+        calls: list[tuple],
+        name: str,
+        handle: int,
+        *,
+        fail_close: bool = False,
+        mapped_base: Optional[int] = 0,
     ) -> None:
         self._calls = calls
         self._name = name
         self.handle = handle
-        self.mapped_base = int(mapped_base)
+        self.mapped_base = None if mapped_base is None else int(mapped_base)
         self.closed = False
         self._fail_close = fail_close
 
@@ -517,7 +524,7 @@ class _FakeLease:
         self.closed = True
         self._calls.append(("mapping_close", self._name))
         if self._fail_close:
-            raise RuntimeError("mapping close failed")
+            raise RuntimeError(f"{self._name} mapping close failed")
 
 
 class _FakeNativeWorker:
@@ -1025,8 +1032,9 @@ def _overlap_allocated_counter_view(staged: bytearray) -> None:
 
 def test_invalid_success_reply_releases_once_and_never_imports(region_worker):
     worker, calls, leases = region_worker(mutate_success=_overlap_allocated_counter_view)
-    with pytest.raises((RuntimeError, ValueError), match="must not overlap"):
+    with pytest.raises(RegionControlError, match="must not overlap") as excinfo:
         _materialize_default_region(worker)
+    assert excinfo.value.kind is RegionControlErrorKind.INVALID_FIELD_VALUE
 
     assert _tracked(worker) == ()
     assert worker._delegated_session_fatal is not None
@@ -1036,8 +1044,9 @@ def test_invalid_success_reply_releases_once_and_never_imports(region_worker):
 
 def test_invalid_success_compensation_debt_releases_once_and_survives_until_sweep(region_worker):
     worker, calls, leases = region_worker(fail_release=True, mutate_success=_overlap_allocated_counter_view)
-    with pytest.raises((RuntimeError, ValueError), match="must not overlap"):
+    with pytest.raises(RegionControlError, match="must not overlap") as excinfo:
         _materialize_default_region(worker)
+    assert excinfo.value.kind is RegionControlErrorKind.INVALID_FIELD_VALUE
 
     assert _tracked(worker) == ()
     assert worker._delegated_session_fatal is not None
@@ -1249,6 +1258,226 @@ def test_unpublished_close_failed_survives_cleanup_run_until_sweep(region_worker
     assert calls.count(("release", 1, 42)) == 1
     worker._region_instance_registry.sweep()
     assert _tracked(worker) == ()
+    assert calls.count(("release", 1, 42)) == 1
+
+
+def _raise_on_part_validation(monkeypatch, failing_part: RegionPartKind, primary: BaseException):
+    from simpler import comm_region
+
+    def _validate(_descriptor, _lease, *, part, expected_backend_kind):
+        del expected_backend_kind
+        if RegionPartKind(part) is failing_part:
+            raise primary
+
+    monkeypatch.setattr(comm_region, "_validate_imported_lease", _validate)
+    return primary
+
+
+def test_payload_validation_close_failure_keeps_primary_and_poisons(region_worker, monkeypatch):
+    worker, calls, leases = region_worker(fail_mapping_close=True)
+    primary = MaterializationError("payload runtime validation failed")
+    _raise_on_part_validation(monkeypatch, RegionPartKind.PAYLOAD, primary)
+    with pytest.raises(MaterializationError) as excinfo:
+        _materialize_default_region(worker)
+    assert excinfo.value is primary
+    tracked = _tracked(worker)
+    assert len(tracked) == 1
+    instance = tracked[0]
+    assert instance._state is RegionInstanceState.CLOSE_FAILED
+    assert instance._cleanup_error is not None
+    assert "payload mapping close failed" in str(instance._cleanup_error)
+    assert leases[0].closed is True
+    assert calls == [
+        ("allocate", 64, 128),
+        ("import", "payload", 64, RegionPartKind.PAYLOAD),
+        ("mapping_close", "payload"),
+        ("release", 1, 42),
+    ]
+    with pytest.raises(RuntimeError, match="no further work is admitted"):
+        worker._require_no_ordered_cleanup_failure("test")
+    worker._region_instance_registry.sweep()
+    assert _tracked(worker) == ()
+    assert calls.count(("release", 1, 42)) == 1
+
+
+def test_counter_validation_both_close_failures_keep_primary_order_and_release_once(region_worker, monkeypatch):
+    worker, calls, leases = region_worker(fail_mapping_close=True)
+    primary = MaterializationError("counter runtime validation failed")
+    _raise_on_part_validation(monkeypatch, RegionPartKind.COUNTER, primary)
+    with pytest.raises(MaterializationError) as excinfo:
+        _materialize_default_region(worker)
+    assert excinfo.value is primary
+    tracked = _tracked(worker)
+    assert len(tracked) == 1
+    instance = tracked[0]
+    assert instance._state is RegionInstanceState.CLOSE_FAILED
+    assert instance._cleanup_error is not None
+    assert str(instance._cleanup_error) == "counter mapping close failed"
+    assert [item for item in calls if item[0] in ("mapping_close", "release")] == [
+        ("mapping_close", "counter"),
+        ("mapping_close", "payload"),
+        ("release", 1, 42),
+    ]
+    assert leases[0].closed is True
+    assert leases[1].closed is True
+    with pytest.raises(RuntimeError, match="no further work is admitted"):
+        worker._require_no_ordered_cleanup_failure("test")
+    worker._region_instance_registry.cleanup_run(None)
+    worker._region_instance_registry.sweep()
+    assert _tracked(worker) == ()
+    assert calls.count(("release", 1, 42)) == 1
+    assert calls.count(("mapping_close", "counter")) == 1
+    assert calls.count(("mapping_close", "payload")) == 1
+
+
+def test_clean_partial_import_rollback_closes_and_does_not_poison(region_worker, monkeypatch):
+    worker, calls, leases = region_worker()
+    primary = MaterializationError("counter runtime validation failed")
+    _raise_on_part_validation(monkeypatch, RegionPartKind.COUNTER, primary)
+    with pytest.raises(MaterializationError) as excinfo:
+        _materialize_default_region(worker)
+    assert excinfo.value is primary
+    assert _tracked(worker) == ()
+    worker._require_no_ordered_cleanup_failure("test")
+    assert leases[0].closed is True
+    assert leases[1].closed is True
+    assert [item for item in calls if item[0] in ("mapping_close", "release")] == [
+        ("mapping_close", "counter"),
+        ("mapping_close", "payload"),
+        ("release", 1, 42),
+    ]
+
+
+def test_partial_import_provider_release_failure_poisons_without_retry(region_worker, monkeypatch):
+    worker, calls, _leases = region_worker(fail_release=True)
+    primary = MaterializationError("counter runtime validation failed")
+    _raise_on_part_validation(monkeypatch, RegionPartKind.COUNTER, primary)
+    resources = _RunResources()
+    worker._building_run_resources = resources
+    try:
+        with pytest.raises(MaterializationError) as excinfo:
+            _materialize_default_region(worker)
+        assert excinfo.value is primary
+    finally:
+        worker._building_run_resources = None
+    tracked = _tracked(worker)
+    assert len(tracked) == 1
+    instance = tracked[0]
+    assert instance._state is RegionInstanceState.CLOSE_FAILED
+    assert calls.count(("release", 1, 42)) == 1
+    with pytest.raises(RuntimeError, match="no further work is admitted"):
+        worker._require_no_ordered_cleanup_failure("test")
+    worker._region_instance_registry.cleanup_run(resources)
+    assert _tracked(worker) == (instance,)
+    worker._region_instance_registry.sweep()
+    assert _tracked(worker) == ()
+    assert calls.count(("release", 1, 42)) == 1
+
+
+def _install_mapped_base_imports(
+    worker,
+    calls: list[tuple],
+    leases: list[_FakeLease],
+    monkeypatch,
+    *,
+    payload_base: Optional[int] = 0,
+    counter_base: Optional[int] = 64,
+    fail_close: bool = False,
+) -> None:
+    def fake_import(_worker_id, _resource_id, descriptor, *, part=None, expected_device_id=None):
+        name = "payload" if not leases else "counter"
+        lease = _FakeLease(
+            calls,
+            name,
+            handle=100 + len(leases),
+            fail_close=fail_close,
+            mapped_base=payload_base if name == "payload" else counter_base,
+        )
+        calls.append(("import", name, int(descriptor.nbytes), part))
+        leases.append(lease)
+        return lease
+
+    monkeypatch.setattr(worker, "_import_region_part_lease", fake_import)
+
+
+def test_counter_mapped_base_aligned_publishes_live(region_worker, monkeypatch):
+    worker, calls, leases = region_worker()
+    _install_mapped_base_imports(worker, calls, leases, monkeypatch, counter_base=64)
+    instance = _materialize_default_region(worker)
+    assert instance.state is RegionInstanceState.LIVE
+    assert leases[1].mapped_base == 64
+    with worker._control_reservation("test_region_instance"):
+        instance.close()
+    assert instance.state is RegionInstanceState.CLOSED
+    worker._require_no_ordered_cleanup_failure("test")
+
+
+def test_counter_mapped_base_misaligned_is_materialization_error(region_worker, monkeypatch):
+    worker, calls, leases = region_worker()
+    _install_mapped_base_imports(worker, calls, leases, monkeypatch, counter_base=32)
+    with pytest.raises(MaterializationError, match="64-byte aligned") as excinfo:
+        _materialize_default_region(worker)
+    assert isinstance(excinfo.value, MaterializationError)
+    assert _tracked(worker) == ()
+    worker._require_no_ordered_cleanup_failure("test")
+    assert leases[0].closed is True
+    assert leases[1].closed is True
+    assert [item for item in calls if item[0] in ("mapping_close", "release")] == [
+        ("mapping_close", "counter"),
+        ("mapping_close", "payload"),
+        ("release", 1, 42),
+    ]
+
+
+def test_counter_mapped_base_getter_failure_is_materialization_error(region_worker, monkeypatch):
+    from simpler import comm_region
+
+    worker, calls, leases = region_worker()
+    _install_mapped_base_imports(worker, calls, leases, monkeypatch, counter_base=None)
+
+    def _boom(_handle: int) -> int:
+        raise OSError("mapped base unavailable")
+
+    monkeypatch.setattr(comm_region, "_worker_host_mapped_region_mapped_base", _boom)
+    with pytest.raises(MaterializationError, match="unavailable") as excinfo:
+        _materialize_default_region(worker)
+    assert isinstance(excinfo.value, MaterializationError)
+    assert isinstance(excinfo.value.__cause__, OSError)
+    assert _tracked(worker) == ()
+    worker._require_no_ordered_cleanup_failure("test")
+    assert leases[0].closed is True
+    assert leases[1].closed is True
+    assert [item for item in calls if item[0] in ("mapping_close", "release")] == [
+        ("mapping_close", "counter"),
+        ("mapping_close", "payload"),
+        ("release", 1, 42),
+    ]
+
+
+def test_counter_mapped_base_getter_failure_with_close_diagnostic_poisons(region_worker, monkeypatch):
+    from simpler import comm_region
+
+    worker, calls, leases = region_worker()
+    _install_mapped_base_imports(worker, calls, leases, monkeypatch, counter_base=None, fail_close=True)
+
+    def _boom(_handle: int) -> int:
+        raise OSError("mapped base unavailable")
+
+    monkeypatch.setattr(comm_region, "_worker_host_mapped_region_mapped_base", _boom)
+    with pytest.raises(MaterializationError, match="unavailable") as excinfo:
+        _materialize_default_region(worker)
+    primary = excinfo.value
+    tracked = _tracked(worker)
+    assert len(tracked) == 1
+    instance = tracked[0]
+    assert instance._state is RegionInstanceState.CLOSE_FAILED
+    assert instance._cleanup_error is not None
+    assert str(instance._cleanup_error) == "counter mapping close failed"
+    assert primary is not instance._cleanup_error
+    with pytest.raises(RuntimeError, match="no further work is admitted"):
+        worker._require_no_ordered_cleanup_failure("test")
+    assert calls.count(("release", 1, 42)) == 1
+    worker._region_instance_registry.sweep()
     assert calls.count(("release", 1, 42)) == 1
 
 

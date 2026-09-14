@@ -645,31 +645,38 @@ class RegionInstance:
         self._delegated_allocation_committed = True
         self._delegated_release_edge = True
 
-    def _abort_materialization(self, cause: BaseException) -> None:
-        if isinstance(cause, RegionAllocationError):
-            poison = bool(cause.cleanup_debt_remaining)
-        else:
-            poison = False
+    def _abort_materialization(
+        self,
+        cause: BaseException,
+        *,
+        prior_cleanup_errors: tuple[BaseException, ...] = (),
+    ) -> None:
         close_error: BaseException | None = None
         try:
-            self._close_owned(poison_on_error=False)
+            self._close_owned(
+                poison_on_error=False,
+                prior_cleanup_errors=prior_cleanup_errors,
+            )
         except BaseException as exc:  # noqa: BLE001
             close_error = exc
-        if not poison:
-            if close_error is None and self._state is not RegionInstanceState.CLOSE_FAILED:
+        provider_create_debt = isinstance(cause, RegionAllocationError) and bool(cause.cleanup_debt_remaining)
+        must_poison = provider_create_debt or close_error is not None
+        if not must_poison:
+            if self._state is not RegionInstanceState.CLOSE_FAILED:
                 self._state = RegionInstanceState.CLOSED
-            elif close_error is not None:
-                self._cleanup_error = close_error
-                self._state = RegionInstanceState.CLOSE_FAILED
             return
         if close_error is not None and close_error.__cause__ is None:
             close_error.__cause__ = cause
-        self._cleanup_error = self._worker._record_unreclaimable(
+        if close_error is not None:
+            self._cleanup_error = close_error
+        self._state = RegionInstanceState.CLOSE_FAILED
+        poison = self._worker._record_unreclaimable(
             f"region instance: committed allocation could not be published on worker {self.worker_id}; "
             "no further work is admitted",
             close_error or cause,
         )
-        self._state = RegionInstanceState.CLOSE_FAILED
+        if self._cleanup_error is None:
+            self._cleanup_error = poison
 
     def _close_mapping_leases(self) -> list[BaseException]:
         errors: list[BaseException] = []
@@ -725,7 +732,12 @@ class RegionInstance:
             f"region instance: delegated release failed for transaction {self._delegated_transaction_id}"
         )
 
-    def _close_owned(self, *, poison_on_error: bool) -> None:
+    def _close_owned(
+        self,
+        *,
+        poison_on_error: bool,
+        prior_cleanup_errors: tuple[BaseException, ...] = (),
+    ) -> None:
         if self._state is RegionInstanceState.CLOSED:
             return
         if self._state is RegionInstanceState.CLOSE_FAILED and self._cleanup_error is not None:
@@ -737,7 +749,8 @@ class RegionInstance:
         self._close_attempted = True
         if self._state is RegionInstanceState.LIVE:
             self._state = RegionInstanceState.CLOSING
-        errors = self._close_mapping_leases()
+        errors = list(prior_cleanup_errors)
+        errors.extend(self._close_mapping_leases())
         release_error = self._release_provider_resource()
         if release_error is not None:
             errors.append(release_error)
@@ -1056,14 +1069,24 @@ def materialize_region_instance(ctx: MaterializationContext) -> RegionInstance: 
                     RegionPartKind.COUNTER, counter_desc, counter_lease
                 )
                 counter_lease = None
-            except BaseException:
+            except BaseException as primary:
+                cleanup_errors: list[BaseException] = []
                 if counter_lease is not None:
-                    _close_native_lease(counter_lease)
+                    error = _attempt_close_native_lease(counter_lease)
+                    counter_lease = None
+                    if error is not None:
+                        cleanup_errors.append(error)
                 if instance._payload_attachment is not None:
-                    instance._payload_attachment.close()
-                    instance._payload_attachment = None
+                    cleanup_errors.extend(instance._close_mapping_leases())
                 elif payload_lease is not None:
-                    _close_native_lease(payload_lease)
+                    error = _attempt_close_native_lease(payload_lease)
+                    payload_lease = None
+                    if error is not None:
+                        cleanup_errors.append(error)
+                instance._abort_materialization(
+                    primary,
+                    prior_cleanup_errors=tuple(cleanup_errors),
+                )
                 raise
             instance._payload_part = PayloadPart(
                 RegionPartSpan(offset=0, nbytes=int(spec.payload.logical_bytes)),
@@ -1114,15 +1137,23 @@ def _close_native_lease(lease: Any) -> None:
     _worker_host_mapped_region_close(int(lease))
 
 
-def _imported_lease_base(lease: Any) -> int | None:
-    mapped = getattr(lease, "mapped_base", None)
-    if mapped is not None:
-        return int(mapped)
-    handle = getattr(lease, "handle", lease)
+def _attempt_close_native_lease(lease: Any) -> BaseException | None:
     try:
+        _close_native_lease(lease)
+    except BaseException as exc:  # noqa: BLE001
+        return exc
+    return None
+
+
+def _require_imported_lease_base(lease: Any) -> int:
+    try:
+        mapped = getattr(lease, "mapped_base", None)
+        if mapped is not None:
+            return int(mapped)
+        handle = getattr(lease, "handle", lease)
         return int(_worker_host_mapped_region_mapped_base(int(handle)))
-    except Exception:
-        return None
+    except Exception as exc:
+        raise MaterializationError("COUNTER imported mapping base is unavailable") from exc
 
 
 def _validate_imported_lease(
@@ -1136,11 +1167,9 @@ def _validate_imported_lease(
         raise RuntimeError("imported lease backend does not match the current execution environment")
     if RegionPartKind(part) is not RegionPartKind.COUNTER:
         return
-    base = _imported_lease_base(lease)
-    if base is None:
-        return
-    if int(base) % _COUNTER_BASE_ALIGNMENT != 0:
-        raise RuntimeError("COUNTER mapped base must be 64-byte aligned")
+    base = _require_imported_lease_base(lease)
+    if base % _COUNTER_BASE_ALIGNMENT != 0:
+        raise MaterializationError("COUNTER mapped base must be 64-byte aligned")
 
 
 def _require_legal_actual_lowering(
