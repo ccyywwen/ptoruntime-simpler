@@ -381,15 +381,6 @@ class _ShellProxy:
     def materialize(self, identity, diagnostics=None) -> Any:
         return object.__getattribute__(self, "_inner").materialize(identity, diagnostics)
 
-    def mapping_bytes(self) -> Any:
-        return object.__getattribute__(self, "_inner").mapping_bytes()
-
-    def import_capability(self) -> Any:
-        return object.__getattribute__(self, "_inner").import_capability()
-
-    def local_base(self) -> Any:
-        return object.__getattribute__(self, "_inner").local_base()
-
     def zero_bytes(self, *args: Any, **kwargs: Any) -> Any:
         return object.__getattribute__(self, "_inner").zero_bytes(*args, **kwargs)
 

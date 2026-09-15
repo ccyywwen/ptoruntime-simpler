@@ -2900,7 +2900,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
     prepared: set[int] | None = None,
     task_frame_count: int = 1,
     chip_rank: int | None = None,
-    provider_region_store: ProviderRegionStore | None = None,
+    provider_region_store: ProviderRegionStore,
 ) -> None:
     """Chip-process handlers for `_run_mailbox_loop`.
 
@@ -2920,17 +2920,12 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
     ``owner_instance_id`` is the parent Worker's nonce — the only owner whose
     DEVICE_MALLOC/VMM_WINDOW backings this chip may materialize. Region Buffer
     identity uses the AICPU endpoint allocator constructed before INIT_READY.
+    ``provider_region_store`` is that Store; a missing Store is an invariant
+    failure.
     """
     prepared = prepared if prepared is not None else set()
-    environment = RegionEnvironmentKind.SIM if str(chip_platform).endswith("sim") else RegionEnvironmentKind.ONBOARD
     if provider_region_store is None:
-        provider_region_store = ProviderRegionStore(
-            RegionAllocationContext(
-                environment_kind=environment,
-                target=DeviceAllocationTarget(int(device_id)),
-            ),
-            identity_allocator=LocalEndpointBufferIdentityAllocator(mint_owner_instance_id()),
-        )
+        raise RuntimeError(f"chip_process dev={device_id}: ProviderRegionStore is required before INIT_READY")
     provider_transaction_table = ProviderTransactionTable()
     import_registry = ImportRegistry(
         ImportContext(

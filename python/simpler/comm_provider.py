@@ -317,31 +317,6 @@ class RegionAllocationSpec:
         return self.counter
 
 
-@dataclass(frozen=True)
-class VmmShareableHandleImport:
-    device_id: int
-    shareable_handle: int
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "device_id", _require_int32("device_id", self.device_id))
-        object.__setattr__(
-            self,
-            "shareable_handle",
-            _require_uint64("shareable_handle", self.shareable_handle),
-        )
-
-
-@dataclass(frozen=True)
-class PosixShmImport:
-    shm_name: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "shm_name", _require_posix_shm_token(self.shm_name))
-
-
-ImportCapability = Union[VmmShareableHandleImport, PosixShmImport]
-
-
 def _posix_token_from_descriptor(descriptor: BufferDescriptor) -> str:
     if descriptor.backend_kind is not BackendKind.POSIX_SHM:
         raise ValueError("POSIX shm token requires POSIX_SHM")
