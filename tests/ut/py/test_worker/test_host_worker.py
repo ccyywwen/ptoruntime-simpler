@@ -306,6 +306,25 @@ def _teardown_identity_allocator():
     return LocalEndpointBufferIdentityAllocator(b"\x11\x22\x33\x44\x55\x66\x77\x88")
 
 
+def _chip_loop_provider_region_store(*, device_id: int = 0, chip_platform: str = ""):
+    from simpler.comm_provider import (
+        DeviceAllocationTarget,
+        LocalEndpointBufferIdentityAllocator,
+        ProviderRegionStore,
+        RegionAllocationContext,
+        RegionEnvironmentKind,
+    )
+
+    environment = RegionEnvironmentKind.SIM if str(chip_platform).endswith("sim") else RegionEnvironmentKind.ONBOARD
+    return ProviderRegionStore(
+        RegionAllocationContext(
+            environment_kind=environment,
+            target=DeviceAllocationTarget(int(device_id)),
+        ),
+        identity_allocator=LocalEndpointBufferIdentityAllocator(worker_mod.mint_owner_instance_id()),
+    )
+
+
 class _TeardownPartShell:
     def __init__(self, part, spec) -> None:
         self.part = part
@@ -1101,6 +1120,7 @@ class _TwoFrameLoopHarness:
                 "chip_runtime": chip_runtime,
                 "prepared": self.prepared,
                 "task_frame_count": 2,
+                "provider_region_store": _chip_loop_provider_region_store(chip_platform="a2a3"),
             },
         )
         self._mailbox_load_patch = patch.object(worker_mod, "_mailbox_load_i32", observed_mailbox_load)
@@ -8033,7 +8053,10 @@ class TestChipMainLoopDigestRegister:
         t = threading.Thread(
             target=_run_chip_main_loop,
             args=(cw, buf, 0, state_addr, 0, registry, identity_table, identity_refs, mint_owner_instance_id()),
-            kwargs={"chip_platform": ""},
+            kwargs={
+                "chip_platform": "",
+                "provider_region_store": _chip_loop_provider_region_store(chip_platform=""),
+            },
             daemon=True,
         )
         t.start()
@@ -8307,7 +8330,13 @@ def test_a_failed_diagnostic_sidecar_write_fails_the_task_not_the_loop(tmp_path)
             {digest: 1},
             worker_mod.mint_owner_instance_id(),
         ),
-        kwargs={"chip_platform": "a2a3", "chip_runtime": "", "prepared": {7}, "chip_rank": 0},
+        kwargs={
+            "chip_platform": "a2a3",
+            "chip_runtime": "",
+            "prepared": {7},
+            "chip_rank": 0,
+            "provider_region_store": _chip_loop_provider_region_store(chip_platform="a2a3"),
+        },
         daemon=True,
     )
     try:

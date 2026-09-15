@@ -33,9 +33,7 @@ from simpler.comm_provider import (
     POSIX_SHM_TOKEN_MAX_BYTES,
     DeviceAllocationTarget,
     HostAllocationTarget,
-    ImportCapability,
     LocalEndpointBufferIdentityAllocator,
-    PosixShmImport,
     ProviderCleanupFailure,
     ProviderPartResourceState,
     ProviderRegionResourceState,
@@ -59,6 +57,7 @@ from simpler.comm_provider import (
     RegionPartLocalView,
     SimPosixShmAllocation,
     VmmAllocation,
+    _require_posix_shm_token,
     _vmm_shareable_facts,
     validate_independent_local_views,
 )
@@ -252,13 +251,12 @@ def test_export_descriptor_holds_two_buffer_descriptors():
 @pytest.mark.parametrize("shm_name", ["", "a" * (POSIX_SHM_TOKEN_MAX_BYTES + 1), "npu\u4e00", "name\x00x"])
 def test_posix_shm_token_rejects_empty_overlong_non_ascii_and_nul(shm_name):
     with pytest.raises((ValueError, TypeError)):
-        PosixShmImport(shm_name=shm_name)
+        _require_posix_shm_token(shm_name)
 
 
 def test_posix_shm_token_accepts_bounded_ascii():
     token = "p" * POSIX_SHM_TOKEN_MAX_BYTES
-    capability = PosixShmImport(shm_name=token)
-    assert capability.shm_name == token
+    assert _require_posix_shm_token(token) == token
 
 
 def test_local_view_accepts_base_zero_and_rejects_uint64_span_overflow():
@@ -391,15 +389,13 @@ class FakeRegionPartAllocation:
         self.fail_materialize: BaseException | type[BaseException] | None = None
         self.fail_zero: BaseException | type[BaseException] | None = None
         self.fail_describe: BaseException | type[BaseException] | None = None
-        self.fail_mapping_bytes: BaseException | type[BaseException] | None = None
-        self.fail_import_capability: BaseException | type[BaseException] | None = None
         self.fail_local_base: BaseException | type[BaseException] | None = None
         self.raise_on_release: BaseException | type[BaseException] | None = None
         self.release_step_failures: list[ProviderCleanupFailure] = []
         self.descriptor_mutate = None
         self._local_base = local_base
         self._mapping_bytes = spec.logical_bytes if mapping_bytes is None else mapping_bytes
-        self._import_capability: ImportCapability = PosixShmImport(shm_name=shm_name)
+        self._shm_name = shm_name
         self._buffer: Buffer | None = None
         self._environment_kind = environment_kind
         self._device_id = int(device_id)
@@ -424,7 +420,7 @@ class FakeRegionPartAllocation:
         owner_worker_path = ""
         if diagnostics is not None:
             owner_worker_path = str(getattr(diagnostics, "owner_worker_path", "") or "")
-        token = self._import_capability.shm_name.lstrip("/")
+        token = self._shm_name.lstrip("/")
         if self._environment_kind is RegionEnvironmentKind.ONBOARD:
             mapping_bytes = int(self._mapping_bytes)
             if self.part is RegionPartKind.COUNTER:
@@ -486,45 +482,6 @@ class FakeRegionPartAllocation:
 
             buffer.base = _BoomBase()  # type: ignore[assignment]
         return buffer
-
-    def mapping_bytes(self) -> int:
-        self.calls.append("mapping_bytes")
-        self.world.record(self.part, "mapping_bytes")
-        if not self.materialized:
-            raise RegionControlError(
-                RegionControlErrorKind.INTERNAL_INVARIANT,
-                "mapping_bytes requires a materialized shell",
-                failed_part=self.part,
-                failed_operation=RegionOperationKind.DESCRIBE,
-            )
-        self._raise_configured(self.fail_mapping_bytes)
-        return self._mapping_bytes
-
-    def import_capability(self) -> ImportCapability:
-        self.calls.append("import_capability")
-        self.world.record(self.part, "import_capability")
-        if not self.materialized:
-            raise RegionControlError(
-                RegionControlErrorKind.INTERNAL_INVARIANT,
-                "import_capability requires a materialized shell",
-                failed_part=self.part,
-                failed_operation=RegionOperationKind.DESCRIBE,
-            )
-        self._raise_configured(self.fail_import_capability)
-        return self._import_capability
-
-    def local_base(self) -> int:
-        self.calls.append("local_base")
-        self.world.record(self.part, "local_base")
-        if not self.materialized:
-            raise RegionControlError(
-                RegionControlErrorKind.INTERNAL_INVARIANT,
-                "local_base requires a materialized shell",
-                failed_part=self.part,
-                failed_operation=RegionOperationKind.LOCAL_VIEW,
-            )
-        self._raise_configured(self.fail_local_base)
-        return self._local_base
 
     def zero_bytes(self, offset: int, nbytes: int) -> None:
         self.calls.append("zero_bytes")
@@ -977,16 +934,17 @@ def test_describe_and_local_view_reject_gone_and_unknown_ids():
     assert zero.value.kind is RegionControlErrorKind.INVALID_FIELD_VALUE
 
 
-def test_unmaterialized_fake_facts_fail_and_materialize_does_not_release():
+def test_materialize_does_not_release_and_facts_come_from_buffer():
     factory = FakeShellFactory()
     spec = _allocation_spec()
     payload = factory(_sim_context(), RegionPartKind.PAYLOAD, spec.payload)
-    with pytest.raises(RegionControlError) as exc_info:
-        payload.mapping_bytes()
-    assert exc_info.value.kind is RegionControlErrorKind.INTERNAL_INVARIANT
-    payload.materialize(_burn_identity())
+    buffer = payload.materialize(_burn_identity())
     assert payload.release_count == 0
-    assert payload.mapping_bytes() == spec.payload.logical_bytes
+    assert int(buffer.base) == 0x1000
+    assert buffer.nbytes == spec.payload.logical_bytes
+    descriptor = buffer.to_descriptor()
+    assert descriptor.nbytes == spec.payload.logical_bytes
+    assert bytes(descriptor.body).decode("ascii") == payload._shm_name.lstrip("/")
 
 
 def test_successful_sweep_releases_active_resources_in_id_order():
@@ -1897,7 +1855,7 @@ def test_publication_rejects_duplicate_posix_tokens():
 
     def _mutate(shell, kind):
         if kind is RegionPartKind.COUNTER:
-            token = factory.payloads[0]._import_capability.shm_name.lstrip("/")
+            token = factory.payloads[0]._shm_name.lstrip("/")
             shell.descriptor_mutate = lambda desc: _clone_descriptor(desc, body=token.encode("ascii"))
 
     store = ProviderRegionStore(
