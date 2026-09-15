@@ -355,6 +355,7 @@ def _make_orchestrator() -> tuple[Orchestrator, Worker, SharedMemory, _FakeClien
         (comm_region, "_region_counter_test", comm_region._region_counter_test),
         (comm_region, "_region_counter_wait", comm_region._region_counter_wait),
         (comm_region, "_worker_host_mapped_region_close", comm_region._worker_host_mapped_region_close),
+        (comm_region, "_worker_host_mapped_region_mapped_base", comm_region._worker_host_mapped_region_mapped_base),
     ]
     worker._lifecycle = worker_module._Lifecycle.READY
     fake_c_worker = _FakeCWorker()
@@ -378,6 +379,7 @@ def _make_orchestrator() -> tuple[Orchestrator, Worker, SharedMemory, _FakeClien
 
     worker_module._posix_object_size = _posix_object_size
     comm_region._worker_host_mapped_region_close = lambda _handle: None
+    comm_region._worker_host_mapped_region_mapped_base = lambda _handle: 0
     comm_region._host_vmm_copy_to = fake_client.payload_write
     comm_region._host_vmm_copy_from = fake_client.payload_read
     comm_region._region_counter_notify = fake_client.counter_notify

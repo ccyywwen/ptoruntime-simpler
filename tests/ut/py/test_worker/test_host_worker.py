@@ -411,8 +411,8 @@ def test_teardown_chip_process_resources_continues_and_aggregates_in_order():
     )
     result = store.allocate_and_export(
         RegionAllocationSpec(
-            payload=RegionPartAllocationSpec(planned_backing_kind=BackendKind.POSIX_SHM, logical_bytes=64),
-            counter=RegionPartAllocationSpec(planned_backing_kind=BackendKind.POSIX_SHM, logical_bytes=8),
+            payload=RegionPartAllocationSpec(planned_backing_kind=BackendKind.VMM_SHAREABLE, logical_bytes=64),
+            counter=RegionPartAllocationSpec(planned_backing_kind=BackendKind.VMM_SHAREABLE, logical_bytes=8),
         )
     )
     factory.payloads[0].release_step_failures = [
@@ -467,8 +467,8 @@ def test_teardown_chip_process_resources_lists_every_retained_resource():
         _shell_factory=factory,
     )
     spec = RegionAllocationSpec(
-        payload=RegionPartAllocationSpec(planned_backing_kind=BackendKind.POSIX_SHM, logical_bytes=64),
-        counter=RegionPartAllocationSpec(planned_backing_kind=BackendKind.POSIX_SHM, logical_bytes=8),
+        payload=RegionPartAllocationSpec(planned_backing_kind=BackendKind.VMM_SHAREABLE, logical_bytes=64),
+        counter=RegionPartAllocationSpec(planned_backing_kind=BackendKind.VMM_SHAREABLE, logical_bytes=8),
     )
     first = store.allocate_and_export(spec)
     second = store.allocate_and_export(spec)
@@ -530,8 +530,8 @@ def test_teardown_chip_process_resources_ignores_released_and_keeps_each_step_on
     )
     store.allocate_and_export(
         RegionAllocationSpec(
-            payload=RegionPartAllocationSpec(planned_backing_kind=BackendKind.POSIX_SHM, logical_bytes=64),
-            counter=RegionPartAllocationSpec(planned_backing_kind=BackendKind.POSIX_SHM, logical_bytes=8),
+            payload=RegionPartAllocationSpec(planned_backing_kind=BackendKind.VMM_SHAREABLE, logical_bytes=64),
+            counter=RegionPartAllocationSpec(planned_backing_kind=BackendKind.VMM_SHAREABLE, logical_bytes=8),
         )
     )
     worker_mod._teardown_chip_process_resources(

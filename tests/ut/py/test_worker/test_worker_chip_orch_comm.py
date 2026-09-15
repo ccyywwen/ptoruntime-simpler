@@ -84,6 +84,7 @@ def _fake_region_runtime_facts(monkeypatch):
 
     monkeypatch.setattr(worker_module, "_posix_object_size", _posix_object_size)
     monkeypatch.setattr(worker_module, "_region_vmm_granularity", lambda _device_id: 1)
+    monkeypatch.setattr(comm_region, "_worker_host_mapped_region_mapped_base", lambda _handle: 0)
 
 
 def _vmm_shareable_body(*, device_id: int, shareable_handle: int, mapping_bytes: int) -> bytes:
