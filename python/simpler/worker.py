@@ -4929,7 +4929,7 @@ class Worker:
               add_worker() before init().
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0915 -- one constructor installs this Worker's level, registries, and owner state
         self,
         level: int,
         **config,
