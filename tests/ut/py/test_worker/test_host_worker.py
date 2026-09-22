@@ -301,15 +301,15 @@ class _RecordingDomainImpl:
 
 
 def _teardown_identity_allocator():
-    from simpler.comm_provider import LocalEndpointBufferIdentityAllocator
+    from simpler.buffer import LocalEndpointBufferIdentityAllocator
 
     return LocalEndpointBufferIdentityAllocator(b"\x11\x22\x33\x44\x55\x66\x77\x88")
 
 
 def _chip_loop_provider_region_store(*, device_id: int = 0, chip_platform: str = ""):
+    from simpler.buffer import LocalEndpointBufferIdentityAllocator
     from simpler.comm_provider import (
         DeviceAllocationTarget,
-        LocalEndpointBufferIdentityAllocator,
         ProviderRegionStore,
         RegionAllocationContext,
         RegionEnvironmentKind,

@@ -15,6 +15,7 @@ import ast
 import dataclasses
 import logging
 import sys
+import threading
 from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
 
@@ -26,14 +27,15 @@ from simpler.buffer import (
     BackendKind,
     Buffer,
     BufferDescriptor,
+    BufferIdentityExhaustedError,
     CanonicalIdentity,
+    LocalEndpointBufferIdentityAllocator,
     intern_worker_path,
 )
 from simpler.comm_provider import (
     POSIX_SHM_TOKEN_MAX_BYTES,
     DeviceAllocationTarget,
     HostAllocationTarget,
-    LocalEndpointBufferIdentityAllocator,
     ProviderCleanupFailure,
     ProviderPartResourceState,
     ProviderRegionResourceState,
@@ -1975,3 +1977,137 @@ def test_publication_failure_cleanup_debt_is_orthogonal_to_primary_kind():
     assert snapshot[0].status is ProviderReleaseStatus.CLEANUP_INCOMPLETE
     assert factory.payloads[0].release_count == 1
     assert factory.counters[0].release_count == 1
+
+
+def test_two_stores_share_one_allocator_and_restart_resource_ids():
+    allocator = LocalEndpointBufferIdentityAllocator(_TEST_OWNER_NONCE)
+    store1 = ProviderRegionStore(_sim_context(), allocator, _shell_factory=FakeShellFactory())
+    first = store1.allocate_and_export(_allocation_spec())
+    assert int(first.export_descriptor.payload.identity.buffer_id) == 1
+    assert int(first.export_descriptor.counter.identity.buffer_id) == 2
+    assert first.provider_resource_id == 1
+    assert store1.sweep()[0].status is ProviderReleaseStatus.RELEASED
+
+    store2 = ProviderRegionStore(_sim_context(), allocator, _shell_factory=FakeShellFactory())
+    second = store2.allocate_and_export(_allocation_spec())
+    assert int(second.export_descriptor.payload.identity.buffer_id) == 3
+    assert int(second.export_descriptor.counter.identity.buffer_id) == 4
+    assert second.provider_resource_id == 1
+
+
+def test_store_maps_identity_exhaustion_onto_the_current_part():
+    allocator = LocalEndpointBufferIdentityAllocator(_TEST_OWNER_NONCE)
+    allocator._next_buffer_id = _UINT64_MAX + 1
+    factory = FakeShellFactory()
+    store = ProviderRegionStore(_sim_context(), allocator, _shell_factory=factory)
+    with pytest.raises(RegionAllocationError) as first_exc:
+        store.allocate_and_export(_allocation_spec())
+    assert isinstance(first_exc.value.__cause__, BufferIdentityExhaustedError)
+    assert first_exc.value.control_kind is RegionControlErrorKind.INTERNAL_INVARIANT
+    assert first_exc.value.failed_part is RegionPartKind.PAYLOAD
+    assert first_exc.value.failed_operation is RegionOperationKind.NONE
+    assert first_exc.value.cleanup_debt_remaining is False
+    assert factory.payloads == []
+
+    allocator._next_buffer_id = _UINT64_MAX
+    factory2 = FakeShellFactory()
+    store2 = ProviderRegionStore(_sim_context(), allocator, _shell_factory=factory2)
+    with pytest.raises(RegionAllocationError) as second_exc:
+        store2.allocate_and_export(_allocation_spec())
+    assert isinstance(second_exc.value.__cause__, BufferIdentityExhaustedError)
+    assert second_exc.value.control_kind is RegionControlErrorKind.INTERNAL_INVARIANT
+    assert second_exc.value.failed_part is RegionPartKind.COUNTER
+    assert second_exc.value.failed_operation is RegionOperationKind.NONE
+    assert second_exc.value.cleanup_debt_remaining is False
+    assert factory2.payloads[0].release_count == 1
+    assert factory2.counters == []
+
+
+def test_region_vmm_concurrent_granularity_queries_are_serialized(fake_vmm):
+    from _task_interface import (  # pyright: ignore[reportMissingImports]
+        _region_vmm_granularity,
+        _region_vmm_test_issued_ops,
+        _region_vmm_test_reset_hooks,
+    )
+
+    _region_vmm_test_reset_hooks()
+    threads_n = 8
+    calls_each = 10_000
+    barrier = threading.Barrier(threads_n)
+    values: list[int] = []
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+
+    def query() -> None:
+        try:
+            barrier.wait()
+            local = [_region_vmm_granularity(0) for _ in range(calls_each)]
+            with lock:
+                values.extend(local)
+        except BaseException as exc:  # noqa: BLE001 -- the test asserts the collected failure
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=query) for _ in range(threads_n)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert values == [64] * (threads_n * calls_each)
+    issued = _region_vmm_test_issued_ops()
+    assert issued == ["granularity"] * (threads_n * calls_each)
+
+
+def test_region_vmm_granularity_query_is_serialized_with_allocate(fake_vmm):
+    from _task_interface import (  # pyright: ignore[reportMissingImports]
+        _region_vmm_allocate_export,
+        _region_vmm_begin,
+        _region_vmm_granularity,
+        _region_vmm_release,
+        _region_vmm_test_issued_ops,
+        _region_vmm_test_reset_hooks,
+    )
+
+    alloc_count = 16
+    query_count = 2_000
+    handles = [_region_vmm_begin(0) for _ in range(alloc_count)]
+    _region_vmm_test_reset_hooks()
+    barrier = threading.Barrier(2)
+    query_values: list[int] = []
+    exports = []
+    errors: list[BaseException] = []
+
+    def query_worker() -> None:
+        try:
+            barrier.wait()
+            query_values.extend(_region_vmm_granularity(0) for _ in range(query_count))
+        except BaseException as exc:  # noqa: BLE001 -- the test asserts the collected failure
+            errors.append(exc)
+
+    def alloc_worker() -> None:
+        try:
+            barrier.wait()
+            for handle in handles:
+                exports.append(_region_vmm_allocate_export(handle, 8))
+        except BaseException as exc:  # noqa: BLE001 -- the test asserts the collected failure
+            errors.append(exc)
+
+    threads = [threading.Thread(target=query_worker), threading.Thread(target=alloc_worker)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert errors == []
+        assert query_values == [64] * query_count
+        assert len(exports) == alloc_count
+        assert len(set(handles)) == alloc_count
+        assert [int(item.mapping_bytes) for item in exports] == [64] * alloc_count
+        issued = _region_vmm_test_issued_ops()
+        assert issued.count("granularity") == query_count + alloc_count
+        for op in ("bind_device", "physical_alloc", "va_reserve", "map", "set_access", "export"):
+            assert issued.count(op) == alloc_count
+    finally:
+        for handle in handles:
+            _region_vmm_release(handle)

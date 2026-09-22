@@ -1112,12 +1112,17 @@ void region_vmm_bind_device(int device_id) {
     acl_api().bind_device_with_check(device_id);
 }
 
-uint64_t region_vmm_granularity(int device_id) {
+uint64_t region_vmm_granularity_under_lock(int device_id) {
     region_vmm_record_issued("granularity");
     if (region_vmm_test_hooks().use_fake) {
         return region_vmm_test_hooks().fake_granularity;
     }
     return acl_api().vmm_granularity_with_check(device_id);
+}
+
+uint64_t region_vmm_query_granularity(int device_id) {
+    std::lock_guard<std::mutex> lk(region_vmm_mu());
+    return region_vmm_granularity_under_lock(device_id);
 }
 
 void *region_vmm_malloc_physical(uint64_t bytes, int device_id) {
@@ -1326,7 +1331,7 @@ RegionVmmExport region_vmm_allocate_export(uint64_t handle, uint64_t logical_byt
         throw std::runtime_error("region VMM allocate_export already has partial or complete state");
     }
     region_vmm_bind_device(record.device_id);
-    uint64_t mapping_bytes = align_vmm_bytes(logical_bytes, region_vmm_granularity(record.device_id));
+    uint64_t mapping_bytes = align_vmm_bytes(logical_bytes, region_vmm_granularity_under_lock(record.device_id));
     record.mapping_bytes = mapping_bytes;
 
     region_vmm_run_allocate_stage(
@@ -4291,7 +4296,7 @@ NB_MODULE(_task_interface, m) {
     m.def(
         "_region_vmm_granularity",
         [](int device_id) -> uint64_t {
-            return region_vmm_granularity(device_id);
+            return region_vmm_query_granularity(device_id);
         },
         nb::arg("device_id"), nb::call_guard<nb::gil_scoped_release>(),
         "Provider/consumer runtime VMM granularity for one device."

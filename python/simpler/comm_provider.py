@@ -18,7 +18,6 @@ from __future__ import annotations
 import ctypes
 import errno
 import logging
-import threading
 import uuid
 from dataclasses import dataclass
 from enum import Enum, IntEnum
@@ -38,7 +37,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     _region_vmm_zero_bytes,
 )
 
-from .buffer import Buffer, _wrap_vmm_shareable, intern_worker_path
+from .buffer import Buffer, EndpointBufferIdentityAllocator, _wrap_vmm_shareable, intern_worker_path
 
 _UINT64_MAX = (1 << 64) - 1
 _INT32_MIN = -(1 << 31)
@@ -227,37 +226,6 @@ def _require_owner_nonce(nonce: object) -> bytes:
     if len(value) != 8 or value == b"\x00" * 8:
         raise ValueError("owner_instance_id must be a nonzero 8-byte nonce")
     return value
-
-
-class EndpointBufferIdentityAllocator(Protocol):
-    @property
-    def owner_instance_id(self) -> bytes: ...
-
-    def burn_identity(self) -> CanonicalIdentity: ...
-
-
-class LocalEndpointBufferIdentityAllocator:
-    """Thread-safe endpoint-scoped Buffer identity allocator."""
-
-    def __init__(self, owner_instance_id: bytes) -> None:
-        self._owner_instance_id = _require_owner_nonce(owner_instance_id)
-        self._lock = threading.Lock()
-        self._next_buffer_id = 1
-
-    @property
-    def owner_instance_id(self) -> bytes:
-        return self._owner_instance_id
-
-    def burn_identity(self) -> CanonicalIdentity:
-        with self._lock:
-            buffer_id = self._next_buffer_id
-            if buffer_id > _UINT64_MAX:
-                raise RegionControlError(
-                    RegionControlErrorKind.INTERNAL_INVARIANT,
-                    "buffer identity space exhausted",
-                )
-            self._next_buffer_id = buffer_id + 1
-        return CanonicalIdentity(self._owner_instance_id, buffer_id, 1)
 
 
 @dataclass(frozen=True)

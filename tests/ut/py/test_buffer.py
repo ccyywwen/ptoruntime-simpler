@@ -18,6 +18,7 @@ the registry and the Buffer constructors that are genuinely defined there.
 
 import ctypes
 import re
+import threading
 from dataclasses import replace
 from multiprocessing.shared_memory import SharedMemory
 from unittest.mock import patch
@@ -1073,3 +1074,74 @@ def test_vmm_shareable_stays_closed_dispatch_in_importer_paths():
     reg = ImportRegistry(chip)
     with pytest.raises(ValueError, match="direct map probe is not implemented"):
         reg.materialize(desc)
+
+
+def test_allocator_types_stay_out_of_the_public_surface():
+    assert "EndpointBufferIdentityAllocator" not in buffer_mod.__all__
+    assert "LocalEndpointBufferIdentityAllocator" not in buffer_mod.__all__
+    assert "BufferIdentityExhaustedError" not in buffer_mod.__all__
+
+
+def test_one_allocator_issues_consecutive_ids_to_interleaved_callers():
+    nonce = mint_owner_instance_id()
+    allocator = buffer_mod.LocalEndpointBufferIdentityAllocator(nonce)
+    other = buffer_mod.LocalEndpointBufferIdentityAllocator(mint_owner_instance_id())
+    seen = [int(allocator.burn_identity().buffer_id) for _ in range(2)]
+    seen.append(int(other.burn_identity().buffer_id))
+    seen.extend(int(allocator.burn_identity().buffer_id) for _ in range(2))
+    assert seen[:2] == [1, 2]
+    assert seen[2] == 1
+    assert seen[3:] == [3, 4]
+    assert int(other.burn_identity().buffer_id) == 2
+    assert all(int(allocator.burn_identity().generation) == 1 for _ in range(1))
+
+
+def test_concurrent_burns_from_one_allocator_do_not_repeat_ids():
+    allocator = buffer_mod.LocalEndpointBufferIdentityAllocator(mint_owner_instance_id())
+    barrier = threading.Barrier(8)
+    found: list[int] = []
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+
+    def burn() -> None:
+        try:
+            barrier.wait()
+            local = [int(allocator.burn_identity().buffer_id) for _ in range(200)]
+            with lock:
+                found.extend(local)
+        except BaseException as exc:  # noqa: BLE001 -- the test asserts the collected failure
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=burn) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert sorted(found) == list(range(1, 8 * 200 + 1))
+
+
+def test_allocator_accepts_uint64_max_once_then_stays_exhausted():
+    allocator = buffer_mod.LocalEndpointBufferIdentityAllocator(mint_owner_instance_id())
+    allocator._next_buffer_id = (1 << 64) - 1
+    identity = allocator.burn_identity()
+    assert int(identity.buffer_id) == (1 << 64) - 1
+    assert int(identity.generation) == 1
+    for _ in range(3):
+        with pytest.raises(buffer_mod.BufferIdentityExhaustedError, match="exhausted"):
+            allocator.burn_identity()
+
+
+def test_burn_stays_consumed_when_the_caller_fails():
+    allocator = buffer_mod.LocalEndpointBufferIdentityAllocator(mint_owner_instance_id())
+
+    def caller() -> None:
+        identity = allocator.burn_identity()
+        assert int(identity.buffer_id) == 1
+        raise RuntimeError("caller failed after burn")
+
+    with pytest.raises(RuntimeError, match="caller failed after burn"):
+        caller()
+    nxt = allocator.burn_identity()
+    assert int(nxt.buffer_id) == 2

@@ -1929,7 +1929,8 @@ class _StoreControlMailbox:
 
 
 def _provider_store(worker: Worker, factory, *, worker_id: int = 1):
-    from simpler.comm_provider import LocalEndpointBufferIdentityAllocator, ProviderRegionStore
+    from simpler.buffer import LocalEndpointBufferIdentityAllocator
+    from simpler.comm_provider import ProviderRegionStore
 
     from tests.ut.py.test_worker.test_comm_provider import _sim_context
 

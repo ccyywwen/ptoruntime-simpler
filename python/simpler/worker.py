@@ -122,6 +122,7 @@ from .buffer import (
     CanonicalIdentity,
     ImportContext,
     ImportRegistry,
+    LocalEndpointBufferIdentityAllocator,
     capabilities_for_adapter,
     create_host_shared_buffer,
     host_ptr_nbytes,
@@ -169,7 +170,6 @@ from .comm_endpoints import (
 )
 from .comm_provider import (
     DeviceAllocationTarget,
-    LocalEndpointBufferIdentityAllocator,
     ProviderRegionStore,
     ProviderReleaseResult,
     ProviderReleaseStatus,
@@ -5177,8 +5177,8 @@ class Worker:
 
         self._init_device_allocation_tables()
 
-        # Owner-side Buffer state (P1-B): a per-incarnation opaque nonce, a monotonic buffer_id
-        # (0 reserved), and the live handles this Worker owns. create_buffer allocates a handle whose
+        # Owner-side Buffer state: a per-incarnation opaque nonce, the allocator bound to that
+        # nonce, and the live handles this Worker owns. create_buffer allocates a handle whose
         # self-describing descriptor rides embedded in every Tensor built over it (no export
         # handshake); consumers materialize it lazily on receipt.
         #
@@ -5189,11 +5189,12 @@ class Worker:
         # since the nonce is opaque, `owner_worker_path_id` is diagnostic by contract, and
         # `address_space` does not say which card.
         #
-        # Both identities share this mint point. Root init() remints it after claiming the
-        # startup epoch. A next-level child receives the parent-frozen nonce as an explicit
-        # init input and does not remint, so the root snapshot and the child incarnation match.
+        # Both identities share this mint point. Root init() replaces the constructor nonce and
+        # allocator when no identity has been burned yet. A next-level child receives the
+        # parent-frozen nonce as an explicit init input and keeps the matching allocator.
         self._owner_instance_id: bytes = mint_owner_instance_id()
-        self._buffer_id_counter: int = 1
+        self._buffer_identity_allocator = LocalEndpointBufferIdentityAllocator(self._owner_instance_id)
+        self._buffer_identity_committed = False
         self._buffers: dict[int, Buffer] = {}
         # Local chip endpoint incarnation facts, frozen once per (chip index, deployment).
         # AICPU/AICORE each have a nonce; only AICPU has a Buffer identity allocator.
@@ -8078,6 +8079,48 @@ class Worker:
                     f"has no eligible dispatch target (needs {need})"
                 )
 
+    def _install_buffer_identity_allocator(self, owner_instance_id: bytes) -> None:
+        """Bind this Worker to ``owner_instance_id`` and a fresh allocator for it.
+
+        Caller holds ``_hierarchical_start_cv``. Does not clear a committed burn.
+        """
+        nonce = bytes(owner_instance_id)
+        self._owner_instance_id = nonce
+        self._buffer_identity_allocator = LocalEndpointBufferIdentityAllocator(nonce)
+
+    def _resolve_buffer_identity_on_init(self, adopted_owner_instance_id: bytes | None) -> None:
+        """Install or retain the HOST allocator for this init.
+
+        Caller holds ``_hierarchical_start_cv``. A root with no successful burn replaces the
+        constructor nonce. A successful burn keeps that nonce and allocator. An adopted nonce
+        that matches the current one reuses the allocator; a different nonce is installed only
+        when nothing has been burned.
+        """
+        if adopted_owner_instance_id is None:
+            if not self._buffer_identity_committed:
+                self._install_buffer_identity_allocator(mint_owner_instance_id())
+        else:
+            adopted = bytes(adopted_owner_instance_id)
+            if adopted != self._owner_instance_id:
+                if self._buffer_identity_committed:
+                    raise RuntimeError(
+                        "Worker.init(): adopted HOST nonce differs from an owner that already minted a Buffer identity"
+                    )
+                self._install_buffer_identity_allocator(adopted)
+        if bytes(self._buffer_identity_allocator.owner_instance_id) != self._owner_instance_id:
+            raise RuntimeError("Worker buffer identity allocator is not bound to the HOST owner nonce")
+
+    def _burn_buffer_identity(self) -> CanonicalIdentity:
+        """Mint the next canonical identity from this Worker's current allocator.
+
+        Serialized with root remint on ``_hierarchical_start_cv``. The id is consumed once
+        ``burn_identity`` returns, including when the caller then fails to publish a Buffer.
+        """
+        with self._hierarchical_start_cv:
+            identity = self._buffer_identity_allocator.burn_identity()
+            self._buffer_identity_committed = True
+        return identity
+
     def init(  # noqa: PLR0912, PLR0915
         self,
         prewarm_config: CallConfig | None = None,
@@ -8112,8 +8155,9 @@ class Worker:
                 consumes the parent's remaining budget instead of restarting the
                 timeout. ``None`` starts a fresh epoch.
             _adopted_owner_instance_id: Internal. Parent-frozen HOST nonce for a
-                next-level child. Root still mints in this method; a child adopts
-                the value frozen before fork and does not remint.
+                next-level child. Root replaces the constructor nonce when no Buffer
+                identity has been burned; a successful pre-init burn keeps that nonce
+                and allocator. A child adopts the value frozen before fork.
         """
         if prewarm_config is not None:
             prewarm_config.validate()
@@ -8149,13 +8193,8 @@ class Worker:
             self._cancel_token = False
             if _startup_deadline is None:
                 self._assign_shm_namespace()
+            self._resolve_buffer_identity_on_init(_adopted_owner_instance_id)
             self._lifecycle = _Lifecycle.INITIALIZING
-            # Root mints after claiming the startup epoch. A next-level child adopts the nonce
-            # the parent froze before fork so the root snapshot and the child incarnation match.
-            if _adopted_owner_instance_id is None:
-                self._owner_instance_id = mint_owner_instance_id()
-            else:
-                self._owner_instance_id = bytes(_adopted_owner_instance_id)
             if self.level >= 3:
                 self._is_startup_root = _startup_deadline is None
                 own_deadline = _monotonic() + self._startup_timeout_s
@@ -9449,6 +9488,18 @@ class Worker:
                         ptrs: list[int] = []
                         if buffer_count:
                             ptrs = list(struct.unpack_from(f"<{buffer_count}Q", reply_buf, _DOMAIN_REPLY_HEADER.size))
+                        named_buffers: dict[str, Buffer] = {}
+                        for i, b in enumerate(buffers):
+                            identity = self._burn_buffer_identity()
+                            named_buffers[b.name] = wrap_vmm_window(
+                                ptrs[i],
+                                int(b.nbytes),
+                                bytes(identity.owner_instance_id),
+                                int(identity.buffer_id),
+                                f"L{self.level}",
+                                generation=int(identity.generation),
+                                owner_worker_id=int(chip_idx),
+                            )
                         contexts[chip_idx] = ChipDomainContext(
                             name=name,
                             domain_rank=worker_to_rank[chip_idx],
@@ -9456,17 +9507,7 @@ class Worker:
                             device_ctx=int(device_ctx),
                             local_window_base=int(local_window_base),
                             actual_window_size=int(window_size),
-                            buffers={
-                                b.name: wrap_vmm_window(
-                                    ptrs[i],
-                                    int(b.nbytes),
-                                    self._owner_instance_id,
-                                    self._next_buffer_id(),
-                                    f"L{self.level}",
-                                    owner_worker_id=int(chip_idx),
-                                )
-                                for i, b in enumerate(buffers)
-                            },
+                            buffers=named_buffers,
                         )
                     handle.contexts = contexts
                 finally:
@@ -10004,12 +10045,14 @@ class Worker:
                 for buffer in command.buffers:
                     base = int(local_base) + offset
                     buffer_bases[buffer.name] = base
+                    identity = self._burn_buffer_identity()
                     domain_buffers[buffer.name] = wrap_vmm_window(
                         base,
                         int(buffer.nbytes),
-                        self._owner_instance_id,
-                        self._next_buffer_id(),
+                        bytes(identity.owner_instance_id),
+                        int(identity.buffer_id),
                         f"L{self.level}",
+                        generation=int(identity.generation),
                         owner_worker_id=int(member.local_worker_id),
                     )
                     offset += buffer.nbytes
@@ -11053,10 +11096,8 @@ class Worker:
             raise TypeError("worker.malloc is L2-only; at L3+ use worker.alloc_child_tensor(worker_id, ...)")
         with self._operation_lease("malloc"):
             assert self._chip_worker is not None
-            # Minted before the registration lock: `_next_buffer_id` takes `_registry_lock`, and
-            # `_child_prov_lock` is never held across another lock. Ids need only be unique, so one
-            # skipped by a failed alloc costs nothing.
-            buffer_id = self._next_buffer_id()
+            # Burned before native malloc. A failed malloc leaves that id unused.
+            identity = self._burn_buffer_identity()
             # L2 is a single chip; worker_id is meaningless there, so the provenance is keyed
             # on the canonical worker 0.
             with self._child_prov_lock:
@@ -11064,9 +11105,10 @@ class Worker:
                 handle = wrap_device_malloc(
                     ptr,
                     int(size),
-                    self._owner_instance_id,
-                    buffer_id,
+                    bytes(identity.owner_instance_id),
+                    int(identity.buffer_id),
                     f"L{self.level}",
+                    generation=int(identity.generation),
                     owner_worker_id=0,
                 )
                 self._record_device_alloc(handle)
@@ -11086,23 +11128,26 @@ class Worker:
         self._check_chip_worker_id(int(worker_id))
         assert self._worker is not None
         # The lease is re-entrant, so calling this inside the orch fn (the run already holds it) nests
-        # safely, and calling it outside a run acquires it fresh.
+        # safely, and calling it outside a run acquires it fresh. Identity is burned before the
+        # device-operation lock and native malloc, so exhaustion allocates nothing.
         with (
             self._operation_lease("alloc_child_tensor"),
             self._device_control_admission("alloc_child_tensor"),
-            self._child_prov_worker_lock(int(worker_id)),
         ):
-            ptr = int(self._worker.malloc(int(worker_id), int(nbytes)))
-            handle = wrap_device_malloc(
-                ptr,
-                int(nbytes),
-                self._owner_instance_id,
-                self._next_buffer_id(),
-                f"L{self.level}",
-                owner_worker_id=int(worker_id),
-            )
-            with self._child_prov_lock:
-                self._record_device_alloc(handle)
+            identity = self._burn_buffer_identity()
+            with self._child_prov_worker_lock(int(worker_id)):
+                ptr = int(self._worker.malloc(int(worker_id), int(nbytes)))
+                handle = wrap_device_malloc(
+                    ptr,
+                    int(nbytes),
+                    bytes(identity.owner_instance_id),
+                    int(identity.buffer_id),
+                    f"L{self.level}",
+                    generation=int(identity.generation),
+                    owner_worker_id=int(worker_id),
+                )
+                with self._child_prov_lock:
+                    self._record_device_alloc(handle)
         return handle
 
     def free(self, handle: Buffer) -> None:
@@ -11400,17 +11445,17 @@ class Worker:
         nbytes = get_element_size(dtype)
         for s in shapes:
             nbytes *= int(s)
-        oid, buffer_id, path = self._owner_instance_id, self._next_buffer_id(), f"L{self.level}"
-        identity = CanonicalIdentity(oid, buffer_id)
+        identity = self._burn_buffer_identity()
         va = int(self._orch._o.alloc(list(int(s) for s in shapes), dtype, identity))
         # Wrap the ring VA under the SAME identity: the child materializes to that VA (fork-inherited,
         # MAP_SHARED read-write) and infer_deps keys the ref to the slot registered above.
         return wrap_fork_inherited(
             va,
             int(nbytes),
-            oid,
-            buffer_id,
-            path,
+            bytes(identity.owner_instance_id),
+            int(identity.buffer_id),
+            f"L{self.level}",
+            generation=int(identity.generation),
             access=AccessMode.READWRITE,
             backend_kind=BackendKind.FORK_SHM,
         )
@@ -11454,23 +11499,19 @@ class Worker:
             # the FORK_COW rejection protects. At L2 the consumer IS this process, so they reach it
             # trivially and FORK_COW's contract — a write splitting into a private copy the owner
             # never sees — is the one that would be false; the tag therefore follows `shared`.
+            identity = self._burn_buffer_identity()
             handle = wrap_fork_inherited(
                 base,
                 nbytes,
-                self._owner_instance_id,
-                self._next_buffer_id(),
+                bytes(identity.owner_instance_id),
+                int(identity.buffer_id),
                 f"L{self.level}",
+                generation=int(identity.generation),
                 access=AccessMode.READWRITE if shared else AccessMode.READ,
                 backend_kind=BackendKind.FORK_SHM if shared else BackendKind.FORK_COW,
             )
             self._fork_tensor_handles[base] = handle
         return handle.tensor(shapes=tuple(shapes), dtype=dtype, strides=strides, byte_offset=byte_offset)
-
-    def _next_buffer_id(self) -> int:
-        with self._registry_lock:
-            bid = self._buffer_id_counter
-            self._buffer_id_counter += 1
-        return bid
 
     def _reexport(self, source: BufferDescriptor) -> Buffer:
         """Re-export a received backing for forwarding (per-backing, memoized, no map).
@@ -11499,13 +11540,14 @@ class Worker:
             )
         if nbytes <= 0:
             raise ValueError("create_buffer: nbytes must be positive")
-        buffer_id = self._next_buffer_id()
+        identity = self._burn_buffer_identity()
+        buffer_id = int(identity.buffer_id)
         buffer = create_host_shared_buffer(
             nbytes,
-            owner_instance_id=self._owner_instance_id,
+            owner_instance_id=bytes(identity.owner_instance_id),
             buffer_id=buffer_id,
             owner_worker_path=_format_worker_path(int(self.level)),
-            generation=1,
+            generation=int(identity.generation),
         )
         with self._registry_lock:
             self._buffers[buffer_id] = buffer

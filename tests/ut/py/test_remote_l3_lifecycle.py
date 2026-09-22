@@ -18,7 +18,7 @@ from typing import cast
 
 import pytest
 from simpler import remote_l3_session, remote_l3_worker
-from simpler.buffer import create_host_shared_buffer, mint_owner_instance_id
+from simpler.buffer import LocalEndpointBufferIdentityAllocator, create_host_shared_buffer, mint_owner_instance_id
 from simpler.worker import RunHandle, Worker, _RunResources, _SharedExclusiveLock
 
 
@@ -981,7 +981,8 @@ def _bare_l3_worker():
     w._next_level_shms = []
     w._registry_lock = threading.Lock()
     w._owner_instance_id = mint_owner_instance_id()
-    w._buffer_id_counter = 1
+    w._buffer_identity_allocator = LocalEndpointBufferIdentityAllocator(w._owner_instance_id)
+    w._buffer_identity_committed = False
     w._buffers = {}
     w._hierarchical_start_mu = threading.Lock()
     w._hierarchical_start_cv = threading.Condition(w._hierarchical_start_mu)

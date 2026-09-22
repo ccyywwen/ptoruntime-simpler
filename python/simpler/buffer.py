@@ -25,11 +25,12 @@ from __future__ import annotations
 
 import ctypes
 import os
+import threading
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from multiprocessing.shared_memory import SharedMemory
-from typing import Any
+from typing import Any, Protocol
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     OWNER_INSTANCE_ID_BYTES,
@@ -123,6 +124,50 @@ def mint_owner_instance_id() -> bytes:
     one process within one second — a routine pattern (an L4 and its L3 built back to back).
     """
     return os.urandom(OWNER_INSTANCE_ID_BYTES)
+
+
+_UINT64_MAX = (1 << 64) - 1
+
+
+class BufferIdentityExhaustedError(RuntimeError):
+    """The owner's uint64 buffer-id space cannot mint another identity."""
+
+
+def _require_allocator_owner_nonce(nonce: object) -> bytes:
+    if not isinstance(nonce, (bytes, bytearray)):
+        raise TypeError("owner_instance_id must be bytes")
+    value = bytes(nonce)
+    if len(value) != 8 or value == b"\x00" * 8:
+        raise ValueError("owner_instance_id must be a nonzero 8-byte nonce")
+    return value
+
+
+class EndpointBufferIdentityAllocator(Protocol):
+    @property
+    def owner_instance_id(self) -> bytes: ...
+
+    def burn_identity(self) -> CanonicalIdentity: ...
+
+
+class LocalEndpointBufferIdentityAllocator:
+    """Thread-safe owner-scoped canonical Buffer identity allocator."""
+
+    def __init__(self, owner_instance_id: bytes) -> None:
+        self._owner_instance_id = _require_allocator_owner_nonce(owner_instance_id)
+        self._lock = threading.Lock()
+        self._next_buffer_id = 1
+
+    @property
+    def owner_instance_id(self) -> bytes:
+        return self._owner_instance_id
+
+    def burn_identity(self) -> CanonicalIdentity:
+        with self._lock:
+            buffer_id = self._next_buffer_id
+            if buffer_id > _UINT64_MAX:
+                raise BufferIdentityExhaustedError("buffer identity space exhausted")
+            self._next_buffer_id = buffer_id + 1
+        return CanonicalIdentity(self._owner_instance_id, buffer_id, 1)
 
 
 def _shm_base_addr(shm: SharedMemory) -> int:
