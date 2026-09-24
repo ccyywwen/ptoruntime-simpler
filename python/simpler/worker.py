@@ -5189,12 +5189,10 @@ class Worker:
         # since the nonce is opaque, `owner_worker_path_id` is diagnostic by contract, and
         # `address_space` does not say which card.
         #
-        # Both identities share this mint point. Root init() replaces the constructor nonce and
-        # allocator when no identity has been burned yet. A next-level child receives the
-        # parent-frozen nonce as an explicit init input and keeps the matching allocator.
+        # Both identities share this mint point. The HOST nonce and the allocator bound to it
+        # are fixed here; the first init() does not replace them.
         self._owner_instance_id: bytes = mint_owner_instance_id()
         self._buffer_identity_allocator = LocalEndpointBufferIdentityAllocator(self._owner_instance_id)
-        self._buffer_identity_committed = False
         self._buffers: dict[int, Buffer] = {}
         # Local chip endpoint incarnation facts, frozen once per (chip index, deployment).
         # AICPU/AICORE each have a nonce; only AICPU has a Buffer identity allocator.
@@ -8079,54 +8077,14 @@ class Worker:
                     f"has no eligible dispatch target (needs {need})"
                 )
 
-    def _install_buffer_identity_allocator(self, owner_instance_id: bytes) -> None:
-        """Bind this Worker to ``owner_instance_id`` and a fresh allocator for it.
-
-        Caller holds ``_hierarchical_start_cv``. Does not clear a committed burn.
-        """
-        nonce = bytes(owner_instance_id)
-        self._owner_instance_id = nonce
-        self._buffer_identity_allocator = LocalEndpointBufferIdentityAllocator(nonce)
-
-    def _resolve_buffer_identity_on_init(self, adopted_owner_instance_id: bytes | None) -> None:
-        """Install or retain the HOST allocator for this init.
-
-        Caller holds ``_hierarchical_start_cv``. A root with no successful burn replaces the
-        constructor nonce. A successful burn keeps that nonce and allocator. An adopted nonce
-        that matches the current one reuses the allocator; a different nonce is installed only
-        when nothing has been burned.
-        """
-        if adopted_owner_instance_id is None:
-            if not self._buffer_identity_committed:
-                self._install_buffer_identity_allocator(mint_owner_instance_id())
-        else:
-            adopted = bytes(adopted_owner_instance_id)
-            if adopted != self._owner_instance_id:
-                if self._buffer_identity_committed:
-                    raise RuntimeError(
-                        "Worker.init(): adopted HOST nonce differs from an owner that already minted a Buffer identity"
-                    )
-                self._install_buffer_identity_allocator(adopted)
-        if bytes(self._buffer_identity_allocator.owner_instance_id) != self._owner_instance_id:
-            raise RuntimeError("Worker buffer identity allocator is not bound to the HOST owner nonce")
-
     def _burn_buffer_identity(self) -> CanonicalIdentity:
-        """Mint the next canonical identity from this Worker's current allocator.
-
-        Serialized with root remint on ``_hierarchical_start_cv``. The id is consumed once
-        ``burn_identity`` returns, including when the caller then fails to publish a Buffer.
-        """
-        with self._hierarchical_start_cv:
-            identity = self._buffer_identity_allocator.burn_identity()
-            self._buffer_identity_committed = True
-        return identity
+        return self._buffer_identity_allocator.burn_identity()
 
     def init(  # noqa: PLR0912, PLR0915
         self,
         prewarm_config: CallConfig | None = None,
         *,
         _startup_deadline: float | None = None,
-        _adopted_owner_instance_id: bytes | None = None,
     ) -> None:
         """Initialize the worker and bring its whole subtree to READY.
 
@@ -8154,10 +8112,6 @@ class Worker:
                 inherited from a parent's startup epoch so a recursive descendant
                 consumes the parent's remaining budget instead of restarting the
                 timeout. ``None`` starts a fresh epoch.
-            _adopted_owner_instance_id: Internal. Parent-frozen HOST nonce for a
-                next-level child. Root replaces the constructor nonce when no Buffer
-                identity has been burned; a successful pre-init burn keeps that nonce
-                and allocator. A child adopts the value frozen before fork.
         """
         if prewarm_config is not None:
             prewarm_config.validate()
@@ -8193,7 +8147,8 @@ class Worker:
             self._cancel_token = False
             if _startup_deadline is None:
                 self._assign_shm_namespace()
-            self._resolve_buffer_identity_on_init(_adopted_owner_instance_id)
+            if bytes(self._buffer_identity_allocator.owner_instance_id) != self._owner_instance_id:
+                raise RuntimeError("Worker buffer identity allocator is not bound to the HOST owner nonce")
             self._lifecycle = _Lifecycle.INITIALIZING
             if self.level >= 3:
                 self._is_startup_root = _startup_deadline is None
@@ -8628,7 +8583,6 @@ class Worker:
                     inner.init(
                         prewarm_config=self._prewarm_config,
                         _startup_deadline=deadline,
-                        _adopted_owner_instance_id=inner._owner_instance_id,
                     )
                     try:
                         return _make_local_identity_tables(

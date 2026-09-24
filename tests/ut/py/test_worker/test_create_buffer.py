@@ -19,6 +19,7 @@ whose children are local L3 Workers.
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 from simpler.buffer import (
@@ -40,7 +41,6 @@ def _bare_worker(level: int, *, chip: int = 0, sub: int = 0, next_level: int = 0
     w._registry_lock = threading.Lock()
     w._owner_instance_id = mint_owner_instance_id()
     w._buffer_identity_allocator = LocalEndpointBufferIdentityAllocator(w._owner_instance_id)
-    w._buffer_identity_committed = False
     w._buffers = {}
     w._hierarchical_start_mu = threading.Lock()
     w._hierarchical_start_cv = threading.Condition(w._hierarchical_start_mu)
@@ -199,27 +199,33 @@ def _patch_level2_init(monkeypatch, worker: Worker) -> None:
 def test_pre_init_burn_retains_constructor_allocator(monkeypatch):
     worker = Worker(level=2)
     nonce = bytes(worker._owner_instance_id)
+    allocator = worker._buffer_identity_allocator
     first = worker._burn_buffer_identity()
+    assert bytes(first.owner_instance_id) == nonce
+    assert int(first.buffer_id) == 1
     _patch_level2_init(monkeypatch, worker)
     worker.init()
     try:
         assert bytes(worker._owner_instance_id) == nonce
+        assert worker._buffer_identity_allocator is allocator
         second = worker._burn_buffer_identity()
         assert bytes(second.owner_instance_id) == nonce
-        assert int(second.buffer_id) == int(first.buffer_id) + 1
+        assert int(second.buffer_id) == 2
     finally:
         worker.close()
 
 
-def test_root_init_without_pre_init_burn_installs_a_fresh_allocator(monkeypatch):
+def test_root_init_without_pre_init_burn_keeps_the_constructor_allocator(monkeypatch):
     worker = Worker(level=2)
     constructor = bytes(worker._owner_instance_id)
+    allocator = worker._buffer_identity_allocator
     _patch_level2_init(monkeypatch, worker)
     worker.init()
     try:
-        assert bytes(worker._owner_instance_id) != constructor
+        assert bytes(worker._owner_instance_id) == constructor
+        assert worker._buffer_identity_allocator is allocator
         identity = worker._burn_buffer_identity()
-        assert bytes(identity.owner_instance_id) == bytes(worker._owner_instance_id)
+        assert bytes(identity.owner_instance_id) == constructor
         assert int(identity.buffer_id) == 1
         assert int(identity.generation) == 1
     finally:
@@ -228,6 +234,7 @@ def test_root_init_without_pre_init_burn_installs_a_fresh_allocator(monkeypatch)
 
 def test_init_and_pre_init_burn_do_not_mix_nonces(monkeypatch):
     worker = Worker(level=2)
+    constructor = bytes(worker._owner_instance_id)
     _patch_level2_init(monkeypatch, worker)
     barrier = threading.Barrier(2)
     errors: list[BaseException] = []
@@ -255,49 +262,45 @@ def test_init_and_pre_init_burn_do_not_mix_nonces(monkeypatch):
     try:
         assert errors == []
         identity = burned[0]
-        assert bytes(identity.owner_instance_id) == bytes(worker._owner_instance_id)
+        assert bytes(identity.owner_instance_id) == constructor
         nxt = worker._burn_buffer_identity()
-        assert bytes(nxt.owner_instance_id) == bytes(identity.owner_instance_id)
+        assert bytes(nxt.owner_instance_id) == constructor
         assert int(nxt.buffer_id) == int(identity.buffer_id) + 1
+        assert int(nxt.buffer_id) != int(identity.buffer_id)
     finally:
         if worker._lifecycle is _Lifecycle.READY:
             worker.close()
 
 
-def test_matching_adopted_nonce_reuses_the_allocator(monkeypatch):
-    worker = Worker(level=2)
-    nonce = bytes(worker._owner_instance_id)
-    first = worker._burn_buffer_identity()
-    _patch_level2_init(monkeypatch, worker)
-    worker.init(_adopted_owner_instance_id=nonce)
+def test_add_worker_child_keeps_constructor_identity_across_init():
+    parent = Worker(level=4)
+    child = Worker(level=3)
     try:
-        assert bytes(worker._owner_instance_id) == nonce
-        second = worker._burn_buffer_identity()
-        assert int(second.buffer_id) == int(first.buffer_id) + 1
+        child_nonce = bytes(child._owner_instance_id)
+        allocator = child._buffer_identity_allocator
+        first = child._burn_buffer_identity()
+        assert bytes(first.owner_instance_id) == child_nonce
+        assert int(first.buffer_id) == 1
+        parent.add_worker(child)
+        assert parent._next_level_workers == [child]
+        assert bytes(parent._owner_instance_id) != child_nonce
+        child._init_hierarchical = lambda: None  # type: ignore[method-assign]
+        child._start_hierarchical = lambda: None  # type: ignore[method-assign]
+        child.init(_startup_deadline=time.monotonic() + 30)
+        assert bytes(child._owner_instance_id) == child_nonce
+        assert child._buffer_identity_allocator is allocator
+        second = child._burn_buffer_identity()
+        assert bytes(second.owner_instance_id) == child_nonce
+        assert int(second.buffer_id) == 2
     finally:
-        worker.close()
-
-
-def test_uncommitted_adopted_nonce_installs_a_fresh_allocator(monkeypatch):
-    worker = Worker(level=2)
-    adopted = b"\x03" * 8
-    _patch_level2_init(monkeypatch, worker)
-    worker.init(_adopted_owner_instance_id=adopted)
-    try:
-        identity = worker._burn_buffer_identity()
-        assert bytes(worker._owner_instance_id) == adopted
-        assert bytes(identity.owner_instance_id) == adopted
-        assert int(identity.buffer_id) == 1
-    finally:
-        worker.close()
-
-
-def test_adopted_nonce_after_burn_must_match_the_current_owner():
-    worker = Worker(level=2)
-    worker._burn_buffer_identity()
-    with pytest.raises(RuntimeError, match="adopted HOST nonce"):
-        worker.init(_adopted_owner_instance_id=b"\x02" * 8)
-    assert worker._lifecycle is _Lifecycle.NEW
+        for worker in (child, parent):
+            if worker._lifecycle is _Lifecycle.READY:
+                try:
+                    worker.close()
+                except BaseException:  # noqa: BLE001 -- no-op init has no native tree to tear down
+                    worker._lifecycle = _Lifecycle.NEW
+            elif worker._lifecycle is not _Lifecycle.NEW:
+                worker._lifecycle = _Lifecycle.NEW
 
 
 class _CountingMalloc:
