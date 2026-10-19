@@ -601,19 +601,6 @@ class RegionInstanceRegistry:
         if errors:
             raise errors[0]
 
-    def record_data_plane_failure(self, run_scope: Any, resource_id: int, error: BaseException) -> None:
-        resource_id = int(resource_id)
-        matches = [
-            instance for instance in self._iter_run(run_scope) if int(instance._provider_resource_id) == resource_id
-        ]
-        if not matches:
-            raise MaterializationError(f"no region instance for resource {resource_id}")
-        if len(matches) > 1:
-            raise MaterializationError(f"duplicate region instances for resource {resource_id}")
-        instance = matches[0]
-        if instance._data_plane_error is None:
-            instance._data_plane_error = error
-
     def record_data_plane_failure_by_allocation_identity(
         self,
         run_scope: object,

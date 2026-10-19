@@ -530,7 +530,8 @@ public:
             throw std::invalid_argument("region counter notify op is invalid");
         }
         if (op == WorkerChipOrchNotifyOp::Add) {
-            value = load_counter(offset) + value;
+            uint32_t wrapped = static_cast<uint32_t>(load_counter(offset)) + static_cast<uint32_t>(value);
+            std::memcpy(&value, &wrapped, sizeof(value));
         }
         store_counter(offset, value);
     }
