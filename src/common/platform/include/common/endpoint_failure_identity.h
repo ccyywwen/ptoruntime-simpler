@@ -15,6 +15,10 @@
 #include <stdint.h>
 #include <type_traits>
 
+constexpr uint32_t kEndpointFailureKindNone = 0;
+constexpr uint32_t kEndpointFailureKindRegion = 1;
+constexpr uint32_t kEndpointFailureKindSpscQueue = 2;
+
 struct EndpointFailureIdentity {
     uint32_t kind;
     uint32_t reserved;

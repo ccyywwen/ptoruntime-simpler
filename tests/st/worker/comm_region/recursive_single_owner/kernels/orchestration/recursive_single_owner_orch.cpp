@@ -14,6 +14,7 @@
 #include "aicpu/region_instance_view.h"
 #include "common/region_task_args.h"
 #include "orchestration_api.h"  // NOLINT(build/include_subdir)
+#include "aicpu/region_endpoint_diagnostics.h"
 
 namespace {
 
@@ -29,24 +30,13 @@ struct ChannelHeader {
 };
 
 void report_view_error(
-    uint64_t session_bits, uint64_t transaction_id, uint64_t region_id, const RegionViewError &error
+    uint64_t session_bits, uint64_t transaction_id, uint64_t region_id, const RegionViewError &error,
+    uint64_t counter_addr = 0, int32_t counter_operand = 0
 ) {
-    rt_report_fatal(
-        SIMPLER_ERROR_EXPLICIT_ORCH_FATAL,
-        "Region endpoint error session=0x%016llx transaction=%llu\n"
-        "op=%u kind=%u region=%llu observed=%d msg=%s",
-        static_cast<unsigned long long>(session_bits), static_cast<unsigned long long>(transaction_id),
-        static_cast<unsigned>(error.op), static_cast<unsigned>(error.kind), static_cast<unsigned long long>(region_id),
-        error.observed, error.message
-    );
+    region_report_endpoint_error(session_bits, transaction_id, region_id, error, counter_addr, counter_operand);
 }
 
-void report_decode_error(RegionTaskArgError error) {
-    rt_report_fatal(
-        SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, "Region endpoint error identity=untrusted\nkind=%u",
-        static_cast<unsigned>(error)
-    );
-}
+void report_decode_error(RegionTaskArgError error) { region_report_invalid_task_args(error); }
 
 }  // namespace
 
@@ -91,6 +81,10 @@ __attribute__((visibility("default"))) void recursive_single_owner_orchestration
     const uint64_t completion_counter_offset = orch_args.scalar(15);
     const uint64_t timeout = 5000000000ULL;
     uint32_t shape[1] = {numel};
+    const auto counter_addr_at = [&](uint64_t offset) -> uint64_t {
+        if (region_add_overflows(counter.base, offset)) return 0;
+        return counter.base + offset;
+    };
 
     for (uint64_t seq = 1;; ++seq) {
         const int32_t signal_value = static_cast<int32_t>(seq);
@@ -98,7 +92,10 @@ __attribute__((visibility("default"))) void recursive_single_owner_orchestration
         if (!view.counter().wait(
                 data_ready_counter_offset, signal_value, RegionWaitCmp::GE, timeout, observed
             )) {
-            report_view_error(session_bits, transaction_id, region_id, view.error());
+            report_view_error(
+                session_bits, transaction_id, region_id, view.error(), counter_addr_at(data_ready_counter_offset),
+                signal_value
+            );
             return;
         }
 
@@ -148,7 +145,10 @@ __attribute__((visibility("default"))) void recursive_single_owner_orchestration
         uint32_t first_index[1] = {0};
         (void)get_tensor_data<float>(output, 1, first_index);
         if (!view.counter().notify(completion_counter_offset, signal_value, RegionNotifyOp::Set)) {
-            report_view_error(session_bits, transaction_id, region_id, view.error());
+            report_view_error(
+                session_bits, transaction_id, region_id, view.error(), counter_addr_at(completion_counter_offset),
+                signal_value
+            );
             return;
         }
     }
