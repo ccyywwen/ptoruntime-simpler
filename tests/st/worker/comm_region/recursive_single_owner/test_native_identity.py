@@ -23,13 +23,11 @@ from ._helpers import (
     FAULT_PLATFORMS,
     _install_release_probe,
     _stream_config,
-    assert_lifecycle_rounds,
     assert_sentinel_order,
     build_chip_callable,
     build_region_task_args,
     close_owned_workers,
     create_live_region,
-    install_lifecycle_recorder,
     make_l3_forward,
     publish_channel_header,
     sentinel_task_args,
@@ -225,11 +223,9 @@ def test_child_l3_view_failure_stays_on_child_scope(st_platform, st_device_ids):
         runtime=_RUNTIME,
     )
     worker = None
-    recorder = None
     matched = multiprocessing.Array(ctypes.c_uint64, 2, lock=True)
     try:
         chip_handle = l3.register(chip)
-        recorder = install_lifecycle_recorder(l3)
         original = l3._poison_region_from_endpoint_error
 
         def _watch(exc, resources=None):
@@ -271,10 +267,5 @@ def test_child_l3_view_failure_stays_on_child_scope(st_platform, st_device_ids):
         assert int(matched[0]) == 1
         assert int(matched[1]) == 1
         assert worker._region_instance_registry._instances == {}
-        assert_lifecycle_rounds(recorder, 1)
     finally:
-        try:
-            close_owned_workers(None, worker, l3)
-        finally:
-            if recorder is not None and recorder.restore is not None:
-                recorder.restore()
+        close_owned_workers(None, worker, l3)

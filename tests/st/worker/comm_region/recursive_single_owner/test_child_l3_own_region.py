@@ -11,8 +11,8 @@
 
 from __future__ import annotations
 
-import ctypes
-import multiprocessing
+import os
+import tempfile
 
 import pytest
 from simpler.worker import Worker
@@ -48,7 +48,7 @@ def test_child_l3_owns_region_inside_l4_tree(st_platform, st_device_ids):
     )
     worker = None
     recorder = None
-    transactions = multiprocessing.Array(ctypes.c_uint64, 2, lock=True)
+    tx_path = os.path.join(tempfile.mkdtemp(prefix="child-l3-region-"), "transactions")
     primary = None
     try:
         chip_handle = l3.register(chip_callable)
@@ -65,8 +65,8 @@ def test_child_l3_owns_region_inside_l4_tree(st_platform, st_device_ids):
             assert int(orch._worker.level) == 3
             assert int(region._delegated_transaction_id) == slot
             assert int(region.layout.payload_bytes) == _PAYLOAD_BYTES
-            with transactions.get_lock():
-                transactions[slot - 1] = int(region._delegated_transaction_id)
+            with open(tx_path, "a", encoding="ascii") as record:
+                record.write(f"{int(region._delegated_transaction_id)}\n")
             submit_chip(orch, region, cfg)
             _handshake(orch, region, 1)
             if slot == 1:
@@ -90,7 +90,7 @@ def test_child_l3_owns_region_inside_l4_tree(st_platform, st_device_ids):
 
         worker.run(lambda orch, args, cfg: l4_drive(orch, args, cfg, 1), args=None, config=_stream_config())
         worker.run(lambda orch, args, cfg: l4_drive(orch, args, cfg, 2), args=None, config=_stream_config())
-        assert [int(transactions[0]), int(transactions[1])] == [1, 2]
+        assert [int(line) for line in open(tx_path, encoding="ascii")] == [1, 2]
         assert worker._region_instance_registry._instances == {}
         assert_lifecycle_rounds(recorder, 2)
     except BaseException as exc:
