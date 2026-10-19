@@ -19,7 +19,7 @@ from collections.abc import Callable
 from enum import IntEnum
 from typing import Any
 
-from _task_interface import _worker_host_mapped_region_close  # pyright: ignore[reportMissingImports]
+from _task_interface import _region_close  # pyright: ignore[reportMissingImports]
 from simpler import comm_provider
 from simpler.comm_endpoints import DEVICE_AICPU, HOST_CPU, SingleOwner, at
 from simpler.comm_provider import ProviderRegionStore, RegionPartKind
@@ -343,7 +343,7 @@ class _LeaseProxy:
         if closer is not None:
             closer()
         else:
-            _worker_host_mapped_region_close(int(inner))
+            _region_close(int(inner))
         part = object.__getattribute__(self, "_part")
         kind = (
             _LifecycleEventKind.CLOSE_PAYLOAD if part is RegionPartKind.PAYLOAD else _LifecycleEventKind.CLOSE_COUNTER

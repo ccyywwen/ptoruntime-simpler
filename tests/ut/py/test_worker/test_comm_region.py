@@ -674,7 +674,7 @@ def region_worker(monkeypatch):
             allocate_error=allocate_error,
             mutate_success=mutate_success,
         )
-        monkeypatch.setattr(worker, "_consume_worker_host_mapped_cleanup_error", lambda _api: None)
+        monkeypatch.setattr(worker, "_consume_region_mapping_cleanup_error", lambda _api: None)
 
         def fake_import(_worker_id, _resource_id, descriptor, *, part=None, expected_device_id=None):
             name = "payload" if not leases else "counter"
@@ -1442,7 +1442,7 @@ def test_counter_mapped_base_getter_failure_is_materialization_error(region_work
     def _boom(_handle: int) -> int:
         raise OSError("mapped base unavailable")
 
-    monkeypatch.setattr(comm_region, "_worker_host_mapped_region_mapped_base", _boom)
+    monkeypatch.setattr(comm_region, "_region_mapped_base", _boom)
     with pytest.raises(MaterializationError, match="unavailable") as excinfo:
         _materialize_default_region(worker)
     assert isinstance(excinfo.value, MaterializationError)
@@ -1467,7 +1467,7 @@ def test_counter_mapped_base_getter_failure_with_close_diagnostic_poisons(region
     def _boom(_handle: int) -> int:
         raise OSError("mapped base unavailable")
 
-    monkeypatch.setattr(comm_region, "_worker_host_mapped_region_mapped_base", _boom)
+    monkeypatch.setattr(comm_region, "_region_mapped_base", _boom)
     with pytest.raises(MaterializationError, match="unavailable") as excinfo:
         _materialize_default_region(worker)
     primary = excinfo.value
@@ -1967,7 +1967,7 @@ def test_projection_requires_a_real_backend_plan():
 def test_compatibility_create_does_not_allocate_when_admission_refuses(monkeypatch):
     worker = _l3(device_ids=[8, 9])
     calls: list[str] = []
-    monkeypatch.setattr(worker, "_consume_worker_host_mapped_cleanup_error", lambda _api: None)
+    monkeypatch.setattr(worker, "_consume_region_mapping_cleanup_error", lambda _api: None)
 
     def refuse(_ctx):
         calls.append("admit")
@@ -1996,7 +1996,7 @@ def test_compatibility_create_does_not_allocate_when_admission_refuses(monkeypat
 def test_compatibility_create_uses_projection_result_not_a_fabricated_spec(monkeypatch):
     worker = _l3(device_ids=[8, 9])
     worker._config = {**worker._config, "platform": "a2a3sim", "device_ids": [8, 9]}
-    monkeypatch.setattr(worker, "_consume_worker_host_mapped_cleanup_error", lambda _api: None)
+    monkeypatch.setattr(worker, "_consume_region_mapping_cleanup_error", lambda _api: None)
     monkeypatch.setattr(
         worker,
         "_import_region_part_lease",
@@ -2140,7 +2140,7 @@ def _live_control_worker(mailbox, monkeypatch, device_ids=(8, 9), worker=None):
     worker = worker or _l3(device_ids=device_ids)
     worker._config = {**worker._config, "platform": "a2a3sim", "device_ids": list(device_ids)}
     worker._worker = mailbox
-    monkeypatch.setattr(worker, "_consume_worker_host_mapped_cleanup_error", lambda _api: None)
+    monkeypatch.setattr(worker, "_consume_region_mapping_cleanup_error", lambda _api: None)
     return worker
 
 
@@ -2495,7 +2495,7 @@ def test_l4_onboard_import_uses_provider_device_id_not_local_device_list(monkeyp
     monkeypatch.setattr(worker_mod, "_region_vmm_granularity", lambda _device_id: 64)
     monkeypatch.setattr(
         worker_mod,
-        "_worker_host_mapped_region_import_onboard",
+        "_region_import_onboard",
         lambda device_id, handle, mapping_bytes, owner: imported.append((device_id, handle, mapping_bytes)) or 21,
     )
     body = (

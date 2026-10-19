@@ -26,11 +26,11 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     BufferDescriptor,
     _host_vmm_copy_from,
     _host_vmm_copy_to,
+    _region_close,
     _region_counter_notify,
     _region_counter_test,
     _region_counter_wait,
-    _worker_host_mapped_region_close,
-    _worker_host_mapped_region_mapped_base,
+    _region_mapped_base,
 )
 
 from .buffer import AddressSpace, BackendKind, Buffer
@@ -113,7 +113,7 @@ class _RegionPartAttachment:
         if closer is not None:
             closer()
             return
-        _worker_host_mapped_region_close(int(lease))
+        _region_close(int(lease))
 
 
 _GENERATION_COUNTER = itertools.count(1)
@@ -1364,7 +1364,7 @@ def _close_native_lease(lease: Any) -> None:
     if closer is not None:
         closer()
         return
-    _worker_host_mapped_region_close(int(lease))
+    _region_close(int(lease))
 
 
 def _attempt_close_native_lease(lease: Any) -> BaseException | None:
@@ -1381,7 +1381,7 @@ def _require_imported_lease_base(lease: Any) -> int:
         if mapped is not None:
             return int(mapped)
         handle = getattr(lease, "handle", lease)
-        return int(_worker_host_mapped_region_mapped_base(int(handle)))
+        return int(_region_mapped_base(int(handle)))
     except Exception as exc:
         raise MaterializationError("COUNTER imported mapping base is unavailable") from exc
 
