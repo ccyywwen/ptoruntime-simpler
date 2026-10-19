@@ -9364,7 +9364,8 @@ class Worker:
                 parent_path=self._delegated_control_path,
                 index=int(worker_id),
             )
-            inner_worker._delegated_control_path = child_path
+            # child_path is the control-loop route. The forked Worker keeps the
+            # registry root stored at its own construction.
             pid = os.fork()
             if pid == 0:
                 buf = self._next_level_shms[idx].buf
@@ -9894,7 +9895,7 @@ class Worker:
     ):
         expected = self._provider_import_backend_kind()
         if descriptor.backend_kind is not expected:
-            raise RuntimeError("create_worker_chip_region: unsupported import backend")
+            raise RuntimeError("region import: unsupported import backend")
         selected = None if part is None else RegionPartKind(part)
         if expected is BackendKind.POSIX_SHM:
             token = _posix_token_from_descriptor(descriptor)
@@ -9927,7 +9928,7 @@ class Worker:
                 int(mapping_bytes),
                 self._owner_id,
             )
-        raise RuntimeError("create_worker_chip_region: unsupported import backend")
+        raise RuntimeError("region import: unsupported import backend")
 
     def _provider_import_backend_kind(self) -> BackendKind:
         platform = str(self._config.get("platform", ""))

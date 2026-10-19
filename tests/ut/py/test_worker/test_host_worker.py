@@ -5569,8 +5569,8 @@ class TestOrderedCleanupDegradation:
         assert resources.requires_ordered_cleanup
 
         # A remote slot reference: releasing it is an RPC to the owning worker.
-        # `create_worker_chip_queue` is not a fourth set-point — it builds its region
-        # through `create_worker_chip_region`, and inherits the flag from there.
+        # Queue creation is not a fourth set-point. It allocates a region and
+        # inherits ordered cleanup from that allocation.
         remote = worker_mod._RunResources()
         worker._building_run_resources = remote
         ref = cast(Any, object())
@@ -7839,9 +7839,9 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         worker = self._worker()
         assert worker._ordered_cleanup_error is None
 
-        # The shape _create_worker_chip_region's rollback reaches: the region exists
-        # on the chip and the release for it failed.
-        leaked = RuntimeError("create_worker_chip_region: rollback could not release region 4")
+        # The region exists on the chip and the release for it failed. Nothing
+        # tracked the id, so a later fence cannot reclaim it.
+        leaked = RuntimeError("region rollback could not release provider resource 4")
         with worker._hierarchical_start_cv:
             worker._ordered_cleanup_error = leaked
 

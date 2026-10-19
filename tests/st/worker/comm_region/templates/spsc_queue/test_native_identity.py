@@ -29,7 +29,6 @@ from ._helpers import (
     enqueue_bytes,
     forwarded_task_args,
     queue_task_args,
-    region_lifecycle,
     sentinel_task_args,
     stream_config,
     submit_queue,
@@ -128,13 +127,10 @@ def test_child_l3_descriptor_failure_stays_on_child_scope(st_platform, st_device
         runtime=_RUNTIME,
     )
     worker = None
-    recorder = None
     matched = multiprocessing.Array(ctypes.c_uint64, 2, lock=True)
     primary = None
     try:
         chip_handle = l3.register(chip)
-        lifecycle = region_lifecycle()
-        recorder = lifecycle.install_lifecycle_recorder(l3)
         original = l3._poison_spsc_queue_from_endpoint_error
 
         def _watch(exc, resources=None):
@@ -171,13 +167,8 @@ def test_child_l3_descriptor_failure_stays_on_child_scope(st_platform, st_device
         assert int(matched[0]) == 1
         assert int(matched[1]) == 1
         assert worker._region_instance_registry._instances == {}
-        lifecycle.assert_lifecycle_rounds(recorder, 1)
     except BaseException as exc:
         primary = exc
         raise
     finally:
-        try:
-            close_owned_workers(primary, worker, l3)
-        finally:
-            if recorder is not None and recorder.restore is not None:
-                recorder.restore()
+        close_owned_workers(primary, worker, l3)

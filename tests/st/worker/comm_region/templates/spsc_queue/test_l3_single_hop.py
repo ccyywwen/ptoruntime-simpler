@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import pytest
 from simpler.comm_region_template import SpscQueueOpcode
+from simpler.worker import Worker
 
 from ._helpers import (
     _POST_STOP_MARKER,
@@ -20,6 +21,7 @@ from ._helpers import (
     _SMALL_ECHO,
     _TIMEOUT_S,
     SUCCESS_PLATFORMS,
+    build_chip_callable,
     close_owned_workers,
     compute_payload,
     create_queue,
@@ -29,7 +31,6 @@ from ._helpers import (
     enqueue_bytes,
     error_payload,
     expected_compute_payload,
-    make_l3_worker,
     region_lifecycle,
     stream_config,
     submit_queue,
@@ -41,9 +42,17 @@ from ._helpers import (
 @pytest.mark.device_count(1)
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 def test_l3_single_hop(st_platform, st_device_ids):
-    worker, chip_handle = make_l3_worker(st_platform, int(st_device_ids[0]))
+    worker = Worker(
+        level=3,
+        device_ids=[int(st_device_ids[0])],
+        num_sub_workers=0,
+        platform=st_platform,
+        runtime="tensormap_and_ringbuffer",
+    )
+    chip_handle = worker.register(build_chip_callable(st_platform))
     lifecycle = region_lifecycle()
     recorder = lifecycle.install_lifecycle_recorder(worker)
+    worker.init()
     transactions: list[int] = []
     primary = None
     try:
