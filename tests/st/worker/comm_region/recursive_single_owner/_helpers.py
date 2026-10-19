@@ -47,6 +47,8 @@ _DATA_READY_COUNTER = 0
 _COMPLETION_COUNTER = 64
 _COUNTER_BYTES = 128
 _SCALAR = ctypes.c_float(7.0)
+_SENTINEL_HEAD = 0xD100000000000001
+_SENTINEL_TAIL = 0xD100000000000002
 
 SUCCESS_PLATFORMS = ["a2a3sim", "a2a3", "a5sim", "a5"]
 FAULT_PLATFORMS = ["a2a3sim", "a5sim"]
@@ -132,19 +134,61 @@ def _handshake(orch_handle, region, round_idx: int) -> None:
     data_ready.notify(stop_seq, NotifyOp.Set)
 
 
-def _chip_task_args(region) -> TaskArgs:
+def build_region_task_args(
+    region, overrides: dict[int, int] | None = None, *, sentinels: bool = False
+) -> TaskArgs:
+    values: list[object] = [int(scalar) for scalar in region.descriptor_scalars()]
+    values.extend(
+        [
+            _INPUT_OFFSET,
+            _OUTPUT_OFFSET,
+            _NUMEL,
+            int(DataType.FLOAT32.value),
+            _NBYTES,
+            _SCALAR,
+            _DATA_READY_COUNTER,
+            _COMPLETION_COUNTER,
+        ]
+    )
+    if overrides:
+        for index, value in overrides.items():
+            values[int(index)] = int(value)
     task_args = TaskArgs()
-    for scalar in region.descriptor_scalars():
-        task_args.add_scalar(int(scalar))
-    task_args.add_scalar(_INPUT_OFFSET)
-    task_args.add_scalar(_OUTPUT_OFFSET)
-    task_args.add_scalar(_NUMEL)
-    task_args.add_scalar(DataType.FLOAT32.value)
-    task_args.add_scalar(_NBYTES)
-    task_args.add_scalar(_SCALAR)
-    task_args.add_scalar(_DATA_READY_COUNTER)
-    task_args.add_scalar(_COMPLETION_COUNTER)
+    if sentinels:
+        task_args.add_scalar(_SENTINEL_HEAD)
+    for value in values:
+        task_args.add_scalar(value)
+    if sentinels:
+        task_args.add_scalar(_SENTINEL_TAIL)
     return task_args
+
+
+def _chip_task_args(region) -> TaskArgs:
+    return build_region_task_args(region)
+
+
+def publish_channel_header(orch_handle, region, seq: int, opcode: int) -> None:
+    header = orch_handle.alloc([_HEADER_BYTES], DataType.UINT8)
+    _write_header(header, seq, opcode)
+    region.payload_write(0, header, nbytes=_HEADER.size)
+    region.counter(_DATA_READY_COUNTER).notify(seq, NotifyOp.Set)
+
+
+def _reject_released(region) -> None:
+    try:
+        region.counter(_DATA_READY_COUNTER)
+    except RuntimeError as exc:
+        if "released" not in str(exc):
+            raise
+    else:
+        raise AssertionError("counter access after free succeeded")
+    try:
+        region.descriptor_scalars()
+    except RuntimeError as exc:
+        if "released" not in str(exc):
+            raise
+    else:
+        raise AssertionError("descriptor export after free succeeded")
 
 
 def _stream_config() -> CallConfig:
@@ -228,6 +272,10 @@ def run_two_lifecycles(
         _assert_delegated_live_region(region, path, transaction_id)
         submit_chip(orch_handle, region, cfg)
         _handshake(orch_handle, region, 1)
+        if transaction_id == 1:
+            return
+        region.free()
+        _reject_released(region)
 
     worker.run(orch, args=None, config=_stream_config())
     worker.run(orch, args=None, config=_stream_config())
@@ -243,21 +291,53 @@ def make_l3_submit(chip_handle) -> Callable[[Any, Any, CallConfig], None]:
     return _submit
 
 
+def forwarded_task_args(args) -> TaskArgs:
+    count = int(args.scalar_count())
+    start = 0
+    end = count
+    if (
+        count >= 2
+        and int(args.scalar(0)) == _SENTINEL_HEAD
+        and int(args.scalar(count - 1)) == _SENTINEL_TAIL
+    ):
+        start = 1
+        end = count - 1
+    chip_args = TaskArgs()
+    for index in range(start, end):
+        chip_args.add_scalar(int(args.scalar(index)))
+    return chip_args
+
+
 def make_l3_forward(chip_handle):
     def l3_forward(orch, args, cfg):
-        chip_args = TaskArgs()
-        for index in range(args.scalar_count()):
-            chip_args.add_scalar(int(args.scalar(index)))
-        orch.submit_next_level(chip_handle, chip_args, cfg, worker=0)
+        orch.submit_next_level(chip_handle, forwarded_task_args(args), cfg, worker=0)
 
     return l3_forward
 
 
 def make_l4_submit(l3_handle, l3_worker_id: int) -> Callable[[Any, Any, CallConfig], None]:
     def _submit(orch_handle, region, cfg):
-        orch_handle.submit_next_level(l3_handle, _chip_task_args(region), cfg, worker=int(l3_worker_id))
+        orch_handle.submit_next_level(
+            l3_handle, build_region_task_args(region, sentinels=True), cfg, worker=int(l3_worker_id)
+        )
 
     return _submit
+
+
+def sentinel_task_args(*middle: int) -> TaskArgs:
+    task_args = TaskArgs()
+    task_args.add_scalar(_SENTINEL_HEAD)
+    for value in middle:
+        task_args.add_scalar(int(value))
+    task_args.add_scalar(_SENTINEL_TAIL)
+    return task_args
+
+
+def assert_sentinel_order(args, *middle: int) -> None:
+    expected = (_SENTINEL_HEAD, *middle, _SENTINEL_TAIL)
+    assert int(args.scalar_count()) == len(expected)
+    for index, value in enumerate(expected):
+        assert int(args.scalar(index)) == int(value)
 
 
 class _LifecycleEventKind(IntEnum):
@@ -474,17 +554,11 @@ def install_lifecycle_recorder(worker: Worker) -> _LifecycleRecorder:
     return recorder
 
 
-def _assert_lifecycle_events(recorder: _LifecycleRecorder) -> None:
+def assert_lifecycle_rounds(recorder: _LifecycleRecorder, rounds: int) -> None:
     events = recorder.events()
-    assert len(events) == _RECORDER_EVENT_LIMIT
-    first = events[:8]
-    second = events[8:]
+    assert len(events) == 8 * int(rounds)
     expected_kinds = [int(kind) for kind in _LIFECYCLE_KIND_ORDER]
-    assert [kind for kind, _resource, _part in first] == expected_kinds
-    assert [kind for kind, _resource, _part in second] == expected_kinds
-    assert first[0][1] != second[0][1]
-    assert first[0][1] != 0 and second[0][1] != 0
-    expected_parts = (
+    expected_parts = [
         int(RegionPartKind.PAYLOAD),
         int(RegionPartKind.COUNTER),
         int(RegionPartKind.PAYLOAD),
@@ -493,8 +567,17 @@ def _assert_lifecycle_events(recorder: _LifecycleRecorder) -> None:
         int(RegionPartKind.PAYLOAD),
         int(RegionPartKind.COUNTER),
         int(RegionPartKind.INVALID),
-    )
-    assert [part for _kind, _resource, part in first] == list(expected_parts)
-    assert [part for _kind, _resource, part in second] == list(expected_parts)
-    assert [resource for _kind, resource, _part in first] == [first[0][1]] * 8
-    assert [resource for _kind, resource, _part in second] == [second[0][1]] * 8
+    ]
+    resource_ids = []
+    for round_index in range(int(rounds)):
+        group = events[round_index * 8 : (round_index + 1) * 8]
+        assert [kind for kind, _resource, _part in group] == expected_kinds
+        assert [part for _kind, _resource, part in group] == expected_parts
+        assert [resource for _kind, resource, _part in group] == [group[0][1]] * 8
+        assert group[0][1] != 0
+        resource_ids.append(group[0][1])
+    assert len(set(resource_ids)) == int(rounds)
+
+
+def _assert_lifecycle_events(recorder: _LifecycleRecorder) -> None:
+    assert_lifecycle_rounds(recorder, 2)

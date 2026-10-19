@@ -24,11 +24,13 @@ from ._helpers import (
     compute_payload,
     create_queue,
     drain_message,
+    echo_once,
     echo_payload,
     enqueue_bytes,
     error_payload,
     expected_compute_payload,
     make_l3_worker,
+    region_lifecycle,
     stream_config,
     submit_queue,
     wrap_payload,
@@ -40,11 +42,15 @@ from ._helpers import (
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 def test_l3_single_hop(st_platform, st_device_ids):
     worker, chip_handle = make_l3_worker(st_platform, int(st_device_ids[0]))
+    lifecycle = region_lifecycle()
+    recorder = lifecycle.install_lifecycle_recorder(worker)
+    transactions: list[int] = []
     primary = None
     try:
 
         def orch(orch_handle, _args, cfg):
             queue = create_queue(orch_handle)
+            transactions.append(int(queue._endpoint_binding.transaction_id))
             layout = queue.layout
 
             for _ in range(_QUEUE_DEPTH):
@@ -109,9 +115,22 @@ def test_l3_single_hop(st_platform, st_device_ids):
             with pytest.raises(RuntimeError):
                 queue.input.try_enqueue(_SMALL_ECHO, len(_SMALL_ECHO))
 
+        def orch_unfreed(orch_handle, _args, cfg):
+            queue = create_queue(orch_handle)
+            transactions.append(int(queue._endpoint_binding.transaction_id))
+            submit_queue(orch_handle, chip_handle, queue, cfg)
+            echo_once(queue, free=False)
+
         worker.run(orch, args=None, config=stream_config())
+        worker.run(orch_unfreed, args=None, config=stream_config())
+        assert transactions == [1, 2]
+        lifecycle.assert_lifecycle_rounds(recorder, 2)
     except BaseException as exc:
         primary = exc
         raise
     finally:
-        close_owned_workers(primary, worker)
+        try:
+            close_owned_workers(primary, worker)
+        finally:
+            if recorder.restore is not None:
+                recorder.restore()
