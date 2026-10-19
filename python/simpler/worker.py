@@ -99,13 +99,13 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     _mailbox_store_i32,
     _mailbox_store_u64,
     _read_control_copy_request,
+    _region_ack_cleanup_error,
+    _region_import_onboard,
+    _region_import_sim,
+    _region_peek_cleanup_error,
     _region_vmm_granularity,
     _set_host_span_level_prefix,
     _snapshot_local_task_args,
-    _worker_host_mapped_region_ack_cleanup_error,
-    _worker_host_mapped_region_import_onboard,
-    _worker_host_mapped_region_import_sim,
-    _worker_host_mapped_region_peek_cleanup_error,
     get_element_size,
     read_args_from_blob,
 )
@@ -5738,13 +5738,13 @@ class Worker:
         # Sticky copy of this Worker's native return-boundary mapping cleanup
         # diagnostic. Native storage is acknowledged only after this field and
         # the admission poison above have been published.
-        self._worker_host_mapped_cleanup_error: RuntimeError | None = None
+        self._region_mapping_cleanup_error: RuntimeError | None = None
         # (snapshot awaiting acknowledgement, retained distinct detail
         # fragments). This is an ordered diagnostic set, not a resource-count
         # ledger: an identical repeated failure adds no actionable information.
         # Keep it immutable so one attribute assignment publishes both pieces
         # atomically with respect to asynchronous Python exceptions.
-        self._worker_host_mapped_cleanup_state: tuple[str | None, tuple[str, ...]] = (None, ())
+        self._region_mapping_cleanup_state: tuple[str | None, tuple[str, ...]] = (None, ())
         # submit graph construction is serialized by _submit_mu. Resource
         # creation helpers use this pointer to bind new objects to the handle
         # being built; the pointer is cleared before submit() returns.
@@ -7535,7 +7535,7 @@ class Worker:
         """
         tid = threading.get_ident()
         with self._hierarchical_start_cv:
-            self._consume_worker_host_mapped_cleanup_error_locked(api)
+            self._consume_region_mapping_cleanup_error_locked(api)
             if self._lifecycle is not _Lifecycle.READY:
                 raise RuntimeError(f"Worker.{api}: requires an initialized (READY) worker") from self._startup_error
             if self._ordered_cleanup_error is not None:
@@ -9838,7 +9838,7 @@ class Worker:
                 f"L3-L2 payload buffer size {nbytes} exceeds registered shared storage {registered_nbytes}"
             )
 
-    def _consume_worker_host_mapped_cleanup_error_locked(self, api: str) -> RuntimeError | None:
+    def _consume_region_mapping_cleanup_error_locked(self, api: str) -> RuntimeError | None:
         """Publish and then acknowledge this Worker's native cleanup debt.
 
         Must hold ``_hierarchical_start_cv``. The native read is intentionally
@@ -9847,12 +9847,12 @@ class Worker:
         boundary. Acknowledgement may be interrupted only after admission is
         already poisoned.
         """
-        cleanup_error = _worker_host_mapped_region_peek_cleanup_error(self._owner_id)
-        pending_snapshot, details = self._worker_host_mapped_cleanup_state
+        cleanup_error = _region_peek_cleanup_error(self._owner_id)
+        pending_snapshot, details = self._region_mapping_cleanup_state
         if not cleanup_error:
             if pending_snapshot is not None:
-                self._worker_host_mapped_cleanup_state = (None, details)
-            return self._worker_host_mapped_cleanup_error
+                self._region_mapping_cleanup_state = (None, details)
+            return self._region_mapping_cleanup_error
 
         if cleanup_error != pending_snapshot:
             detail = cleanup_error
@@ -9863,26 +9863,26 @@ class Worker:
                 detail = cleanup_error[len(pending_snapshot) + 2 :]
             if detail and detail not in details:
                 details = (*details, detail)
-            self._worker_host_mapped_cleanup_state = (cleanup_error, details)
+            self._region_mapping_cleanup_state = (cleanup_error, details)
 
-        leaked = self._worker_host_mapped_cleanup_error
+        leaked = self._region_mapping_cleanup_error
         if leaked is None:
             leaked = RuntimeError(
                 f"Worker.{api}: a native L3 Host mapping owned by this Worker finalized without explicit close "
                 "and could not be reclaimed; no further work is admitted"
             )
-            self._worker_host_mapped_cleanup_error = leaked
+            self._region_mapping_cleanup_error = leaked
         leaked.__cause__ = RuntimeError("; ".join(details))
         if self._ordered_cleanup_error is None:
             self._ordered_cleanup_error = leaked
 
-        _worker_host_mapped_region_ack_cleanup_error(self._owner_id, cleanup_error)
-        self._worker_host_mapped_cleanup_state = (None, details)
-        return self._worker_host_mapped_cleanup_error
+        _region_ack_cleanup_error(self._owner_id, cleanup_error)
+        self._region_mapping_cleanup_state = (None, details)
+        return self._region_mapping_cleanup_error
 
-    def _consume_worker_host_mapped_cleanup_error(self, api: str) -> RuntimeError | None:
+    def _consume_region_mapping_cleanup_error(self, api: str) -> RuntimeError | None:
         with self._hierarchical_start_cv:
-            return self._consume_worker_host_mapped_cleanup_error_locked(api)
+            return self._consume_region_mapping_cleanup_error_locked(api)
 
     def _import_provider_part(
         self,
@@ -9903,7 +9903,7 @@ class Worker:
                 raise RuntimeError("POSIX shm object is shorter than the descriptor logical bytes")
             if selected is RegionPartKind.COUNTER and mapping_bytes < _align_up(int(descriptor.nbytes), 64):
                 raise RuntimeError("COUNTER POSIX shm object is shorter than the 64-byte padded span")
-            return _worker_host_mapped_region_import_sim(token, int(mapping_bytes), self._owner_id)
+            return _region_import_sim(token, int(mapping_bytes), self._owner_id)
         if expected is BackendKind.VMM_SHAREABLE:
             device_id, shareable_handle, mapping_bytes = _vmm_shareable_facts(descriptor)
             namespace_id = (
@@ -9921,7 +9921,7 @@ class Worker:
                 raise RuntimeError("VMM mapping_bytes must be a positive multiple of runtime granularity")
             if selected is RegionPartKind.COUNTER and int(mapping_bytes) < _align_up(int(descriptor.nbytes), 64):
                 raise RuntimeError("COUNTER VMM mapping_bytes must cover 64-byte alignment")
-            return _worker_host_mapped_region_import_onboard(
+            return _region_import_onboard(
                 int(device_id),
                 int(shareable_handle),
                 int(mapping_bytes),
@@ -13830,7 +13830,7 @@ class Worker:
                     and self._cleanup_journal.empty
                     and (self._teardown_attempted or prior.error is None)
                 ):
-                    deferred_native_cleanup_error = self._consume_worker_host_mapped_cleanup_error_locked("close")
+                    deferred_native_cleanup_error = self._consume_region_mapping_cleanup_error_locked("close")
                     if prior.error is not None:
                         raise prior.error
                     if deferred_native_cleanup_error is not None:
@@ -13846,7 +13846,7 @@ class Worker:
                         "init()'d it (native teardown is thread-bound)"
                     )
                 self._validate_chip_execution_context()
-                deferred_native_cleanup_error = self._consume_worker_host_mapped_cleanup_error_locked("close")
+                deferred_native_cleanup_error = self._consume_region_mapping_cleanup_error_locked("close")
                 # Claim: publish CLOSED (permanent admission fence) and install a
                 # fresh teardown attempt.
                 self._lifecycle = _Lifecycle.CLOSED
@@ -13935,7 +13935,7 @@ class Worker:
                 had_live = True  # conservative default if a read below is interrupted
                 detached_registry: tuple[dict, dict, dict] | None = None
                 try:
-                    deferred_native_cleanup_error = self._consume_worker_host_mapped_cleanup_error("close")
+                    deferred_native_cleanup_error = self._consume_region_mapping_cleanup_error("close")
                     if result is None and deferred_native_cleanup_error is not None:
                         result = deferred_native_cleanup_error
                     # A successful tree teardown is the reclamation boundary

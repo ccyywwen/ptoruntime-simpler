@@ -1129,7 +1129,7 @@ def region_worker(monkeypatch):
         worker._ensure_local_device_endpoint_identities()
         owner_nonce = bytes(worker._device_endpoint_identities[(1, DEVICE_AICPU)][0])
         worker._worker = _FakeNativeWorker(calls, owner_nonce, fail_release=fail_release)
-        monkeypatch.setattr(worker, "_consume_worker_host_mapped_cleanup_error", lambda _api: None)
+        monkeypatch.setattr(worker, "_consume_region_mapping_cleanup_error", lambda _api: None)
 
         def fake_import(_worker_id, _resource_id, export, *, part=None, expected_device_id=None):
             del part, expected_device_id

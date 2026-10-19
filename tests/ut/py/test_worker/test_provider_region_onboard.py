@@ -38,8 +38,8 @@ def _require_runtime(platform: str) -> None:
 
 def _install_lifecycle_spies(monkeypatch) -> list[tuple]:
     events: list[tuple] = []
-    original_import = worker_module._worker_host_mapped_region_import_onboard
-    original_close = comm_region._worker_host_mapped_region_close
+    original_import = worker_module._region_import_onboard
+    original_close = comm_region._region_close
     original_release = Worker._dispatch_delegated_release
 
     def spy_import(device_id, shareable_handle, mapping_bytes, owner_token):
@@ -61,8 +61,8 @@ def _install_lifecycle_spies(monkeypatch) -> list[tuple]:
         events.append(("release", int(result.provider_resource_id)))
         return result
 
-    monkeypatch.setattr(worker_module, "_worker_host_mapped_region_import_onboard", spy_import)
-    monkeypatch.setattr(comm_region, "_worker_host_mapped_region_close", spy_close)
+    monkeypatch.setattr(worker_module, "_region_import_onboard", spy_import)
+    monkeypatch.setattr(comm_region, "_region_close", spy_close)
     monkeypatch.setattr(Worker, "_dispatch_delegated_release", spy_release)
     return events
 
