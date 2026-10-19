@@ -37,6 +37,7 @@ from .comm_region import (
     RegionInstanceState,
     WaitCmp,
     materialize_region_instance,
+    validate_single_owner_region_shape,
 )
 
 _UINT64_MAX = (1 << 64) - 1
@@ -360,6 +361,8 @@ class _RegionTemplatePlan(Protocol):
     @property
     def region_layout(self) -> RegionLayoutSpec: ...
 
+    def _validate_placement(self, ctx: MaterializationContext, slots: _ResolvedTemplateSlots) -> None: ...
+
     def _bind(self, instance: object, slots: _ResolvedTemplateSlots) -> object: ...
 
 
@@ -445,6 +448,12 @@ class _SpscQueuePlan:
     @property
     def region_layout(self) -> RegionLayoutSpec:
         return self._region_layout
+
+    def _validate_placement(self, ctx: MaterializationContext, slots: _ResolvedTemplateSlots) -> None:
+        shape = validate_single_owner_region_shape(ctx)
+        initiator, peer = _require_distinct_initiator_peer(slots)
+        if initiator.identity != shape.consumer.identity or peer.identity != shape.provider.identity:
+            raise ValueError("INITIATOR and PEER must cover the consumer and provider endpoints")
 
     def _consume_for_bind(self) -> None:
         with self._bind_lock:
@@ -550,24 +559,24 @@ class _RegionTemplateCoordinator:
                     RefusalReason.UNSUPPORTED_PLAN,
                     "materialized region requires a BackendPlan",
                 )
-            instance = materialize_region_instance(
-                MaterializationContext(
-                    worker=worker,
-                    registry=registry,
-                    plan=backend_plan,
-                    layout=plan.region_layout,
-                )
+            ctx = MaterializationContext(
+                worker=worker,
+                registry=registry,
+                plan=backend_plan,
+                layout=plan.region_layout,
             )
+            plan._validate_placement(ctx, slots)
+            instance = materialize_region_instance(ctx)
             bound = plan._bind(instance, slots)
             projected = result_projector(bound)
             published = True
             return projected
-        except BaseException:
+        except BaseException as exc:
             if instance is not None and not published:
-                self._rollback_unpublished(instance)
+                self._rollback_unpublished(instance, exc)
             raise
 
-    def _rollback_unpublished(self, instance: object) -> None:
+    def _rollback_unpublished(self, instance: object, primary: BaseException) -> None:
         try:
             live = instance.state is RegionInstanceState.LIVE
         except BaseException:
@@ -577,10 +586,26 @@ class _RegionTemplateCoordinator:
         try:
             self._worker._region_instance_registry.close(instance)
         except BaseException as cleanup_error:
-            self._worker._record_unreclaimable(
-                "region template create: materialized instance could not be reclaimed; no further work is admitted",
-                cleanup_error,
-            )
+            try:
+                _attach_exception_note(
+                    primary,
+                    "region template create: materialized instance could not be reclaimed; no further work is admitted",
+                )
+            except BaseException:
+                pass
+            try:
+                self._worker._record_unreclaimable(
+                    "region template create: materialized instance could not be reclaimed; no further work is admitted",
+                    cleanup_error,
+                )
+            except BaseException:
+                pass
+
+
+def _return_spsc_queue(bound: object) -> _BoundSpscQueue:
+    if not isinstance(bound, _BoundSpscQueue):
+        raise TypeError("SPSC queue creation returned an unexpected object")
+    return bound
 
 
 @dataclass(frozen=True)
@@ -652,6 +677,7 @@ class _BoundSpscQueue:
         if not live:
             self._state = _SpscQueueState.EXPIRED
             raise RuntimeError("SPSC queue expired after the region instance left LIVE")
+        self._instance._ensure_usable("spsc_queue")
 
     def _poison_local(self, error: BaseException) -> None:
         if self._state is not _SpscQueueState.LIVE:
@@ -659,7 +685,7 @@ class _BoundSpscQueue:
         self._first_error = error
         self._state = _SpscQueueState.POISONED_LOCAL
         try:
-            self._instance.counter(self._layout.initiator_abort_offset).notify(1, NotifyOp.Set)
+            self._instance._counter_notify(self._layout.initiator_abort_offset, 1, NotifyOp.Set)
         except BaseException as abort_error:
             _attach_exception_note(error, f"initiator abort notify failed: {abort_error}")
 
@@ -667,17 +693,21 @@ class _BoundSpscQueue:
         self._ensure_usable()
         try:
             return fn(*args, **kwargs)
-        except TimeoutError:
+        except (TimeoutError, ValueError, TypeError):
             raise
         except BaseException as exc:
             self._poison_local(exc)
             raise
 
     def _signal_test(self, offset: int, cmp_value: int, cmp: WaitCmp) -> Any:
-        return self._run_primitive(lambda: self._instance.counter(offset).test(_counter_low32(cmp_value), cmp))
+        return self._run_primitive(
+            lambda: self._instance._counter_test(offset, _counter_low32(cmp_value), cmp)
+        )
 
     def _signal_notify(self, offset: int, value: int) -> None:
-        self._run_primitive(lambda: self._instance.counter(offset).notify(_counter_low32(value), NotifyOp.Set))
+        self._run_primitive(
+            lambda: self._instance._counter_notify(offset, _counter_low32(value), NotifyOp.Set)
+        )
 
     def _sample_peer_abort(self) -> None:
         result = self._signal_test(self._layout.peer_abort_offset, 1, WaitCmp.GE)
@@ -712,7 +742,7 @@ class _BoundSpscQueue:
             raise TimeoutError("SPSC queue operation timed out")
         try:
             self._run_primitive(
-                lambda: self._instance.counter(offset).wait(_counter_low32(local_value), WaitCmp.NE, remaining)
+                lambda: self._instance._counter_wait(offset, _counter_low32(local_value), WaitCmp.NE, remaining)
             )
         except TimeoutError:
             self._sample_peer_abort()

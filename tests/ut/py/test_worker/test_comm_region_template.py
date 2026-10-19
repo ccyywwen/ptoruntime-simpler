@@ -479,6 +479,19 @@ class _MemoryRegion:
     def counter(self, offset: int) -> _MemoryCounter:
         return _MemoryCounter(self, offset)
 
+    def _ensure_usable(self, api: str = "region") -> None:
+        if self._state is not RegionInstanceState.LIVE:
+            raise RuntimeError(f"{api}: region instance is not live")
+
+    def _counter_notify(self, offset: int, value: int, op: NotifyOp) -> None:
+        self.counter(offset).notify(value, op)
+
+    def _counter_test(self, offset: int, cmp_value: int, cmp: WaitCmp) -> SignalTestResult:
+        return self.counter(offset).test(cmp_value, cmp)
+
+    def _counter_wait(self, offset: int, cmp_value: int, cmp: WaitCmp, timeout: float) -> int:
+        return self.counter(offset).wait(cmp_value, cmp, timeout)
+
 
 def _endpoint_bundle():
     session = bytes(range(8))
@@ -688,6 +701,9 @@ class _GenericTemplatePlan:
             if self._state is not _SpscQueuePlanState.AVAILABLE:
                 raise RuntimeError("queue plan bind token is already consumed")
             self._state = _SpscQueuePlanState.CONSUMED
+
+    def _validate_placement(self, ctx: object, slots: object) -> None:
+        return
 
     def _bind(self, instance: object, slots: object) -> dict[str, object]:
         self._consume_for_bind()
@@ -1289,7 +1305,7 @@ def test_coordinator_generic_cleanup_failure_keeps_first_error(region_worker):
     assert any(item[0] == "release" for item in calls)
 
 
-def test_coordinator_spsc_role_mismatch_consumes_plan_and_rolls_back(region_worker):
+def test_coordinator_spsc_role_mismatch_refuses_before_allocate(region_worker):
     worker, calls, _leases = region_worker()
     host_sel = at("L3", HOST_CPU)
     peer_sel = at("L3/L2[1]", DEVICE_AICPU)
@@ -1301,16 +1317,26 @@ def test_coordinator_spsc_role_mismatch_consumes_plan_and_rolls_back(region_work
             _TemplateSlotBindingRequest(_SpscQueueSlot.PEER, host_sel),
         ),
     )
-    with pytest.raises(ValueError, match="INITIATOR slot does not match"):
+    template = _SpscQueueTemplate()
+    created: dict[str, object] = {}
+    original_plan = template.plan
+
+    def plan(config: object):
+        made = original_plan(config)
+        created["plan"] = made
+        return made
+
+    template.plan = plan  # type: ignore[method-assign]
+    with pytest.raises(ValueError, match="INITIATOR and PEER must cover"):
         _RegionTemplateCoordinator(worker).create(
-            template=_SpscQueueTemplate(),
+            template=template,
             config=_SpscQueueConfig(4, 64, 64),
             placement=placement,
             result_projector=lambda bound: bound,
         )
-    assert any(item[0] == "allocate" for item in calls)
-    assert any(item[0] == "release" for item in calls)
+    assert calls == []
     assert worker._region_instance_registry._instances == {}
+    assert created["plan"]._state is _SpscQueuePlanState.AVAILABLE
 
 
 def test_coordinator_source_has_no_spsc_roles():
@@ -1462,3 +1488,113 @@ def test_signed_int32_counter_operands_cross_bit31_and_wrap_to_zero():
     with pytest.raises(TimeoutError, match="timed out"):
         queue.output.peek(0.01)
     assert queue._state is _SpscQueueState.LIVE
+
+
+def test_spsc_free_keeps_backing_and_rejects_lanes(region_worker):
+    from simpler.orchestrator import _callback_run
+    from simpler.worker import _RunResources
+
+    worker, calls, _leases = region_worker()
+    resources = _RunResources()
+    worker._building_run_resources = resources
+    try:
+        with _callback_run(5, worker):
+            queue = worker._create_spsc_queue(
+                initiator=at("L3", HOST_CPU),
+                peer=at("L3/L2[1]", DEVICE_AICPU),
+                depth=4,
+                input_arena_bytes=64,
+                output_arena_bytes=64,
+            )
+            queue.free()
+            queue.free()
+            with pytest.raises(RuntimeError, match="released"):
+                queue.input.try_enqueue(b"ab", 2)
+            with pytest.raises(RuntimeError, match="released"):
+                queue.output.try_peek()
+    finally:
+        worker._building_run_resources = None
+    assert not any(item[0] == "release" for item in calls)
+    worker._region_instance_registry.cleanup_run(resources)
+    assert sum(item[0] == "release" for item in calls) == 1
+
+
+def test_spsc_exact_config_and_cleanup_flag(region_worker, monkeypatch):
+    from simpler.comm_region_template import _SpscQueuePlan
+    from simpler.orchestrator import _callback_run
+    from simpler.worker import _RunResources
+
+    worker, calls, _leases = region_worker()
+    host = at("L3", HOST_CPU)
+    device = at("L3/L2[1]", DEVICE_AICPU)
+    resources = _RunResources()
+    worker._building_run_resources = resources
+    try:
+        with _callback_run(6, worker):
+            with pytest.raises(TypeError, match="exact int"):
+                worker._create_spsc_queue(
+                    initiator=host,
+                    peer=device,
+                    depth=True,
+                    input_arena_bytes=64,
+                    output_arena_bytes=64,
+                )
+            assert resources.requires_ordered_cleanup is False
+            assert calls == []
+
+            def fail_bind(self, instance, slots):
+                del self, instance, slots
+                raise KeyboardInterrupt("bind interrupted")
+
+            original_bind = _SpscQueuePlan._bind
+            monkeypatch.setattr(_SpscQueuePlan, "_bind", fail_bind)
+            with pytest.raises(KeyboardInterrupt, match="bind interrupted"):
+                worker._create_spsc_queue(
+                    initiator=host,
+                    peer=device,
+                    depth=4,
+                    input_arena_bytes=64,
+                    output_arena_bytes=64,
+                )
+            assert resources.requires_ordered_cleanup is False
+            assert worker._region_instance_registry._instances == {}
+            assert sum(item[0] == "release" for item in calls) == 1
+
+            monkeypatch.setattr(_SpscQueuePlan, "_bind", original_bind)
+            region = worker._create_region(
+                members=(host, device),
+                topology=SingleOwner(provider=device),
+                payload_bytes=64,
+                counter_bytes=128,
+            )
+            assert resources.requires_ordered_cleanup is True
+            monkeypatch.setattr(_SpscQueuePlan, "_bind", fail_bind)
+            with pytest.raises(KeyboardInterrupt, match="bind interrupted"):
+                worker._create_spsc_queue(
+                    initiator=host,
+                    peer=device,
+                    depth=4,
+                    input_arena_bytes=64,
+                    output_arena_bytes=64,
+                )
+            assert resources.requires_ordered_cleanup is True
+            assert region.state is RegionInstanceState.LIVE
+            assert id(region) in worker._region_instance_registry._instances
+    finally:
+        worker._building_run_resources = None
+
+
+def test_spsc_free_rejects_acquired_message_without_physical_release():
+    _plan, region, _slots, queue = _bind_memory_queue(depth=4, input_arena_bytes=64, output_arena_bytes=64)
+    out = queue._layout.output_arena_offset
+    _plant_output_descriptor(region, queue, 1, SpscQueueOpcode.DATA, out, b"abcd")
+    handle = queue.output.try_peek()
+    assert handle is not None
+    queue.free()
+    queue.free()
+    with pytest.raises(RuntimeError, match="released"):
+        queue.output.read_into(handle, bytearray(4))
+    with pytest.raises(RuntimeError, match="released"):
+        queue.output.release(handle)
+    assert queue._output_active is handle
+    assert region.state is RegionInstanceState.LIVE

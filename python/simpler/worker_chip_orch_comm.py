@@ -127,7 +127,7 @@ class WorkerChipOrchRegion:
     def payload_write(self, offset: int, host_buffer: Any, nbytes: int | None = None) -> None:
         self._ensure_live()
         try:
-            self._instance.payload_write(offset, host_buffer, nbytes)
+            self._instance._write_payload(offset, host_buffer, nbytes)
         except Exception as exc:
             self._remember_data_plane_error(exc)
             raise
@@ -135,7 +135,7 @@ class WorkerChipOrchRegion:
     def payload_read(self, offset: int, host_buffer: Any, nbytes: int | None = None) -> None:
         self._ensure_live()
         try:
-            self._instance.payload_read(offset, host_buffer, nbytes)
+            self._instance._read_payload(offset, host_buffer, nbytes)
         except Exception as exc:
             self._remember_data_plane_error(exc)
             raise
@@ -143,7 +143,10 @@ class WorkerChipOrchRegion:
     def counter(self, offset: int) -> WorkerChipOrchCounter:
         self._ensure_live()
         offset = int(offset)
-        self._instance.counter(offset)
+        counter_part = self._instance._counter_part
+        if counter_part is None:
+            raise RuntimeError(f"L3-L2 region {self.region_id} has no counter part")
+        counter_part._validate_counter_offset(offset)
         return WorkerChipOrchCounter(self, offset)
 
     def free(self) -> None:
@@ -165,14 +168,14 @@ class WorkerChipOrchRegion:
 
     def _direct_counter_notify(self, offset: int, value: int, op: NotifyOp) -> None:
         try:
-            self._instance.counter(offset).notify(int(value), NotifyOp(op))
+            self._instance._counter_notify(offset, int(value), NotifyOp(op))
         except Exception as exc:
             self._remember_data_plane_error(exc)
             raise
 
     def _direct_counter_test(self, offset: int, cmp_value: int, cmp: WaitCmp) -> SignalTestResult:
         try:
-            return self._instance.counter(offset).test(int(cmp_value), WaitCmp(cmp))
+            return self._instance._counter_test(offset, int(cmp_value), WaitCmp(cmp))
         except Exception as exc:
             self._remember_data_plane_error(exc)
             raise
@@ -180,7 +183,7 @@ class WorkerChipOrchRegion:
     def _direct_counter_wait(self, offset: int, cmp_value: int, cmp: WaitCmp, timeout_ns: int) -> int:
         timeout = float(timeout_ns) / 1_000_000_000
         try:
-            return self._instance.counter(offset).wait(int(cmp_value), WaitCmp(cmp), timeout)
+            return self._instance._counter_wait(offset, int(cmp_value), WaitCmp(cmp), timeout)
         except TimeoutError:
             raise
         except Exception as exc:
