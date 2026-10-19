@@ -74,7 +74,7 @@ def test_peer_rejects_zero_transaction(st_platform, st_device_ids):
 
         def orch(orch_handle, _args, cfg):
             queue = create_queue(orch_handle)
-            scalars = list(queue.chip_task_arg_scalars())
+            scalars = list(queue.peer_task_arg_scalars())
             scalars[2] = 0
             task_args = TaskArgs()
             for value in scalars:
@@ -102,7 +102,7 @@ def test_peer_rejects_wrong_magic(st_platform, st_device_ids):
 
         def orch(orch_handle, _args, cfg):
             queue = create_queue(orch_handle)
-            scalars = list(queue.chip_task_arg_scalars())
+            scalars = list(queue.peer_task_arg_scalars())
             scalars[0] = 0x4C33513200010001
             task_args = TaskArgs()
             for value in scalars:

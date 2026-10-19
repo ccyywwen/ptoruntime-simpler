@@ -704,7 +704,7 @@ def test_worker_materializes_region_instance_and_closes_single_region(region_wor
     instance = _materialize_default_region(worker)
 
     assert instance.state is RegionInstanceState.LIVE
-    assert instance.worker_id == 1
+    assert instance._first_hop_child_id == 1
     assert instance._payload_attachment is not None
     assert instance._counter_attachment is not None
     assert instance._payload_attachment.native_lease is leases[0]
@@ -718,8 +718,8 @@ def test_worker_materializes_region_instance_and_closes_single_region(region_wor
     assert instance._counter_part.span == RegionPartSpan(offset=0, nbytes=128)
 
     with worker._control_reservation("test_region_instance"):
-        instance.close()
-        instance.close()
+        instance._close()
+        instance._close()
     assert instance.state is RegionInstanceState.CLOSED
     assert _tracked(worker) == ()
     assert calls == [
@@ -799,8 +799,8 @@ def test_live_region_instance_close_reuses_one_shot_cleanup(region_worker):
     instance = _materialize_default_region(worker)
 
     with worker._control_reservation("test_region_instance"):
-        instance.close()
-        instance.close()
+        instance._close()
+        instance._close()
 
     assert instance.state is RegionInstanceState.CLOSED
     assert _tracked(worker) == ()
@@ -813,7 +813,7 @@ def test_live_region_instance_close_reuses_one_shot_cleanup(region_worker):
         ("release", 1, 42),
     ]
     with worker._control_reservation("test_region_instance"):
-        instance.close()
+        instance._close()
     assert instance.state is RegionInstanceState.CLOSED
     assert _tracked(worker) == ()
     with pytest.raises(MaterializationError, match="not live"):
@@ -826,7 +826,7 @@ def test_region_instance_close_failure_marks_failed_and_poisons_worker(region_wo
 
     with worker._control_reservation("test_region_instance"):
         with pytest.raises(RuntimeError, match="mapping close failed"):
-            instance.close()
+            instance._close()
 
     assert instance.state is RegionInstanceState.CLOSE_FAILED
     assert _tracked(worker) == ()
@@ -835,7 +835,7 @@ def test_region_instance_close_failure_marks_failed_and_poisons_worker(region_wo
     with pytest.raises(RuntimeError, match="not live"):
         instance.payload_write(0, "src")
     with pytest.raises(RuntimeError, match="mapping close failed"):
-        instance.close()
+        instance._close()
     assert calls == [
         ("allocate", 64, 128),
         ("import", "payload", 64, RegionPartKind.PAYLOAD),
@@ -852,9 +852,9 @@ def test_region_instance_close_failure_replays_cached_error(region_worker):
 
     with worker._control_reservation("test_region_instance"):
         with pytest.raises(RuntimeError, match="mapping close failed") as first_excinfo:
-            instance.close()
+            instance._close()
         with pytest.raises(RuntimeError, match="mapping close failed") as second_excinfo:
-            instance.close()
+            instance._close()
 
     assert instance.state is RegionInstanceState.CLOSE_FAILED
     assert _tracked(worker) == ()
@@ -876,7 +876,7 @@ def test_callback_region_close_before_submit_retired_from_run_cleanup(region_wor
     try:
         with _callback_run(17, worker):
             instance = _materialize_default_region(worker)
-            instance.close()
+            instance._close()
     finally:
         worker._building_run_resources = None
 
@@ -905,7 +905,7 @@ def test_callback_region_run_cleanup_then_later_close_is_idempotent(region_worke
             assert frame is not None
             frame.has_submitted_task = True
             with pytest.raises(RuntimeError, match="cannot follow a task submission"):
-                instance.close()
+                instance._close()
     finally:
         worker._building_run_resources = None
 
@@ -913,7 +913,7 @@ def test_callback_region_run_cleanup_then_later_close_is_idempotent(region_worke
 
     assert instance.state is RegionInstanceState.CLOSED
     assert _tracked(worker) == ()
-    instance.close()
+    instance._close()
     assert instance.state is RegionInstanceState.CLOSED
     assert _tracked(worker) == ()
     assert calls == [
@@ -955,7 +955,7 @@ def test_callback_region_data_plane_after_submit_uses_mapped_view(region_worker,
             instance.payload_read(0, "dst")
             assert instance.counter(0).offset == 0
             with pytest.raises(RuntimeError, match="cannot follow a task submission"):
-                instance.close()
+                instance._close()
     finally:
         worker._building_run_resources = None
 
@@ -1062,7 +1062,7 @@ def test_successful_close_then_materialize_and_close_again(region_worker):
     worker, calls, _leases = region_worker()
     first = _materialize_default_region(worker)
     with worker._control_reservation("test_region_instance"):
-        first.close()
+        first._close()
     assert first.state is RegionInstanceState.CLOSED
     assert _tracked(worker) == ()
 
@@ -1070,7 +1070,7 @@ def test_successful_close_then_materialize_and_close_again(region_worker):
     assert second.state is RegionInstanceState.LIVE
     assert second is not first
     with worker._control_reservation("test_region_instance"):
-        second.close()
+        second._close()
     assert second.state is RegionInstanceState.CLOSED
     assert _tracked(worker) == ()
     assert calls.count(("allocate", 64, 128)) == 2
@@ -1230,7 +1230,7 @@ def test_provider_release_failure_keeps_diagnostic_until_sweep(region_worker):
     instance = _materialize_default_region(worker)
     with worker._control_reservation("test_region_instance"):
         with pytest.raises(RuntimeError, match="release failed"):
-            instance.close()
+            instance._close()
 
     assert instance.state is RegionInstanceState.CLOSE_FAILED
     assert _tracked(worker) == (instance,)
@@ -1411,7 +1411,7 @@ def test_counter_mapped_base_aligned_publishes_live(region_worker, monkeypatch):
     assert instance.state is RegionInstanceState.LIVE
     assert leases[1].mapped_base == 64
     with worker._control_reservation("test_region_instance"):
-        instance.close()
+        instance._close()
     assert instance.state is RegionInstanceState.CLOSED
     worker._require_no_ordered_cleanup_failure("test")
 
@@ -1531,12 +1531,12 @@ def test_live_region_instance_access_requires_control_context(region_worker):
     with pytest.raises(RuntimeError, match="owning run"):
         instance.counter(0)
     with pytest.raises(RuntimeError, match="active orchestration/control context"):
-        instance.close()
+        instance._close()
 
     with worker._control_reservation("test_region_instance"):
         with pytest.raises(RuntimeError, match="owning run"):
             instance.payload_write(0, "src")
-        instance.close()
+        instance._close()
 
     assert calls == [
         ("allocate", 64, 128),
@@ -1552,14 +1552,14 @@ def test_local_view_returns_completed_materialization_only(region_worker):
     worker, _calls, _leases = region_worker()
     instance = _materialize_default_region(worker)
     assert instance.provider_resource_id == 42
-    payload = instance.local_view(RegionPartKind.PAYLOAD)
-    counter = instance.local_view(RegionPartKind.COUNTER)
+    payload = instance._local_view(RegionPartKind.PAYLOAD)
+    counter = instance._local_view(RegionPartKind.COUNTER)
     assert payload is instance._payload_local_view
     assert counter is instance._counter_local_view
     assert payload is not None and counter is not None
     instance._state = RegionInstanceState.CLOSED
-    assert instance.local_view(RegionPartKind.PAYLOAD) is None
-    assert instance.local_view(RegionPartKind.COUNTER) is None
+    assert instance._local_view(RegionPartKind.PAYLOAD) is None
+    assert instance._local_view(RegionPartKind.COUNTER) is None
 
 
 def test_live_resource_inventory_reports_registry_instance_count(region_worker):
@@ -1955,16 +1955,6 @@ def test_projection_requires_a_real_backend_plan():
         project_region_allocation_spec(ctx.plan, object())
 
 
-def test_compatibility_create_projects_admitted_w2_plan_not_byte_counts(monkeypatch):
-    worker = _l3(device_ids=[8, 9])
-    spec = worker._project_admitted_worker_chip_region_spec(1, 64, 128)
-
-    assert spec.payload.planned_backing_kind is ce.BackendKind.VMM_SHAREABLE
-    assert spec.counter.planned_backing_kind is ce.BackendKind.VMM_SHAREABLE
-    assert spec.payload.logical_bytes == 64
-    assert spec.counter.logical_bytes == 128
-
-
 def test_compatibility_create_does_not_allocate_when_admission_refuses(monkeypatch):
     worker = _l3(device_ids=[8, 9])
     calls: list[str] = []
@@ -1981,8 +1971,14 @@ def test_compatibility_create_does_not_allocate_when_admission_refuses(monkeypat
     monkeypatch.setattr("simpler.comm_region.validate_single_owner_region_shape", refuse)
     worker._worker = type("Native", (), {"control_payload": staticmethod(payload)})()
 
-    with pytest.raises(MaterializationRefusal) as excinfo:
-        worker._create_worker_chip_region(1, 64, 128)
+    with _owning_run(worker, 2):
+        with pytest.raises(MaterializationRefusal) as excinfo:
+            worker._create_region(
+                members=(ce.at("L3", ce.HOST_CPU), ce.at("L3/L2[1]", ce.DEVICE_AICPU)),
+                topology=ce.SingleOwner(provider=ce.at("L3/L2[1]", ce.DEVICE_AICPU)),
+                payload_bytes=64,
+                counter_bytes=128,
+            )
 
     assert excinfo.value.reason is RefusalReason.UNSUPPORTED_BACKEND_KIND
     assert calls == ["admit"]
@@ -2040,7 +2036,13 @@ def test_compatibility_create_uses_projection_result_not_a_fabricated_spec(monke
         return bytes(buf)
 
     worker._worker = type("Native", (), {"control_payload": staticmethod(payload)})()
-    region = worker._create_worker_chip_region(1, 64, 128)
+    with _owning_run(worker, 3):
+        region = worker._create_region(
+            members=(ce.at("L3", ce.HOST_CPU), ce.at("L3/L2[1]", ce.DEVICE_AICPU)),
+            topology=ce.SingleOwner(provider=ce.at("L3/L2[1]", ce.DEVICE_AICPU)),
+            payload_bytes=64,
+            counter_bytes=128,
+        )
     request = captured["request"]
     assert int(captured["worker_id"]) == 1
     assert request.payload_logical_bytes == 64
@@ -2048,7 +2050,7 @@ def test_compatibility_create_uses_projection_result_not_a_fabricated_spec(monke
     assert request.payload_backend_kind is ce.BackendKind.VMM_SHAREABLE
     assert request.counter_backend_kind is ce.BackendKind.VMM_SHAREABLE
     registry = worker._get_endpoint_registry()
-    plan = region._instance.plan
+    plan = region._plan
     provider = registry.record_for(plan.topology_plan.provider_endpoint)
     consumer = next(registry.record_for(member) for member in plan.ordered_members if member != provider.identity)
     assert provider.path == "L3/L2[1]"
@@ -2372,7 +2374,7 @@ def test_delegated_allocate_dispatch_closes_admission_at_uint64_limit():
 def test_clean_retirement_keeps_allocator_and_has_no_lookup_api():
     ctx = _accepted_context()
     shape = validate_single_owner_region_shape(ctx)
-    instance = RegionInstance.planned(ctx, shape)
+    instance = RegionInstance._planned(ctx, shape)
     registry = ctx.worker._region_instance_registry
     with registry._delegated_allocate_dispatch(registry=_endpoint_session(), expected_registry_epoch=3) as ident:
         assert ident[1] == 1
@@ -2389,7 +2391,7 @@ def test_clean_retirement_keeps_allocator_and_has_no_lookup_api():
 def test_delegated_identity_requires_track_and_skips_uncertainty_release():
     ctx = _accepted_context()
     shape = validate_single_owner_region_shape(ctx)
-    instance = RegionInstance.planned(ctx, shape)
+    instance = RegionInstance._planned(ctx, shape)
     releases: list[tuple[bytes, int, bytes]] = []
 
     def _dispatch(*, session_instance_id, transaction_id, provider_path):
@@ -2415,7 +2417,7 @@ def test_delegated_identity_requires_track_and_skips_uncertainty_release():
 def test_committed_allocated_installs_release_edge_and_close_sends_once():
     ctx = _accepted_context()
     shape = validate_single_owner_region_shape(ctx)
-    instance = RegionInstance.planned(ctx, shape)
+    instance = RegionInstance._planned(ctx, shape)
     ctx.worker._region_instance_registry.track(instance, None)
     instance._bind_delegated_identity(_DELEGATED_SESSION_A, 4, b"L3/L2[1]")
     instance._commit_delegated_allocation(11)

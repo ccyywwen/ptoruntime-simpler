@@ -13,6 +13,7 @@ from __future__ import annotations
 import ctypes
 import itertools
 import operator
+import struct
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -81,6 +82,12 @@ from .orchestrator import _callback_frame_for
 _COUNTER_BASE_ALIGNMENT = 64
 _INT32_MIN = -1 << 31
 _INT32_MAX = (1 << 31) - 1
+_REGION_TASK_MAGIC = 0x4C334C32
+_REGION_TASK_ABI_MAJOR = 4
+_REGION_TASK_ABI_MINOR = 0
+_REGION_TASK_SCALAR_COUNT = 8
+_REGION_TASK_MAGIC_VERSION = 0x4C334C3200040000
+_SESSION_STRUCT = struct.Struct("<Q")
 
 
 class _RegionPartAttachment:
@@ -217,6 +224,29 @@ class HostVmmCopyAccess:
 
 def _ignore_issued_failure(_error: BaseException) -> None:
     return
+
+
+def _session_instance_id_to_bits(session_instance_id: bytes) -> int:
+    if not isinstance(session_instance_id, (bytes, bytearray, memoryview)):
+        raise TypeError("session_instance_id must be 8 opaque bytes")
+    raw = bytes(session_instance_id)
+    if len(raw) != _SESSION_INSTANCE_ID_BYTES:
+        raise ValueError("session_instance_id must be 8 opaque bytes")
+    return int(_SESSION_STRUCT.unpack(raw)[0])
+
+
+def _session_instance_id_from_bits(bits: object) -> bytes:
+    if isinstance(bits, bool) or type(bits) is not int:
+        raise TypeError("session_instance_id_bits must be an exact int")
+    if bits < 0 or bits > _UINT64_MAX:
+        raise ValueError("session_instance_id_bits overflowed uint64")
+    return _SESSION_STRUCT.pack(bits)
+
+
+def _require_region_scalar(name: str, value: int) -> int:
+    if type(value) is not int or value < 0 or value > _UINT64_MAX:
+        raise RuntimeError(f"{name} is outside uint64")
+    return value
 
 
 def _require_region_size(name: str, value: object) -> int:
@@ -572,7 +602,7 @@ class RegionInstanceRegistry:
     def record_data_plane_failure(self, run_scope: Any, resource_id: int, error: BaseException) -> None:
         resource_id = int(resource_id)
         matches = [
-            instance for instance in self._iter_run(run_scope) if int(instance.provider_resource_id) == resource_id
+            instance for instance in self._iter_run(run_scope) if int(instance._provider_resource_id) == resource_id
         ]
         if not matches:
             raise MaterializationError(f"no region instance for resource {resource_id}")
@@ -624,16 +654,16 @@ class RegionInstanceRegistry:
 
 class RegionInstance:
     def __init__(self, ctx: MaterializationContext, shape: SingleOwnerRegionShape) -> None:
-        self.plan = ctx.plan
-        self.layout = ctx.layout
-        self.provider = shape.provider
-        self.consumer = shape.consumer
-        self.worker_id = int(shape.worker_id)
+        self._plan = ctx.plan
+        self._layout = ctx.layout
+        self._provider = shape.provider
+        self._consumer = shape.consumer
+        self._first_hop_child_id = int(shape.worker_id)
         self.generation = next(_GENERATION_COUNTER)
         self.diagnostic_label = (
-            f"{self.consumer.path} {self.consumer.deployment.value} -> "
-            f"{self.provider.path} {self.provider.deployment.value} "
-            f"payload={int(self.layout.payload_bytes)} counter={int(self.layout.counter_bytes)}"
+            f"{self._consumer.path} {self._consumer.deployment.value} -> "
+            f"{self._provider.path} {self._provider.deployment.value} "
+            f"payload={int(self._layout.payload_bytes)} counter={int(self._layout.counter_bytes)}"
         )
         self._worker = ctx.worker
         self._cleanup_resources = getattr(ctx.worker, "_building_run_resources", None)
@@ -660,6 +690,10 @@ class RegionInstance:
         self._owner_run_id: int | None = None
 
     @property
+    def layout(self) -> RegionLayoutSpec:
+        return self._layout
+
+    @property
     def state(self) -> RegionInstanceState:
         if self._state is None:
             raise MaterializationError("region instance is not published")
@@ -683,7 +717,7 @@ class RegionInstance:
     def data_plane_error(self) -> BaseException | None:
         return self._data_plane_error
 
-    def local_view(self, part: RegionPartKind) -> RegionPartLocalView | None:
+    def _local_view(self, part: RegionPartKind) -> RegionPartLocalView | None:
         if self._state is not RegionInstanceState.LIVE:
             return None
         selected = RegionPartKind(part)
@@ -694,7 +728,7 @@ class RegionInstance:
         raise ValueError("region part must be PAYLOAD or COUNTER")
 
     @classmethod
-    def planned(
+    def _planned(
         cls, ctx: MaterializationContext, shape: SingleOwnerRegionShape | DelegatedSingleOwnerRegionShape
     ) -> RegionInstance:
         if isinstance(shape, DelegatedSingleOwnerRegionShape):
@@ -712,6 +746,28 @@ class RegionInstance:
 
     def free(self) -> None:
         self._released = True
+
+    def descriptor_scalars(self) -> list[int]:
+        self._ensure_usable("region_instance.descriptor_scalars")
+        payload = self._payload_local_view
+        counter = self._counter_local_view
+        if payload is None or counter is None:
+            raise RuntimeError("region descriptor requires PAYLOAD and COUNTER local views")
+        validate_independent_local_views(payload, counter)
+        session, transaction_id = self._allocation_identity
+        resource_id = int(self._provider_resource_id)
+        if resource_id < 1:
+            raise RuntimeError("region descriptor requires a nonzero resource id")
+        return [
+            _REGION_TASK_MAGIC_VERSION,
+            _require_region_scalar("region_id", resource_id),
+            _require_region_scalar("payload_base", int(payload.local_base)),
+            _require_region_scalar("payload_bytes", int(payload.logical_bytes)),
+            _require_region_scalar("counter_base", int(counter.local_base)),
+            _require_region_scalar("counter_bytes", int(counter.logical_bytes)),
+            _session_instance_id_to_bits(session),
+            _require_region_scalar("transaction_id", int(transaction_id)),
+        ]
 
     def payload_write(self, offset: int, host_buffer: Any, nbytes: int | None = None) -> None:
         self._ensure_usable("region_instance.payload_write")
@@ -768,7 +824,7 @@ class RegionInstance:
             return
         self._owner_run_id = int(frame.run_id)
 
-    def close(self) -> None:
+    def _close(self) -> None:
         if self._state is RegionInstanceState.CLOSED:
             return
         if self._state is RegionInstanceState.CLOSE_FAILED and self._cleanup_error is not None:
@@ -837,7 +893,7 @@ class RegionInstance:
             self._cleanup_error = close_error
         self._state = RegionInstanceState.CLOSE_FAILED
         poison = self._worker._record_unreclaimable(
-            f"region instance: committed allocation could not be published on worker {self.worker_id}; "
+            f"region instance: committed allocation could not be published on worker {self._first_hop_child_id}; "
             "no further work is admitted",
             close_error or cause,
         )
@@ -927,7 +983,7 @@ class RegionInstance:
         self._state = RegionInstanceState.CLOSE_FAILED
         if poison_on_error:
             self._worker._record_unreclaimable(
-                f"region instance: resource {self._provider_resource_id} on worker {self.worker_id} "
+                f"region instance: resource {self._provider_resource_id} on worker {self._first_hop_child_id} "
                 "could not be fully reclaimed; no further work is admitted",
                 self._cleanup_error,
             )
@@ -1152,7 +1208,7 @@ def _delegated_allocate_request(
 def materialize_region_instance(ctx: MaterializationContext) -> RegionInstance:  # noqa: PLR0912
     shape = validate_single_owner_region_shape(ctx)
     spec = project_region_allocation_spec(ctx.plan, ctx.layout)
-    instance = RegionInstance.planned(ctx, shape)
+    instance = RegionInstance._planned(ctx, shape)
     resources = getattr(ctx.worker, "_building_run_resources", None)
     ctx.worker._region_instance_registry.track(instance, resources)
     delivered = False
@@ -1201,7 +1257,7 @@ def materialize_region_instance(ctx: MaterializationContext) -> RegionInstance: 
                     outcome.payload_view,
                     outcome.counter_view,
                     registry=ctx.registry,
-                    admitted_provider=instance.provider,
+                    admitted_provider=instance._provider,
                     expected_backend_kind=expected_backend,
                     expected_device_id=int(shape.provider_device_id),
                 )
@@ -1215,7 +1271,7 @@ def materialize_region_instance(ctx: MaterializationContext) -> RegionInstance: 
             counter_lease = None
             try:
                 payload_lease = ctx.worker._import_region_part_lease(
-                    instance.worker_id,
+                    instance._first_hop_child_id,
                     instance._provider_resource_id,
                     payload_desc,
                     part=RegionPartKind.PAYLOAD,
@@ -1232,7 +1288,7 @@ def materialize_region_instance(ctx: MaterializationContext) -> RegionInstance: 
                 )
                 payload_lease = None
                 counter_lease = ctx.worker._import_region_part_lease(
-                    instance.worker_id,
+                    instance._first_hop_child_id,
                     instance._provider_resource_id,
                     counter_desc,
                     part=RegionPartKind.COUNTER,
@@ -1270,14 +1326,14 @@ def materialize_region_instance(ctx: MaterializationContext) -> RegionInstance: 
             instance._payload_part = PayloadPart(
                 RegionPartSpan(offset=0, nbytes=int(spec.payload.logical_bytes)),
                 _select_host_vmm_copy_access(
-                    ctx.plan.payload, instance.provider, instance.consumer, instance._payload_attachment
+                    ctx.plan.payload, instance._provider, instance._consumer, instance._payload_attachment
                 ),
                 on_issued_failure=instance._remember_data_plane_error,
             )
             instance._counter_part = CounterPart(
                 RegionPartSpan(offset=0, nbytes=int(spec.counter.logical_bytes)),
                 _select_host_vmm_copy_access(
-                    ctx.plan.counter, instance.provider, instance.consumer, instance._counter_attachment
+                    ctx.plan.counter, instance._provider, instance._consumer, instance._counter_attachment
                 ),
                 on_issued_failure=instance._remember_data_plane_error,
             )
@@ -1521,3 +1577,14 @@ def _validate_consumer_attachment(attachment: MemberAttachmentPlan) -> None:
             RefusalReason.UNSUPPORTED_ATTACHMENT,
             "Host consumer attachment must use OWNER_DELEGATED_COPY/HOST_VMM_COPY",
         )
+
+
+__all__ = [
+    "MaterializationRefusal",
+    "NotifyOp",
+    "RefusalReason",
+    "RegionCounter",
+    "RegionInstance",
+    "SignalTestResult",
+    "WaitCmp",
+]

@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import Any, NoReturn, Protocol, TypeVar
 
+from .buffer import AccessMode, Buffer
 from .comm_endpoints import (
     BackendPlan,
     BackendResolver,
@@ -36,12 +37,12 @@ from .comm_region import (
     RefusalReason,
     RegionInstanceState,
     WaitCmp,
+    _session_instance_id_to_bits,
     materialize_region_instance,
     validate_single_owner_region_shape,
 )
 
 _UINT64_MAX = (1 << 64) - 1
-_SESSION_INSTANCE_ID_BYTES = 8
 
 _SPSC_QUEUE_MAGIC = 0x53505351
 _SPSC_QUEUE_ABI_MAJOR = 1
@@ -62,7 +63,6 @@ _SPSC_QUEUE_INITIATOR_ABORT_OFFSET = 256
 _SPSC_QUEUE_PEER_ABORT_OFFSET = 320
 
 _DESCRIPTOR_STRUCT = struct.Struct("<QQQQ")
-_SESSION_STRUCT = struct.Struct("<Q")
 
 _TProjected = TypeVar("_TProjected")
 
@@ -117,19 +117,6 @@ def _align_up_u64(value: int, align: int) -> int:
     return _checked_add_u64(value, bump)
 
 
-def session_instance_id_to_bits(session_instance_id: bytes) -> int:
-    if not isinstance(session_instance_id, (bytes, bytearray, memoryview)):
-        raise TypeError("session_instance_id must be 8 opaque bytes")
-    raw = bytes(session_instance_id)
-    if len(raw) != _SESSION_INSTANCE_ID_BYTES:
-        raise ValueError("session_instance_id must be 8 opaque bytes")
-    return int(_SESSION_STRUCT.unpack(raw)[0])
-
-
-def session_instance_id_from_bits(bits: object) -> bytes:
-    return _SESSION_STRUCT.pack(_require_exact_u64("session_instance_id_bits", bits))
-
-
 def encode_spsc_queue_descriptor(
     seq: object,
     opcode: object,
@@ -161,7 +148,7 @@ class _SpscQueueConfig:
 
 
 @dataclass(frozen=True)
-class _SpscQueueLayout:
+class SpscQueueLayout:
     depth: int
     input_arena_bytes: int
     output_arena_bytes: int
@@ -179,7 +166,7 @@ class _SpscQueueLayout:
     counter_bytes: int
 
     @classmethod
-    def create(cls, config: _SpscQueueConfig) -> _SpscQueueLayout:
+    def create(cls, config: _SpscQueueConfig) -> SpscQueueLayout:
         depth = _require_exact_u64("depth", config.depth)
         input_arena_bytes = _require_exact_u64("input_arena_bytes", config.input_arena_bytes)
         output_arena_bytes = _require_exact_u64("output_arena_bytes", config.output_arena_bytes)
@@ -224,7 +211,7 @@ class _SpscQueueLayout:
 
 
 @dataclass(frozen=True)
-class SpscQueueEndpointBinding:
+class _SpscQueueEndpointBinding:
     magic_version: int
     session_instance_id_bits: int
     transaction_id: int
@@ -273,7 +260,7 @@ class SpscQueueEndpointBinding:
         )
 
     @classmethod
-    def from_scalars(cls, scalars: Sequence[object]) -> SpscQueueEndpointBinding:
+    def from_scalars(cls, scalars: Sequence[object]) -> _SpscQueueEndpointBinding:
         try:
             count = len(scalars)
         except TypeError as exc:
@@ -429,7 +416,7 @@ class _SpscQueueTemplate:
     def plan(self, config: object) -> _SpscQueuePlan:
         if not isinstance(config, _SpscQueueConfig):
             raise TypeError("SPSC queue template.plan requires _SpscQueueConfig")
-        layout = _SpscQueueLayout.create(config)
+        layout = SpscQueueLayout.create(config)
         return _SpscQueuePlan(
             config=config,
             layout=layout,
@@ -438,7 +425,7 @@ class _SpscQueueTemplate:
 
 
 class _SpscQueuePlan:
-    def __init__(self, config: _SpscQueueConfig, layout: _SpscQueueLayout, region_layout: RegionLayoutSpec) -> None:
+    def __init__(self, config: _SpscQueueConfig, layout: SpscQueueLayout, region_layout: RegionLayoutSpec) -> None:
         self._config = config
         self._layout = layout
         self._region_layout = region_layout
@@ -461,7 +448,7 @@ class _SpscQueuePlan:
                 raise RuntimeError("queue plan bind token is already consumed")
             self._state = _SpscQueuePlanState.CONSUMED
 
-    def _bind(self, instance: object, slots: _ResolvedTemplateSlots) -> _BoundSpscQueue:
+    def _bind(self, instance: object, slots: _ResolvedTemplateSlots) -> SpscQueue:
         self._consume_for_bind()
         if instance.state is not RegionInstanceState.LIVE:
             raise ValueError("queue bind requires a LIVE region instance")
@@ -471,12 +458,12 @@ class _SpscQueuePlan:
         if int(layout.counter_bytes) != int(self._layout.counter_bytes):
             raise ValueError("region counter_bytes do not match the queue plan")
         initiator, peer = _require_distinct_initiator_peer(slots)
-        if instance.consumer.identity != initiator.identity:
+        if instance._consumer.identity != initiator.identity:
             raise ValueError("INITIATOR slot does not match the materialized consumer access endpoint")
-        if instance.provider.identity != peer.identity:
+        if instance._provider.identity != peer.identity:
             raise ValueError("PEER slot does not match the materialized provider-local view endpoint")
-        payload_view = instance.local_view(RegionPartKind.PAYLOAD)
-        counter_view = instance.local_view(RegionPartKind.COUNTER)
+        payload_view = instance._local_view(RegionPartKind.PAYLOAD)
+        counter_view = instance._local_view(RegionPartKind.COUNTER)
         if payload_view is None or counter_view is None:
             raise ValueError("queue bind requires PAYLOAD and COUNTER local views")
         validate_independent_local_views(payload_view, counter_view)
@@ -485,9 +472,9 @@ class _SpscQueuePlan:
         if int(counter_view.logical_bytes) != int(self._layout.counter_bytes):
             raise ValueError("COUNTER local view does not match the queue plan")
         session, transaction_id = instance._allocation_identity
-        binding = SpscQueueEndpointBinding(
+        binding = _SpscQueueEndpointBinding(
             magic_version=_SPSC_QUEUE_MAGIC_VERSION,
-            session_instance_id_bits=session_instance_id_to_bits(session),
+            session_instance_id_bits=_session_instance_id_to_bits(session),
             transaction_id=int(transaction_id),
             payload_base=int(payload_view.local_base),
             payload_bytes=int(payload_view.logical_bytes),
@@ -497,7 +484,7 @@ class _SpscQueuePlan:
             input_arena_bytes=int(self._layout.input_arena_bytes),
             output_arena_bytes=int(self._layout.output_arena_bytes),
         )
-        return _BoundSpscQueue(instance, self._layout, binding)
+        return SpscQueue(instance, self._layout, binding)
 
     def __copy__(self) -> _SpscQueuePlan:
         _reject_copy(self)
@@ -602,14 +589,60 @@ class _RegionTemplateCoordinator:
                 pass
 
 
-def _return_spsc_queue(bound: object) -> _BoundSpscQueue:
-    if not isinstance(bound, _BoundSpscQueue):
+def _admit_bytes_like(obj: object, nbytes: int, *, writable: bool) -> object:
+    try:
+        view = memoryview(obj)
+    except TypeError as exc:
+        raise ValueError("SPSC queue requires a registered HOST Buffer or contiguous host buffer") from exc
+    if not view.c_contiguous:
+        raise ValueError("SPSC queue ordinary host buffer must be C-contiguous")
+    if writable and view.readonly:
+        raise ValueError("SPSC queue output target must be writable")
+    if int(view.nbytes) < int(nbytes):
+        raise ValueError(f"SPSC queue nbytes={int(nbytes)} exceeds ordinary host buffer size {int(view.nbytes)}")
+    return obj
+
+
+def _admit_registered_buffer(worker: object, obj: Buffer, nbytes: int, *, writable: bool) -> Buffer:
+    if obj.closed:
+        raise ValueError("SPSC queue buffer is closed")
+    worker._validate_region_host_buffer(obj)
+    needed = AccessMode.WRITE if writable else AccessMode.READ
+    if obj.access not in (needed, AccessMode.READWRITE):
+        raise ValueError(f"SPSC queue buffer grants {obj.access.name} but this direction needs {needed.name}")
+    if int(obj.nbytes) < int(nbytes):
+        raise ValueError(f"SPSC queue nbytes={int(nbytes)} exceeds registered buffer size {int(obj.nbytes)}")
+    return obj
+
+
+def _admit_spsc_payload(
+    instance: object, obj: object, nbytes: int, *, writable: bool, allow_none: bool
+) -> object:
+    if int(nbytes) == 0 and allow_none:
+        if obj is not None:
+            raise ValueError("SPSC queue zero-byte payload requires buffer == None")
+        return None
+    if obj is None:
+        raise ValueError("SPSC queue nonzero payload requires a host buffer")
+    if isinstance(obj, Buffer):
+        return _admit_registered_buffer(instance._worker, obj, nbytes, writable=writable)
+    return _admit_bytes_like(obj, nbytes, writable=writable)
+
+
+def _admit_spsc_payload_kind(instance: object, obj: object, *, writable: bool) -> None:
+    if obj is None:
+        return
+    _admit_spsc_payload(instance, obj, 0, writable=writable, allow_none=False)
+
+
+def _return_spsc_queue(bound: object) -> SpscQueue:
+    if not isinstance(bound, SpscQueue):
         raise TypeError("SPSC queue creation returned an unexpected object")
     return bound
 
 
 @dataclass(frozen=True)
-class _SpscQueueMessage:
+class SpscQueueMessage:
     seq: int
     opcode: SpscQueueOpcode
     payload_offset: int
@@ -617,8 +650,8 @@ class _SpscQueueMessage:
     _owner_token: object | None = field(default=None, repr=False, compare=False)
 
 
-class _BoundSpscQueue:
-    def __init__(self, instance: object, layout: _SpscQueueLayout, binding: SpscQueueEndpointBinding) -> None:
+class SpscQueue:
+    def __init__(self, instance: object, layout: SpscQueueLayout, binding: _SpscQueueEndpointBinding) -> None:
         self._instance = instance
         self._layout = layout
         self._endpoint_binding = binding
@@ -633,7 +666,7 @@ class _BoundSpscQueue:
         self._output_head = 0
         self._output_tail = 0
         self._output_payload_head = 0
-        self._output_active: _SpscQueueMessage | None = None
+        self._output_active: SpscQueueMessage | None = None
         self._desc_fields = bytearray(24)
         self._desc_seq = bytearray(8)
         self._desc_read = bytearray(_SPSC_QUEUE_DESCRIPTOR_BYTES)
@@ -641,12 +674,12 @@ class _BoundSpscQueue:
         self.output = _SpscQueueInitiatorOutput(self)
 
     @property
-    def layout(self) -> _SpscQueueLayout:
+    def layout(self) -> SpscQueueLayout:
         return self._layout
 
-    @property
-    def endpoint_binding(self) -> SpscQueueEndpointBinding:
-        return self._endpoint_binding
+    def peer_task_arg_scalars(self) -> list[int]:
+        self._ensure_usable()
+        return list(self._endpoint_binding.to_scalars())
 
     def try_request_stop(self) -> bool:
         return self.input._try_enqueue(None, 0, SpscQueueOpcode.STOP)
@@ -762,7 +795,7 @@ class _BoundSpscQueue:
         self._run_primitive(self._instance.payload_write, offset + 8, self._desc_fields, 24)
         self._run_primitive(self._instance.payload_write, offset, self._desc_seq, 8)
 
-    def _read_descriptor(self, offset: int) -> _SpscQueueMessage:
+    def _read_descriptor(self, offset: int) -> SpscQueueMessage:
         self._run_primitive(self._instance.payload_read, offset, self._desc_read, _SPSC_QUEUE_DESCRIPTOR_BYTES)
         seq, opcode_value, payload_offset, payload_nbytes = decode_spsc_queue_descriptor(bytes(self._desc_read))
         try:
@@ -771,7 +804,7 @@ class _BoundSpscQueue:
             error = RuntimeError("SPSC queue observed invalid descriptor opcode")
             self._poison_local(error)
             raise error from None
-        return _SpscQueueMessage(
+        return SpscQueueMessage(
             seq=int(seq),
             opcode=opcode,
             payload_offset=int(payload_offset),
@@ -829,10 +862,10 @@ class _BoundSpscQueue:
             return None
         return expected_offset, next_payload_tail
 
-    def __copy__(self) -> _BoundSpscQueue:
+    def __copy__(self) -> SpscQueue:
         _reject_copy(self)
 
-    def __deepcopy__(self, memo: dict[int, object]) -> _BoundSpscQueue:
+    def __deepcopy__(self, memo: dict[int, object]) -> SpscQueue:
         _reject_copy(self)
 
     def __reduce__(self) -> tuple[object, ...]:
@@ -843,14 +876,24 @@ class _BoundSpscQueue:
 
 
 class _SpscQueueInitiatorInput:
-    def __init__(self, queue: _BoundSpscQueue) -> None:
+    def __init__(self, queue: SpscQueue) -> None:
         self._queue = queue
 
     def try_enqueue(self, buffer_or_none: object, nbytes: int) -> bool:
-        return self._try_enqueue(buffer_or_none, nbytes, SpscQueueOpcode.DATA)
+        queue = self._queue
+        queue._ensure_usable()
+        admitted = _admit_spsc_payload(
+            queue._instance, buffer_or_none, int(nbytes), writable=False, allow_none=True
+        )
+        return self._try_enqueue(admitted, nbytes, SpscQueueOpcode.DATA)
 
     def enqueue(self, buffer_or_none: object, nbytes: int, timeout: float) -> None:
-        self._enqueue(buffer_or_none, nbytes, SpscQueueOpcode.DATA, timeout)
+        queue = self._queue
+        queue._ensure_usable()
+        admitted = _admit_spsc_payload(
+            queue._instance, buffer_or_none, int(nbytes), writable=False, allow_none=True
+        )
+        self._enqueue(admitted, nbytes, SpscQueueOpcode.DATA, timeout)
 
     def _enqueue(self, buffer_or_none: object, nbytes: int, opcode: SpscQueueOpcode, timeout: float) -> None:
         nbytes = int(nbytes)
@@ -932,10 +975,10 @@ class _SpscQueueInitiatorInput:
 
 
 class _SpscQueueInitiatorOutput:
-    def __init__(self, queue: _BoundSpscQueue) -> None:
+    def __init__(self, queue: SpscQueue) -> None:
         self._queue = queue
 
-    def try_peek(self) -> _SpscQueueMessage | None:
+    def try_peek(self) -> SpscQueueMessage | None:
         queue = self._queue
         queue._ensure_usable()
         queue._sample_peer_abort()
@@ -974,7 +1017,7 @@ class _SpscQueueInitiatorOutput:
                 queue._layout.output_arena_offset,
                 queue._layout.output_arena_bytes,
             )
-        owned = _SpscQueueMessage(
+        owned = SpscQueueMessage(
             seq=message.seq,
             opcode=message.opcode,
             payload_offset=message.payload_offset,
@@ -984,7 +1027,7 @@ class _SpscQueueInitiatorOutput:
         queue._output_active = owned
         return owned
 
-    def peek(self, timeout: float) -> _SpscQueueMessage:
+    def peek(self, timeout: float) -> SpscQueueMessage:
         queue = self._queue
         deadline_ns = queue._blocking_deadline(timeout)
         while True:
@@ -993,20 +1036,18 @@ class _SpscQueueInitiatorOutput:
                 return message
             queue._wait_progress(queue._layout.output_desc_tail_offset, queue._output_tail, deadline_ns)
 
-    def read_into(self, handle: _SpscQueueMessage, buffer: object) -> None:
+    def read_into(self, handle: SpscQueueMessage, buffer: object) -> None:
         queue = self._queue
         queue._ensure_usable()
         self._require_active_handle(handle, ownership_violation=True)
-        if handle.payload_nbytes == 0:
-            if buffer is not None:
-                raise ValueError("SPSC queue zero-byte output read requires buffer == None")
+        admitted = _admit_spsc_payload(
+            queue._instance, buffer, int(handle.payload_nbytes), writable=True, allow_none=True
+        )
+        if int(handle.payload_nbytes) == 0:
             return
-        if buffer is None:
-            raise ValueError("SPSC queue nonzero output read requires a writable host buffer")
-        self._require_read_destination(buffer, handle.payload_nbytes)
-        queue._run_primitive(queue._instance.payload_read, handle.payload_offset, buffer, handle.payload_nbytes)
+        queue._run_primitive(queue._instance.payload_read, handle.payload_offset, admitted, handle.payload_nbytes)
 
-    def release(self, handle: _SpscQueueMessage) -> None:
+    def release(self, handle: SpscQueueMessage) -> None:
         queue = self._queue
         queue._ensure_usable()
         self._require_active_handle(handle, ownership_violation=True)
@@ -1021,13 +1062,19 @@ class _SpscQueueInitiatorOutput:
         queue._output_active = None
         queue._signal_notify(queue._layout.output_desc_head_offset, queue._output_head)
 
-    def dequeue_into(self, buffer: object, timeout: float) -> _SpscQueueMessage:
+    def dequeue_into(self, buffer: object, timeout: float) -> SpscQueueMessage:
+        queue = self._queue
+        queue._ensure_usable()
+        _admit_spsc_payload_kind(queue._instance, buffer, writable=True)
         handle = self.peek(timeout)
         self.read_into(handle, buffer)
         self.release(handle)
         return handle
 
-    def try_dequeue_into(self, buffer: object) -> _SpscQueueMessage | None:
+    def try_dequeue_into(self, buffer: object) -> SpscQueueMessage | None:
+        queue = self._queue
+        queue._ensure_usable()
+        _admit_spsc_payload_kind(queue._instance, buffer, writable=True)
         handle = self.try_peek()
         if handle is None:
             return None
@@ -1035,7 +1082,7 @@ class _SpscQueueInitiatorOutput:
         self.release(handle)
         return handle
 
-    def _require_active_handle(self, handle: _SpscQueueMessage, *, ownership_violation: bool) -> None:
+    def _require_active_handle(self, handle: SpscQueueMessage, *, ownership_violation: bool) -> None:
         queue = self._queue
         active = queue._output_active
         if (
@@ -1070,3 +1117,11 @@ class _SpscQueueInitiatorOutput:
             raise ValueError("SPSC queue output target must be a writable ordinary host buffer")
         if int(view.nbytes) < int(nbytes):
             raise ValueError(f"SPSC queue nbytes={nbytes} exceeds ordinary host buffer size {int(view.nbytes)}")
+
+
+__all__ = [
+    "SpscQueue",
+    "SpscQueueLayout",
+    "SpscQueueMessage",
+    "SpscQueueOpcode",
+]

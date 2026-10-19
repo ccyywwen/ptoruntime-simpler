@@ -14,11 +14,11 @@ import os
 import struct
 from typing import Any
 
-from simpler.comm_region_template import SpscQueueEndpointBinding, _BoundSpscQueue
+from simpler import comm_endpoints as ce
+from simpler.comm_region_template import SpscQueue, SpscQueueOpcode, _SpscQueueEndpointBinding
 from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import CallConfig, ChipCallable, CoreCallable, TaskArgs
 from simpler.worker import Worker, attach_exception_note
-from simpler.worker_chip_message_queue import WorkerChipQueue, WorkerChipQueueOpcode
 
 from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
@@ -126,39 +126,41 @@ def make_l3_worker(platform: str, device_id: int) -> tuple[Worker, Any]:
         raise
 
 
-def create_queue(orch_handle) -> WorkerChipQueue:
-    queue = orch_handle.create_worker_chip_queue(
-        worker_id=0,
+def create_queue(orch_handle) -> SpscQueue:
+    host = ce.at("L3", ce.HOST_CPU)
+    device = ce.at("L3/L2[0]", ce.DEVICE_AICPU)
+    queue = orch_handle.create_spsc_queue(
+        initiator=host,
+        peer=device,
         depth=_QUEUE_DEPTH,
         input_arena_bytes=_INPUT_ARENA_BYTES,
         output_arena_bytes=_OUTPUT_ARENA_BYTES,
     )
-    assert isinstance(queue, WorkerChipQueue)
-    assert isinstance(queue._bound, _BoundSpscQueue)
+    assert isinstance(queue, SpscQueue)
     assert queue.layout.depth == _QUEUE_DEPTH
     assert queue.layout.input_arena_bytes == _INPUT_ARENA_BYTES
     assert queue.layout.output_arena_bytes == _OUTPUT_ARENA_BYTES
     assert queue.layout.input_arena_bytes != queue.layout.output_arena_bytes
-    scalars = queue.chip_task_arg_scalars()
+    scalars = queue.peer_task_arg_scalars()
     assert len(scalars) == 10
-    binding = SpscQueueEndpointBinding.from_scalars(scalars)
+    binding = _SpscQueueEndpointBinding.from_scalars(scalars)
     assert list(binding.to_scalars()) == scalars
     assert binding.transaction_id != 0
     return queue
 
 
-def submit_queue(orch_handle, chip_handle, queue: WorkerChipQueue, cfg) -> None:
+def submit_queue(orch_handle, chip_handle, queue: SpscQueue, cfg) -> None:
     task_args = TaskArgs()
-    for scalar in queue.chip_task_arg_scalars():
+    for scalar in queue.peer_task_arg_scalars():
         task_args.add_scalar(int(scalar))
     orch_handle.submit_next_level(chip_handle, task_args, cfg, worker=0)
 
 
-def enqueue_bytes(queue: WorkerChipQueue, payload: bytes) -> None:
+def enqueue_bytes(queue: SpscQueue, payload: bytes) -> None:
     queue.input.enqueue(payload, nbytes=len(payload), timeout=_TIMEOUT_S)
 
 
-def drain_message(queue: WorkerChipQueue) -> tuple[WorkerChipQueueOpcode, bytes, int]:
+def drain_message(queue: SpscQueue) -> tuple[SpscQueueOpcode, bytes, int]:
     message = queue.output.peek(timeout=_TIMEOUT_S)
     payload = _read_payload(queue, message)
     offset = int(message.payload_offset)
@@ -167,7 +169,7 @@ def drain_message(queue: WorkerChipQueue) -> tuple[WorkerChipQueueOpcode, bytes,
     return opcode, payload, offset
 
 
-def _read_payload(queue: WorkerChipQueue, message) -> bytes:
+def _read_payload(queue: SpscQueue, message) -> bytes:
     if message.payload_nbytes == 0:
         queue.output.read_into(message, None)
         return b""

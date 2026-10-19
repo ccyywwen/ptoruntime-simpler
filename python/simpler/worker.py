@@ -180,7 +180,6 @@ from .comm_provider import (
     ProviderReleaseResult,
     ProviderReleaseStatus,
     RegionAllocationContext,
-    RegionAllocationSpec,
     RegionControlError,
     RegionControlErrorKind,
     RegionEnvironmentKind,
@@ -217,7 +216,6 @@ from .comm_region import (
     RegionInstanceState,
     _require_region_size,
     materialize_region_instance,
-    project_region_allocation_spec,
     validate_single_owner_region_shape,
 )
 from .global_comm_domain import (
@@ -317,10 +315,6 @@ from .teardown_report import (
     TeardownReport,
     decode_teardown_report,
     encode_teardown_report_payload,
-)
-from .worker_chip_orch_comm import (
-    WorkerChipOrchRegion,
-    worker_chip_orch_region_desc_from_local_views,
 )
 from .worker_level import WorkerLevel
 from .worker_level import span_prefix as _span_prefix
@@ -4864,7 +4858,7 @@ class _RunResources:
     pending_release_domains: list[CommDomainHandle] = field(default_factory=list)
     live_global_domains: dict[str, GlobalCommDomainHandle] = field(default_factory=dict)
     pending_release_global_domains: list[GlobalCommDomainHandle] = field(default_factory=list)
-    worker_chip_orch_comm_host_buffers: dict[int, int] = field(default_factory=dict)
+    region_host_buffers: dict[int, int] = field(default_factory=dict)
     # Every Buffer identity a NEXT_LEVEL dispatch (submit_next_level / _group) sent as a Tensor
     # arg during this run. release_buffer() checks this set across every not-yet-settled run before
     # releasing, so a Buffer never goes away while a dispatched task still names it.
@@ -5818,7 +5812,7 @@ class Worker:
         self._region_access_service: RegionAccessService | None = None
 
         self._region_instance_registry = RegionInstanceRegistry()
-        self._worker_chip_orch_comm_host_buffers: dict[int, int] = {}
+        self._region_host_buffers: dict[int, int] = {}
 
         self._init_device_allocation_tables()
 
@@ -7701,29 +7695,6 @@ class Worker:
             return materialize_region_instance(
                 MaterializationContext(worker=self, registry=registry, plan=plan, layout=layout_summary)
             )
-
-    def _admitted_worker_chip_region_context(
-        self, worker_id: int, payload_bytes: int, counter_bytes: int
-    ) -> MaterializationContext:
-        worker_id = int(worker_id)
-        root_path = _format_worker_path(int(self.level))
-        provider_path = _format_worker_path(2, parent_path=root_path, index=worker_id)
-        provider = at(provider_path, DEVICE_AICPU)
-        layout = RegionLayoutSpec(payload_bytes=int(payload_bytes), counter_bytes=int(counter_bytes))
-        members = (at(root_path, HOST_CPU), provider)
-        topology = SingleOwner(provider=provider)
-        registry = self._get_endpoint_registry()
-        resolved = registry.resolve_region_spec(members, topology)
-        plan = BackendResolver(registry, self._get_region_access_service()).plan(resolved, layout)
-        ctx = MaterializationContext(worker=self, registry=registry, plan=plan, layout=layout)
-        validate_single_owner_region_shape(ctx)
-        return ctx
-
-    def _project_admitted_worker_chip_region_spec(
-        self, worker_id: int, payload_bytes: int, counter_bytes: int
-    ) -> RegionAllocationSpec:
-        ctx = self._admitted_worker_chip_region_context(int(worker_id), int(payload_bytes), int(counter_bytes))
-        return project_region_allocation_spec(ctx.plan, ctx.layout)
 
     def _register_into_snapshot_or_wait(self, reg: _CallableRegistration) -> CallableHandle | None:
         """Linearize a level>=3 register against the startup epoch.
@@ -9712,15 +9683,6 @@ class Worker:
         """
         return dict(self._live_domains)
 
-    def _validate_worker_chip_id(self, worker_id: int) -> None:
-        if self.level < 3:
-            raise RuntimeError("create_worker_chip_region requires a hierarchical Worker")
-        if self._worker is None:
-            raise RuntimeError("create_worker_chip_region requires Worker.init()")
-        device_ids = self._config.get("device_ids", [])
-        if worker_id < 0 or worker_id >= len(device_ids):
-            raise ValueError(f"create_worker_chip_region: worker_id {worker_id} outside [0, {len(device_ids)})")
-
     def _poison_spsc_queue_from_endpoint_error(
         self, exc: BaseException, resources: _RunResources | None = None
     ) -> bool:
@@ -9782,7 +9744,7 @@ class Worker:
         )
         return True
 
-    def _register_worker_chip_orch_comm_host_buffer(self, handle) -> None:
+    def _register_region_host_buffer(self, handle) -> None:
         if not isinstance(handle, Buffer):
             raise TypeError("L3-L2 host buffer registration expects a Buffer")
         if handle.address_space != AddressSpace.HOST:
@@ -9793,16 +9755,16 @@ class Worker:
             return
         resources = self._building_run_resources
         buffers = (
-            self._worker_chip_orch_comm_host_buffers
+            self._region_host_buffers
             if resources is None
-            else resources.worker_chip_orch_comm_host_buffers
+            else resources.region_host_buffers
         )
         buffers[base] = max(
             int(buffers.get(base, 0)),
             nbytes,
         )
 
-    def _validate_worker_chip_orch_comm_host_buffer(self, handle) -> None:
+    def _validate_region_host_buffer(self, handle) -> None:
         if not isinstance(handle, Buffer):
             raise ValueError("L3-L2 payload buffer must be a Buffer returned by orch.alloc(...)")
         if handle.address_space != AddressSpace.HOST:
@@ -9813,9 +9775,9 @@ class Worker:
             raise ValueError("L3-L2 payload buffer must have a nonzero address and size")
         resources = self._building_run_resources
         buffers = (
-            self._worker_chip_orch_comm_host_buffers
+            self._region_host_buffers
             if resources is None
-            else resources.worker_chip_orch_comm_host_buffers
+            else resources.region_host_buffers
         )
         registered_nbytes = buffers.get(base)
         if registered_nbytes is None:
@@ -9943,60 +9905,6 @@ class Worker:
             worker_id=int(worker_id),
             expected_device_id=expected_device_id,
         )
-
-    def _create_worker_chip_region(self, worker_id: int, payload_bytes: int, counter_bytes: int):
-        if payload_bytes <= 0:
-            raise ValueError("create_worker_chip_region: payload_bytes must be positive")
-        if counter_bytes <= 0 or counter_bytes % 4 != 0:
-            raise ValueError("create_worker_chip_region: counter_bytes must be positive and a multiple of 4")
-        self._validate_worker_chip_id(int(worker_id))
-        resources = self._building_run_resources
-        instance: RegionInstance | None = None
-        region = None
-        required_ordered_cleanup_before = resources.requires_ordered_cleanup if resources is not None else False
-        try:
-            root_path = _format_worker_path(int(self.level))
-            provider_path = _format_worker_path(2, parent_path=root_path, index=int(worker_id))
-            provider = at(provider_path, DEVICE_AICPU)
-            layout = RegionLayoutSpec(payload_bytes=int(payload_bytes), counter_bytes=int(counter_bytes))
-            members = (at(root_path, HOST_CPU), provider)
-            topology = SingleOwner(provider=provider)
-            instance = self._materialize_region_instance(members, topology, layout)
-            payload_view = instance.local_view(RegionPartKind.PAYLOAD)
-            counter_view = instance.local_view(RegionPartKind.COUNTER)
-            if payload_view is None or counter_view is None:
-                raise RuntimeError("create_worker_chip_region: materialized instance is missing local views")
-            desc = worker_chip_orch_region_desc_from_local_views(
-                instance.provider_resource_id, payload_view, counter_view
-            )
-            region = WorkerChipOrchRegion(self, instance, desc)
-            if resources is not None:
-                resources.requires_ordered_cleanup = True
-            return region
-        except BaseException:
-            if resources is not None:
-                resources.requires_ordered_cleanup = required_ordered_cleanup_before
-            if instance is not None and instance._state is RegionInstanceState.LIVE and not instance._close_attempted:
-                try:
-                    self._region_instance_registry.close(instance)
-                except BaseException as close_exc:  # noqa: BLE001
-                    raise self._record_unreclaimable(
-                        f"create_worker_chip_region: rollback could not close the L3 Host mapping for region "
-                        f"{int(instance.provider_resource_id)} on worker {int(worker_id)}; "
-                        "it is leaked and no further work is admitted",
-                        close_exc,
-                    )
-            deferred_native_cleanup_error = self._consume_worker_host_mapped_cleanup_error(
-                "create_worker_chip_region rollback"
-            )
-            if deferred_native_cleanup_error is not None:
-                region_id = int(instance.provider_resource_id) if instance is not None else 0
-                raise self._record_unreclaimable(
-                    f"create_worker_chip_region: rollback could not close the L3 Host mapping for region "
-                    f"{region_id} on worker {int(worker_id)}; it is leaked and no further work is admitted",
-                    deferred_native_cleanup_error.__cause__ or deferred_native_cleanup_error,
-                )
-            raise
 
     def _create_region(
         self,
@@ -10224,7 +10132,7 @@ class Worker:
         return result if result is not None else outcome
 
     def _close_worker_chip_orch_comm(self) -> None:
-        self._worker_chip_orch_comm_host_buffers.clear()
+        self._region_host_buffers.clear()
         self._region_instance_registry.sweep()
 
     # ------------------------------------------------------------------
@@ -13557,7 +13465,7 @@ class Worker:
                     ("remote_slot_refs", lambda: self._release_active_remote_slot_refs(resources)),
                     ("remote_frees", self._flush_pending_remote_frees),
                     ("region_instances", lambda: self._region_instance_registry.cleanup_run(resources)),
-                    ("worker_chip_host_buffers", resources.worker_chip_orch_comm_host_buffers.clear),
+                    ("worker_chip_host_buffers", resources.region_host_buffers.clear),
                     (
                         "pending_global_domains",
                         lambda: self._execute_pending_global_domain_releases(resources),
