@@ -21,17 +21,12 @@ from typing import Any
 
 from _task_interface import _worker_host_mapped_region_close  # pyright: ignore[reportMissingImports]
 from simpler import comm_provider
-from simpler.comm_endpoints import DEVICE_AICPU, HOST_CPU, RegionLayoutSpec, SingleOwner, at
+from simpler.comm_endpoints import DEVICE_AICPU, HOST_CPU, SingleOwner, at
 from simpler.comm_provider import ProviderRegionStore, RegionPartKind
+from simpler.comm_region import NotifyOp, WaitCmp
 from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import CallConfig, ChipCallable, CoreCallable, DataType, TaskArgs
 from simpler.worker import Worker, attach_exception_note
-from simpler.worker_chip_orch_comm import (
-    NotifyOp,
-    WaitCmp,
-    WorkerChipOrchRegion,
-    worker_chip_orch_region_desc_from_local_views,
-)
 
 from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
@@ -181,7 +176,7 @@ def _install_release_probe(worker: Worker) -> list[dict[str, object]]:
 
 
 def _assert_delegated_live_region(region, provider_path: bytes, transaction_id: int) -> None:
-    instance = region._instance
+    instance = region
     assert instance._delegated_release_edge is True
     assert instance._delegated_allocation_committed is True
     assert instance._delegated_provider_path == provider_path
@@ -204,25 +199,15 @@ def _assert_clean_session(worker: Worker, *, next_transaction_id: int, releases:
 
 def create_live_region(orch_handle, provider_path: str):
     worker = orch_handle._worker
-    if int(worker.level) == 3:
-        return orch_handle.create_worker_chip_region(
-            worker_id=0,
-            payload_bytes=_PAYLOAD_BYTES,
-            counter_bytes=_COUNTER_BYTES,
-        )
     root_path = f"L{int(worker.level)}"
+    host = at(root_path, HOST_CPU)
     provider = at(str(provider_path), DEVICE_AICPU)
-    instance = worker._materialize_region_instance(
-        (at(root_path, HOST_CPU), provider),
-        SingleOwner(provider=provider),
-        RegionLayoutSpec(payload_bytes=_PAYLOAD_BYTES, counter_bytes=_COUNTER_BYTES),
+    return orch_handle.create_region(
+        members=(host, provider),
+        topology=SingleOwner(provider=provider),
+        payload_bytes=_PAYLOAD_BYTES,
+        counter_bytes=_COUNTER_BYTES,
     )
-    payload_view = instance.local_view(RegionPartKind.PAYLOAD)
-    counter_view = instance.local_view(RegionPartKind.COUNTER)
-    if payload_view is None or counter_view is None:
-        raise RuntimeError("materialized instance is missing local views")
-    desc = worker_chip_orch_region_desc_from_local_views(instance.provider_resource_id, payload_view, counter_view)
-    return WorkerChipOrchRegion(worker, instance, desc)
 
 
 def run_two_lifecycles(
@@ -237,9 +222,8 @@ def run_two_lifecycles(
     releases = _install_release_probe(worker)
 
     def orch(orch_handle, _args, cfg):
-        assert not hasattr(orch_handle, "create_region")
         region = create_live_region(orch_handle, provider_path)
-        transaction_id = int(region._instance._delegated_transaction_id)
+        transaction_id = int(region._delegated_transaction_id)
         seen.append(transaction_id)
         _assert_delegated_live_region(region, path, transaction_id)
         submit_chip(orch_handle, region, cfg)

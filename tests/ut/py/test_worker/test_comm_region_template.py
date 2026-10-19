@@ -40,6 +40,12 @@ from simpler.comm_region import (
     SignalTestResult,
     WaitCmp,
 )
+from simpler.comm_region import (
+    _session_instance_id_from_bits as session_instance_id_from_bits,
+)
+from simpler.comm_region import (
+    _session_instance_id_to_bits as session_instance_id_to_bits,
+)
 from simpler.comm_region_template import (
     _SPSC_QUEUE_ABI_MAJOR,
     _SPSC_QUEUE_ABI_MINOR,
@@ -57,10 +63,11 @@ from simpler.comm_region_template import (
     _SPSC_QUEUE_OUTPUT_DESC_HEAD_OFFSET,
     _SPSC_QUEUE_OUTPUT_DESC_TAIL_OFFSET,
     _SPSC_QUEUE_PEER_ABORT_OFFSET,
-    SpscQueueEndpointBinding,
+    SpscQueue,
+    SpscQueueLayout,
+    SpscQueueMessage,
     SpscQueueOpcode,
     _align_up_u64,
-    _BoundSpscQueue,
     _checked_add_u64,
     _checked_mul_u64,
     _counter_low32,
@@ -70,8 +77,7 @@ from simpler.comm_region_template import (
     _require_distinct_initiator_peer,
     _resolve_template_slots,
     _SpscQueueConfig,
-    _SpscQueueLayout,
-    _SpscQueueMessage,
+    _SpscQueueEndpointBinding,
     _SpscQueuePlan,
     _SpscQueuePlanState,
     _SpscQueueSlot,
@@ -80,8 +86,6 @@ from simpler.comm_region_template import (
     _TemplateSlotBindingRequest,
     decode_spsc_queue_descriptor,
     encode_spsc_queue_descriptor,
-    session_instance_id_from_bits,
-    session_instance_id_to_bits,
 )
 from simpler.worker import Worker, _Lifecycle
 
@@ -155,7 +159,7 @@ _BINDING_GOLDEN: tuple[int, ...] = (
 
 
 def _layout(depth, input_arena_bytes, output_arena_bytes):
-    return _SpscQueueLayout.create(
+    return SpscQueueLayout.create(
         _SpscQueueConfig(depth=depth, input_arena_bytes=input_arena_bytes, output_arena_bytes=output_arena_bytes)
     )
 
@@ -215,8 +219,8 @@ def test_layout_max_depth_golden_vector():
 
 def test_layout_is_deterministic_and_has_no_runtime_side_effect():
     config = _SpscQueueConfig(depth=4, input_arena_bytes=128, output_arena_bytes=192)
-    first = _SpscQueueLayout.create(config)
-    second = _SpscQueueLayout.create(config)
+    first = SpscQueueLayout.create(config)
+    second = SpscQueueLayout.create(config)
     assert first == second
     assert copy.copy(first) == first
 
@@ -302,12 +306,12 @@ def test_session_identity_little_endian_round_trip():
 
 
 def test_binding_exact_10_scalar_golden_vector():
-    binding = SpscQueueEndpointBinding(*_BINDING_GOLDEN)
+    binding = _SpscQueueEndpointBinding(*_BINDING_GOLDEN)
     scalars = binding.to_scalars()
     assert len(scalars) == 10
     assert scalars == _BINDING_GOLDEN
-    assert SpscQueueEndpointBinding.from_scalars(list(scalars)) == binding
-    assert SpscQueueEndpointBinding.from_scalars(scalars).to_scalars() == scalars
+    assert _SpscQueueEndpointBinding.from_scalars(list(scalars)) == binding
+    assert _SpscQueueEndpointBinding.from_scalars(scalars).to_scalars() == scalars
 
 
 @pytest.mark.parametrize(
@@ -320,44 +324,44 @@ def test_binding_exact_10_scalar_golden_vector():
 )
 def test_binding_rejects_non_exact_count(scalars):
     with pytest.raises(ValueError, match="exactly 10"):
-        SpscQueueEndpointBinding.from_scalars(scalars)
+        _SpscQueueEndpointBinding.from_scalars(scalars)
 
 
 def test_binding_rejects_bool_range_and_version_mismatch():
     with pytest.raises(TypeError):
-        SpscQueueEndpointBinding.from_scalars((True,) + _BINDING_GOLDEN[1:])
+        _SpscQueueEndpointBinding.from_scalars((True,) + _BINDING_GOLDEN[1:])
     negative = list(_BINDING_GOLDEN)
     negative[2] = -1
     with pytest.raises(ValueError):
-        SpscQueueEndpointBinding.from_scalars(negative)
+        _SpscQueueEndpointBinding.from_scalars(negative)
     over = list(_BINDING_GOLDEN)
     over[3] = 1 << 64
     with pytest.raises(ValueError):
-        SpscQueueEndpointBinding.from_scalars(over)
+        _SpscQueueEndpointBinding.from_scalars(over)
     wrong_magic = list(_BINDING_GOLDEN)
     wrong_magic[0] = 0x4C33513200010001
     with pytest.raises(ValueError, match="unsupported SPSQ version"):
-        SpscQueueEndpointBinding.from_scalars(wrong_magic)
+        _SpscQueueEndpointBinding.from_scalars(wrong_magic)
     wrong_major = list(_BINDING_GOLDEN)
     wrong_major[0] = (_SPSC_QUEUE_MAGIC << 32) | (2 << 16) | 0
     with pytest.raises(ValueError, match="unsupported SPSQ version"):
-        SpscQueueEndpointBinding.from_scalars(wrong_major)
+        _SpscQueueEndpointBinding.from_scalars(wrong_major)
     wrong_minor = list(_BINDING_GOLDEN)
     wrong_minor[0] = (_SPSC_QUEUE_MAGIC << 32) | (1 << 16) | 1
     with pytest.raises(ValueError, match="unsupported SPSQ version"):
-        SpscQueueEndpointBinding.from_scalars(wrong_minor)
+        _SpscQueueEndpointBinding.from_scalars(wrong_minor)
 
 
 def test_binding_rejects_zero_transaction_id_and_keeps_zero_session_bits():
     with pytest.raises(ValueError, match="nonzero"):
-        SpscQueueEndpointBinding(*(_BINDING_GOLDEN[:2] + (0,) + _BINDING_GOLDEN[3:]))
+        _SpscQueueEndpointBinding(*(_BINDING_GOLDEN[:2] + (0,) + _BINDING_GOLDEN[3:]))
     zero = list(_BINDING_GOLDEN)
     zero[2] = 0
     with pytest.raises(ValueError, match="nonzero"):
-        SpscQueueEndpointBinding.from_scalars(zero)
+        _SpscQueueEndpointBinding.from_scalars(zero)
     session_zero = list(_BINDING_GOLDEN)
     session_zero[1] = 0
-    binding = SpscQueueEndpointBinding.from_scalars(session_zero)
+    binding = _SpscQueueEndpointBinding.from_scalars(session_zero)
     assert binding.session_instance_id_bits == 0
     assert binding.transaction_id == 42
     assert binding.to_scalars()[2] == 42
@@ -452,6 +456,17 @@ class _MemoryRegion:
         if len(bytes(self.session)) != 8 or type(self.transaction_id) is not int or self.transaction_id < 1:
             raise MaterializationError("region allocation identity is incomplete")
         return bytes(self.session), int(self.transaction_id)
+
+    @property
+    def _consumer(self) -> EndpointRecord:
+        return self.consumer
+
+    @property
+    def _provider(self) -> EndpointRecord:
+        return self.provider
+
+    def _local_view(self, part: RegionPartKind) -> RegionPartLocalView | None:
+        return self.local_view(part)
 
     def local_view(self, part: RegionPartKind) -> RegionPartLocalView | None:
         if self._state is not RegionInstanceState.LIVE:
@@ -633,7 +648,7 @@ def test_concurrent_first_bind_consumes_once_and_second_bind_does_not_touch_inst
     for thread in threads:
         thread.join()
     assert len(results) == 1
-    assert isinstance(results[0], _BoundSpscQueue)
+    assert isinstance(results[0], SpscQueue)
     assert plan._state is _SpscQueuePlanState.CONSUMED
     assert all("already consumed" in str(error) for error in errors)
 
@@ -825,7 +840,7 @@ def test_try_enqueue_oversize_and_blocking_oversize_do_not_touch_shared_state():
     assert region.counters == {}
     assert bytes(region.payload) == bytes(len(region.payload))
     with pytest.raises(ValueError, match="exceeds input arena"):
-        queue.input.enqueue(None, 128, timeout=0.1)
+        queue.input.enqueue(b"x" * 128, 128, timeout=0.1)
     assert region.counters == {}
 
 
@@ -898,7 +913,7 @@ def test_output_handle_ownership_and_wait_timeout_abort_failure():
     region.counters[queue._layout.output_desc_tail_offset] = 1
     handle = queue.output.try_peek()
     assert handle is not None
-    forged = _SpscQueueMessage(handle.seq, handle.opcode, handle.payload_offset, handle.payload_nbytes)
+    forged = SpscQueueMessage(handle.seq, handle.opcode, handle.payload_offset, handle.payload_nbytes)
     with pytest.raises(RuntimeError, match="not active"):
         queue.output.release(forged)
     assert queue._state is _SpscQueueState.POISONED_LOCAL
@@ -933,7 +948,7 @@ def test_poison_attaches_abort_notify_note_without_add_note():
 
 def test_zero_byte_enqueue_rejects_non_none_and_stop_is_zero_byte():
     _plan, _region, _slots, queue = _bind_memory_queue()
-    with pytest.raises(ValueError, match="buffer_or_none == None"):
+    with pytest.raises(ValueError, match="buffer == None"):
         queue.input.try_enqueue(b"", 0)
     with pytest.raises(ValueError, match="STOP must be zero-byte"):
         queue.input._try_enqueue(None, 4, SpscQueueOpcode.STOP)
@@ -1162,10 +1177,10 @@ def test_coordinator_create_projects_bound_queue_without_escaping_instance(regio
         result_projector=projector,
     )
     assert result is captured["bound"]
-    assert isinstance(result, _BoundSpscQueue)
+    assert isinstance(result, SpscQueue)
     assert result is not captured["instance"]
-    assert result.endpoint_binding.to_scalars()[0] == _SPSC_QUEUE_MAGIC_VERSION
-    assert len(result.endpoint_binding.to_scalars()) == 10
+    assert result._endpoint_binding.to_scalars()[0] == _SPSC_QUEUE_MAGIC_VERSION
+    assert len(result._endpoint_binding.to_scalars()) == 10
     assert result._desc_fields == bytearray(24)
     assert result._desc_seq == bytearray(8)
     assert result._desc_read == bytearray(32)
@@ -1347,18 +1362,6 @@ def test_coordinator_source_has_no_spsc_roles():
     assert "INITIATOR" not in source
     assert "PEER" not in source
     assert "consumer/provider" not in source
-
-
-def test_production_facade_uses_coordinator():
-    from simpler import worker_chip_message_queue
-    from simpler.worker_chip_message_queue import create_worker_chip_queue
-
-    source = inspect.getsource(create_worker_chip_queue)
-    assert "_RegionTemplateCoordinator" in source
-    assert "create_worker_chip_region" not in source
-    module_source = inspect.getsource(worker_chip_message_queue)
-    assert "time.sleep" not in module_source
-    assert "orch.alloc" not in module_source
 
 
 def _plant_output_descriptor(region, queue, seq, opcode, payload_offset, payload=b""):

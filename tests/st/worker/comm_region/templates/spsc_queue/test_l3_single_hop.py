@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import pytest
-from simpler.worker_chip_message_queue import WorkerChipQueueOpcode
+from simpler.comm_region_template import SpscQueueOpcode
 
 from ._helpers import (
     _POST_STOP_MARKER,
@@ -55,7 +55,7 @@ def test_l3_single_hop(st_platform, st_device_ids):
             submit_queue(orch_handle, chip_handle, queue, cfg)
             for _ in range(_QUEUE_DEPTH):
                 opcode, payload, _offset = drain_message(queue)
-                assert opcode is WorkerChipQueueOpcode.DATA
+                assert opcode is SpscQueueOpcode.DATA
                 assert payload == _SMALL_ECHO
             assert queue.output.try_peek() is None
 
@@ -64,7 +64,7 @@ def test_l3_single_hop(st_platform, st_device_ids):
             for payload in wrap_messages:
                 enqueue_bytes(queue, payload)
                 opcode, got, offset = drain_message(queue)
-                assert opcode is WorkerChipQueueOpcode.DATA
+                assert opcode is SpscQueueOpcode.DATA
                 assert got == payload
                 wrap_offsets.append(offset)
             assert wrap_offsets[1] > wrap_offsets[0]
@@ -72,7 +72,7 @@ def test_l3_single_hop(st_platform, st_device_ids):
 
             queue.input.enqueue(None, nbytes=0, timeout=_TIMEOUT_S)
             opcode, payload, offset = drain_message(queue)
-            assert opcode is WorkerChipQueueOpcode.DATA
+            assert opcode is SpscQueueOpcode.DATA
             assert payload == b""
             assert offset == 0
 
@@ -81,27 +81,27 @@ def test_l3_single_hop(st_platform, st_device_ids):
             err2 = error_payload(b"e2")
             enqueue_bytes(queue, err1)
             opcode, payload, _offset = drain_message(queue)
-            assert opcode is WorkerChipQueueOpcode.ERROR
+            assert opcode is SpscQueueOpcode.ERROR
             assert payload == err1
             enqueue_bytes(queue, echo)
             opcode, payload, _offset = drain_message(queue)
-            assert opcode is WorkerChipQueueOpcode.DATA
+            assert opcode is SpscQueueOpcode.DATA
             assert payload == echo
             enqueue_bytes(queue, err2)
             opcode, payload, _offset = drain_message(queue)
-            assert opcode is WorkerChipQueueOpcode.ERROR
+            assert opcode is SpscQueueOpcode.ERROR
             assert payload == err2
 
             compute = compute_payload(3.0)
             enqueue_bytes(queue, compute)
             opcode, payload, _offset = drain_message(queue)
-            assert opcode is WorkerChipQueueOpcode.DATA
+            assert opcode is SpscQueueOpcode.DATA
             assert payload == expected_compute_payload(3.0)
 
             queue.request_stop(timeout=_TIMEOUT_S)
             assert queue.input.try_enqueue(_SMALL_ECHO, len(_SMALL_ECHO)) is False
             opcode, payload, _offset = drain_message(queue)
-            assert opcode is WorkerChipQueueOpcode.DATA
+            assert opcode is SpscQueueOpcode.DATA
             assert payload == _POST_STOP_MARKER
             assert queue.output.try_peek() is None
 
