@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import ctypes
 import itertools
+import operator
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, IntEnum
@@ -75,8 +76,11 @@ from .comm_provider_control import (
     encode_request,
     parse_reply,
 )
+from .orchestrator import _callback_frame_for
 
 _COUNTER_BASE_ALIGNMENT = 64
+_INT32_MIN = -1 << 31
+_INT32_MAX = (1 << 31) - 1
 
 
 class _RegionPartAttachment:
@@ -211,10 +215,46 @@ class HostVmmCopyAccess:
         _host_vmm_copy_from(int(self._handle), int(span.offset) + int(offset), int(host_ptr), int(nbytes))
 
 
+def _ignore_issued_failure(_error: BaseException) -> None:
+    return
+
+
+def _require_region_size(name: str, value: object) -> int:
+    """Accept an integer index and reject bool, non-positive, and uint64 overflow."""
+    if isinstance(value, bool) or getattr(value, "__index__", None) is None:
+        raise TypeError(f"{name} must be an integer index")
+    try:
+        converted = operator.index(value)
+    except TypeError as exc:
+        raise TypeError(f"{name} must be an integer index") from exc
+    if type(converted) is not int or converted <= 0 or converted > _UINT64_MAX:
+        raise ValueError(f"{name} must be a positive uint64")
+    return converted
+
+
+def _require_counter_i32(name: str, value: object) -> int:
+    if isinstance(value, bool) or getattr(value, "__index__", None) is None:
+        raise TypeError(f"{name} must be an integer")
+    try:
+        converted = operator.index(value)
+    except TypeError as exc:
+        raise TypeError(f"{name} must be an integer") from exc
+    if converted < _INT32_MIN or converted > _INT32_MAX:
+        raise ValueError(f"{name} is outside int32")
+    return int(converted)
+
+
 class PayloadPart:
-    def __init__(self, span: RegionPartSpan, access: Any) -> None:
+    def __init__(
+        self,
+        span: RegionPartSpan,
+        access: Any,
+        *,
+        on_issued_failure: Callable[[BaseException], None] = _ignore_issued_failure,
+    ) -> None:
         self._span = span
         self._access = access
+        self._on_issued_failure = on_issued_failure
 
     @property
     def span(self) -> RegionPartSpan:
@@ -222,15 +262,23 @@ class PayloadPart:
 
     def write(self, offset: int, host_buffer: Any, nbytes: int | None = None) -> None:
         with _PinnedBuffer(host_buffer) as pinned:
-            size = pinned.nbytes if nbytes is None else int(nbytes)
+            size = pinned.nbytes if nbytes is None else _require_non_negative_size("nbytes", nbytes)
             self._validate_payload_range(offset, size, pinned.nbytes)
-            self._access.write_bytes(self._span, int(offset), pinned.addr, size)
+            try:
+                self._access.write_bytes(self._span, int(offset), pinned.addr, size)
+            except Exception as exc:
+                self._on_issued_failure(exc)
+                raise
 
     def read(self, offset: int, host_buffer: Any, nbytes: int | None = None) -> None:
         with _PinnedBuffer(host_buffer, writable=True) as pinned:
-            size = pinned.nbytes if nbytes is None else int(nbytes)
+            size = pinned.nbytes if nbytes is None else _require_non_negative_size("nbytes", nbytes)
             self._validate_payload_range(offset, size, pinned.nbytes)
-            self._access.read_bytes(self._span, int(offset), pinned.addr, size)
+            try:
+                self._access.read_bytes(self._span, int(offset), pinned.addr, size)
+            except Exception as exc:
+                self._on_issued_failure(exc)
+                raise
 
     def _validate_payload_range(self, offset: int, nbytes: int, buffer_nbytes: int) -> None:
         if int(nbytes) > int(buffer_nbytes):
@@ -238,10 +286,30 @@ class PayloadPart:
         self._span.validate_range(offset, nbytes, "region payload")
 
 
+def _require_non_negative_size(name: str, value: object) -> int:
+    if isinstance(value, bool) or getattr(value, "__index__", None) is None:
+        raise TypeError(f"{name} must be an integer index")
+    try:
+        converted = operator.index(value)
+    except TypeError as exc:
+        raise TypeError(f"{name} must be an integer index") from exc
+    if converted < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return int(converted)
+
+
 class CounterPart:
-    def __init__(self, span: RegionPartSpan, access: Any, handle: Any | None = None) -> None:
+    def __init__(
+        self,
+        span: RegionPartSpan,
+        access: Any,
+        handle: Any | None = None,
+        *,
+        on_issued_failure: Callable[[BaseException], None] = _ignore_issued_failure,
+    ) -> None:
         self._span = span
         self._access = access
+        self._on_issued_failure = on_issued_failure
         resolved_handle = getattr(access, "handle", handle)
         if resolved_handle is None:
             raise ValueError("region counter access requires a native mapped-region handle")
@@ -251,30 +319,43 @@ class CounterPart:
     def span(self) -> RegionPartSpan:
         return self._span
 
-    def counter(self, offset: int) -> RegionCounter:
-        self._validate_counter_offset(offset)
-        return RegionCounter(self, int(offset))
-
     def notify(self, offset: int, value: int, op: NotifyOp) -> None:
         self._validate_counter_offset(offset)
-        op = NotifyOp(op)
-        _region_counter_notify(self._handle, self._mapping_offset(offset), int(value), int(op))
+        selected = NotifyOp(op)
+        operand = _require_counter_i32("counter value", value)
+        try:
+            _region_counter_notify(self._handle, self._mapping_offset(offset), operand, int(selected))
+        except Exception as exc:
+            self._on_issued_failure(exc)
+            raise
 
     def test(self, offset: int, cmp_value: int, cmp: WaitCmp) -> SignalTestResult:
         self._validate_counter_offset(offset)
-        cmp = WaitCmp(cmp)
-        matched, observed = _region_counter_test(self._handle, self._mapping_offset(offset), int(cmp_value), int(cmp))
+        selected = WaitCmp(cmp)
+        operand = _require_counter_i32("counter cmp_value", cmp_value)
+        try:
+            matched, observed = _region_counter_test(
+                self._handle, self._mapping_offset(offset), operand, int(selected)
+            )
+        except Exception as exc:
+            self._on_issued_failure(exc)
+            raise
         return SignalTestResult(matched=bool(matched), observed=int(observed))
 
     def wait(self, offset: int, cmp_value: int, cmp: WaitCmp, timeout: float) -> int:
         self._validate_counter_offset(offset)
-        cmp = WaitCmp(cmp)
-        if timeout is None or float(timeout) <= 0:
+        selected = WaitCmp(cmp)
+        operand = _require_counter_i32("counter cmp_value", cmp_value)
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or float(timeout) <= 0:
             raise ValueError("region counter wait requires a positive timeout")
         timeout_ns = min(int(float(timeout) * 1_000_000_000), _MAX_SIGNED_CHRONO_TIMEOUT_NS)
-        status, error_kind, observed, _matched, message = _region_counter_wait(
-            self._handle, self._mapping_offset(offset), int(cmp_value), int(cmp), int(timeout_ns)
-        )
+        try:
+            status, error_kind, observed, _matched, message = _region_counter_wait(
+                self._handle, self._mapping_offset(offset), operand, int(selected), int(timeout_ns)
+            )
+        except Exception as exc:
+            self._on_issued_failure(exc)
+            raise
         if int(status) == 0:
             return int(observed)
         msg = str(message) if message else "region counter wait timed out"
@@ -292,8 +373,8 @@ class CounterPart:
 
 
 class RegionCounter:
-    def __init__(self, part: CounterPart, offset: int) -> None:
-        self._part = part
+    def __init__(self, instance: RegionInstance, offset: int) -> None:
+        self._instance = instance
         self._offset = int(offset)
 
     @property
@@ -301,13 +382,16 @@ class RegionCounter:
         return self._offset
 
     def notify(self, value: int, op: NotifyOp = NotifyOp.Set) -> None:
-        self._part.notify(self._offset, int(value), op)
+        self._instance._ensure_usable("region_counter.notify")
+        self._instance._counter_notify(self._offset, value, op)
 
     def test(self, cmp_value: int, cmp: WaitCmp) -> SignalTestResult:
-        return self._part.test(self._offset, int(cmp_value), cmp)
+        self._instance._ensure_usable("region_counter.test")
+        return self._instance._counter_test(self._offset, cmp_value, cmp)
 
     def wait(self, cmp_value: int, cmp: WaitCmp, timeout: float) -> int:
-        return self._part.wait(self._offset, int(cmp_value), cmp, timeout)
+        self._instance._ensure_usable("region_counter.wait")
+        return self._instance._counter_wait(self._offset, cmp_value, cmp, timeout)
 
 
 class RegionInstanceState(str, Enum):
@@ -401,9 +485,17 @@ class RegionInstanceRegistry:
 
     def track(self, instance: RegionInstance, run_scope: Any) -> None:
         key = id(instance)
-        if key in self._instances:
+        if key in self._instances or key in self._run_scopes:
             raise MaterializationError("region instance is already tracked")
         self._instances[key] = instance
+        try:
+            self._remember_run_scope(key, run_scope)
+        except BaseException:
+            self._instances.pop(key, None)
+            self._run_scopes.pop(key, None)
+            raise
+
+    def _remember_run_scope(self, key: int, run_scope: Any) -> None:
         self._run_scopes[key] = run_scope
 
     def _require_tracked(self, instance: RegionInstance) -> None:
@@ -564,6 +656,8 @@ class RegionInstance:
         self._ever_live = False
         self._provider_release_committed = False
         self._data_plane_error: BaseException | None = None
+        self._released = False
+        self._owner_run_id: int | None = None
 
     @property
     def state(self) -> RegionInstanceState:
@@ -616,26 +710,63 @@ class RegionInstance:
             return instance
         return cls(ctx, shape)
 
+    def free(self) -> None:
+        self._released = True
+
     def payload_write(self, offset: int, host_buffer: Any, nbytes: int | None = None) -> None:
-        self._ensure_live()
-        self._worker._require_region_control_context("region_instance.payload_write")
+        self._ensure_usable("region_instance.payload_write")
+        self._write_payload(offset, host_buffer, nbytes)
+
+    def payload_read(self, offset: int, host_buffer: Any, nbytes: int | None = None) -> None:
+        self._ensure_usable("region_instance.payload_read")
+        self._read_payload(offset, host_buffer, nbytes)
+
+    def _write_payload(self, offset: int, host_buffer: Any, nbytes: int | None = None) -> None:
         payload_part = self._payload_part
         assert payload_part is not None
         payload_part.write(offset, host_buffer, nbytes)
 
-    def payload_read(self, offset: int, host_buffer: Any, nbytes: int | None = None) -> None:
-        self._ensure_live()
-        self._worker._require_region_control_context("region_instance.payload_read")
+    def _read_payload(self, offset: int, host_buffer: Any, nbytes: int | None = None) -> None:
         payload_part = self._payload_part
         assert payload_part is not None
         payload_part.read(offset, host_buffer, nbytes)
 
-    def counter(self, offset: int):
-        self._ensure_live()
-        self._worker._require_region_control_context("region_instance.counter")
+    def counter(self, offset: int) -> RegionCounter:
+        self._ensure_usable("region_instance.counter")
         counter_part = self._counter_part
         assert counter_part is not None
-        return counter_part.counter(offset)
+        counter_part._validate_counter_offset(offset)
+        return RegionCounter(self, int(offset))
+
+    def _counter_notify(self, offset: int, value: int, op: NotifyOp) -> None:
+        self._ensure_physical_live()
+        counter_part = self._counter_part
+        assert counter_part is not None
+        counter_part.notify(offset, value, op)
+
+    def _counter_test(self, offset: int, cmp_value: int, cmp: WaitCmp) -> SignalTestResult:
+        self._ensure_physical_live()
+        counter_part = self._counter_part
+        assert counter_part is not None
+        return counter_part.test(offset, cmp_value, cmp)
+
+    def _counter_wait(self, offset: int, cmp_value: int, cmp: WaitCmp, timeout: float) -> int:
+        self._ensure_physical_live()
+        counter_part = self._counter_part
+        assert counter_part is not None
+        return counter_part.wait(offset, cmp_value, cmp, timeout)
+
+    def _remember_data_plane_error(self, error: BaseException) -> None:
+        if self._data_plane_error is None:
+            self._data_plane_error = error
+
+    def _capture_owning_run(self) -> None:
+        frame = _callback_frame_for(self._worker)
+        resources = self._cleanup_resources
+        if frame is None or resources is None or frame.worker is not self._worker:
+            self._owner_run_id = None
+            return
+        self._owner_run_id = int(frame.run_id)
 
     def close(self) -> None:
         if self._state is RegionInstanceState.CLOSED:
@@ -813,10 +944,22 @@ class RegionInstance:
             return not (self._ever_live and self._provider_release_committed)
         return True
 
-    def _ensure_live(self) -> None:
+    def _ensure_physical_live(self) -> None:
         if self._state is not RegionInstanceState.LIVE:
             label = "unpublished" if self._state is None else self._state.value
             raise MaterializationError(f"region instance is not live: {label}")
+
+    def _ensure_usable(self, api: str) -> None:
+        self._ensure_physical_live()
+        if self._released:
+            raise RuntimeError(f"{api}: region has been released")
+        if self._data_plane_error is not None:
+            raise RuntimeError(f"{api}: region data plane failed") from self._data_plane_error
+        if self._owner_run_id is None or self._cleanup_resources is None:
+            raise RuntimeError(f"{api}: region access requires its owning run")
+        self._worker._require_region_access_run(
+            api, resources=self._cleanup_resources, run_id=int(self._owner_run_id)
+        )
 
 
 def project_region_allocation_spec(plan: object, layout: object) -> RegionAllocationSpec:
@@ -1012,6 +1155,7 @@ def materialize_region_instance(ctx: MaterializationContext) -> RegionInstance: 
     instance = RegionInstance.planned(ctx, shape)
     resources = getattr(ctx.worker, "_building_run_resources", None)
     ctx.worker._region_instance_registry.track(instance, resources)
+    delivered = False
     if resources is not None:
         resources.requires_ordered_cleanup = True
     allocator_state = ctx.registry._buffer_identity_allocator_state(shape.provider)
@@ -1128,17 +1272,21 @@ def materialize_region_instance(ctx: MaterializationContext) -> RegionInstance: 
                 _select_host_vmm_copy_access(
                     ctx.plan.payload, instance.provider, instance.consumer, instance._payload_attachment
                 ),
+                on_issued_failure=instance._remember_data_plane_error,
             )
             instance._counter_part = CounterPart(
                 RegionPartSpan(offset=0, nbytes=int(spec.counter.logical_bytes)),
                 _select_host_vmm_copy_access(
                     ctx.plan.counter, instance.provider, instance.consumer, instance._counter_attachment
                 ),
+                on_issued_failure=instance._remember_data_plane_error,
             )
             instance._payload_local_view = outcome.payload_view
             instance._counter_local_view = outcome.counter_view
+            instance._capture_owning_run()
             instance._ever_live = True
             instance._state = RegionInstanceState.LIVE
+            delivered = True
             return instance
         if isinstance(outcome, DelegatedAllocateReply) and outcome.tag is DelegatedAllocateReplyTag.ERROR:
             if outcome.error is None:
@@ -1156,7 +1304,7 @@ def materialize_region_instance(ctx: MaterializationContext) -> RegionInstance: 
         ctx.worker._latch_delegated_session_fatal(unexpected)
         raise unexpected
     except BaseException as exc:
-        if instance._state is None:
+        if not delivered and instance._state in (None, RegionInstanceState.LIVE):
             instance._abort_materialization(exc)
         ctx.worker._region_instance_registry._settle(instance)
         raise

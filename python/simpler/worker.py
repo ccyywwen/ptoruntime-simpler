@@ -162,6 +162,7 @@ from .comm_endpoints import (
     DefaultRegionAccessService,
     EndpointDeployment,
     EndpointRegistry,
+    EndpointSelector,
     RegionAccessService,
     RegionLayoutSpec,
     SingleOwner,
@@ -209,9 +210,12 @@ from .comm_provider_control import (
 from .comm_region import (
     MaterializationContext,
     MaterializationError,
+    MaterializationRefusal,
+    RefusalReason,
     RegionInstance,
     RegionInstanceRegistry,
     RegionInstanceState,
+    _require_region_size,
     materialize_region_instance,
     project_region_allocation_spec,
     validate_single_owner_region_shape,
@@ -5435,6 +5439,31 @@ def attach_exception_note(error: BaseException, note: str) -> None:
     object.__setattr__(error, "__notes__", [note])
 
 
+def _require_endpoint_selector(name: str, value: object) -> EndpointSelector:
+    if not isinstance(value, EndpointSelector):
+        raise TypeError(f"{name} must be an endpoint selector")
+    return value
+
+
+def _require_region_member_selectors(members: object) -> tuple[EndpointSelector, ...]:
+    if isinstance(members, (str, bytes, bytearray)):
+        raise TypeError("members must be a sequence of endpoint selectors")
+    try:
+        items = tuple(members)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise TypeError("members must be a sequence of endpoint selectors") from exc
+    for index, item in enumerate(items):
+        if not isinstance(item, EndpointSelector):
+            raise TypeError(f"members[{index}] must be an endpoint selector")
+    return items
+
+
+def _require_explicit_single_owner(topology: object) -> SingleOwner:
+    if not isinstance(topology, SingleOwner) or not isinstance(topology.provider, EndpointSelector):
+        raise TypeError("topology must be SingleOwner with an explicit provider selector")
+    return topology
+
+
 class _DeviceAllocations:
     """Every live child device allocation, in both forms a dispatch consumes.
 
@@ -9969,6 +9998,135 @@ class Worker:
                 )
             raise
 
+    def _create_region(
+        self,
+        *,
+        members: object,
+        topology: object,
+        payload_bytes: object,
+        counter_bytes: object,
+    ) -> RegionInstance:
+        resources = self._require_region_creation_run("_create_region")
+        frame = _callback_frame_for(self)
+        assert frame is not None
+        run_id = int(frame.run_id)
+        checked_payload = _require_region_size("payload_bytes", payload_bytes)
+        checked_counter = _require_region_size("counter_bytes", counter_bytes)
+        if checked_counter % 4 != 0:
+            raise ValueError("counter_bytes must be a multiple of 4")
+        checked_members = _require_region_member_selectors(members)
+        checked_topology = _require_explicit_single_owner(topology)
+        previous_cleanup = resources.requires_ordered_cleanup
+        instance: RegionInstance | None = None
+        published = False
+        try:
+            with self._operation_lease("_create_region"), self._control_admission("_create_region"):
+                self._require_region_creation_run("_create_region")
+                registry = self._get_endpoint_registry()
+                layout = RegionLayoutSpec(payload_bytes=checked_payload, counter_bytes=checked_counter)
+                resolved = registry.resolve_region_spec(checked_members, checked_topology)
+                plan = BackendResolver(registry, self._get_region_access_service()).plan(resolved, layout)
+                if isinstance(plan, UnsupportedRegionPlan):
+                    raise MaterializationRefusal(RefusalReason.UNSUPPORTED_PLAN, plan.message)
+                ctx = MaterializationContext(worker=self, registry=registry, plan=plan, layout=layout)
+                validate_single_owner_region_shape(ctx)
+                instance = materialize_region_instance(ctx)
+                self._finish_region_publication(instance, resources, run_id)
+                published = True
+                return instance
+        except BaseException as exc:
+            if instance is not None and not published:
+                self._rollback_unpublished_region(instance, exc)
+            if not self._run_retains_ordered_cleanup(resources):
+                resources.requires_ordered_cleanup = previous_cleanup
+            raise
+
+    def _create_spsc_queue(
+        self,
+        *,
+        initiator: object,
+        peer: object,
+        depth: object,
+        input_arena_bytes: object,
+        output_arena_bytes: object,
+    ):
+        from .comm_region_template import (  # noqa: PLC0415
+            _RegionTemplateCoordinator,
+            _RegionTemplatePlacementRequest,
+            _return_spsc_queue,
+            _SpscQueueConfig,
+            _SpscQueueSlot,
+            _SpscQueueTemplate,
+            _TemplateSlotBindingRequest,
+        )
+
+        resources = self._require_region_creation_run("_create_spsc_queue")
+        checked_initiator = _require_endpoint_selector("initiator", initiator)
+        checked_peer = _require_endpoint_selector("peer", peer)
+        placement = _RegionTemplatePlacementRequest(
+            members=(checked_initiator, checked_peer),
+            topology=SingleOwner(provider=checked_peer),
+            slot_bindings=(
+                _TemplateSlotBindingRequest(_SpscQueueSlot.INITIATOR, checked_initiator),
+                _TemplateSlotBindingRequest(_SpscQueueSlot.PEER, checked_peer),
+            ),
+        )
+        previous_cleanup = resources.requires_ordered_cleanup
+        try:
+            return _RegionTemplateCoordinator(self).create(
+                template=_SpscQueueTemplate(),
+                config=_SpscQueueConfig(
+                    depth=depth,
+                    input_arena_bytes=input_arena_bytes,
+                    output_arena_bytes=output_arena_bytes,
+                ),
+                placement=placement,
+                result_projector=_return_spsc_queue,
+            )
+        except BaseException:
+            if not self._run_retains_ordered_cleanup(resources):
+                resources.requires_ordered_cleanup = previous_cleanup
+            raise
+
+    def _finish_region_publication(self, instance: RegionInstance, resources: _RunResources, run_id: int) -> None:
+        instance._cleanup_resources = resources
+        instance._owner_run_id = int(run_id)
+        if instance._state is not RegionInstanceState.LIVE:
+            raise MaterializationError("created region is not live")
+
+    def _rollback_unpublished_region(self, instance: RegionInstance, primary: BaseException) -> None:
+        try:
+            live = instance._state is RegionInstanceState.LIVE and not instance._close_attempted
+        except BaseException:
+            live = False
+        if not live:
+            return
+        try:
+            self._region_instance_registry.close(instance)
+        except BaseException as cleanup_error:
+            try:
+                attach_exception_note(
+                    primary,
+                    "region creation: materialized instance could not be reclaimed; no further work is admitted",
+                )
+            except BaseException:
+                pass
+            try:
+                self._record_unreclaimable(
+                    "region creation: materialized instance could not be reclaimed; no further work is admitted",
+                    cleanup_error,
+                )
+            except BaseException:
+                pass
+
+    def _run_retains_ordered_cleanup(self, resources: _RunResources) -> bool:
+        if self._ordered_cleanup_error is not None:
+            return True
+        return any(
+            instance._retains_cleanup_only_reachability()
+            for instance in self._region_instance_registry._iter_run(resources)
+        )
+
     def _sweep_region_instances(self) -> None:
         self._region_instance_registry.sweep()
 
@@ -12882,6 +13040,27 @@ class Worker:
                     f"Worker.{api}: a prior run's ordered cleanup failed, so this worker's device state is "
                     "unreclaimed and no further work is admitted; close() it"
                 ) from self._ordered_cleanup_error
+
+    def _require_region_creation_run(self, api: str) -> _RunResources:
+        self._require_ready_for_region_planning(api)
+        frame = _callback_frame_for(self)
+        if frame is None or frame.worker is not self:
+            raise RuntimeError(f"Worker.{api}: region creation requires this Worker's orchestration callback")
+        if frame.has_submitted_task:
+            raise RuntimeError(f"Worker.{api}: region creation cannot follow a task submission in the same run")
+        resources = self._building_run_resources
+        if resources is None:
+            raise RuntimeError(f"Worker.{api}: region creation requires the owning run")
+        self._require_no_ordered_cleanup_failure(api)
+        return resources
+
+    def _require_region_access_run(self, api: str, *, resources: _RunResources, run_id: int) -> None:
+        frame = _callback_frame_for(self)
+        if frame is None or frame.worker is not self:
+            raise RuntimeError(f"Worker.{api}: region access requires this Worker's orchestration callback")
+        if int(frame.run_id) != int(run_id) or self._building_run_resources is not resources:
+            raise RuntimeError(f"Worker.{api}: region access requires the owning run")
+        self._require_no_ordered_cleanup_failure(api)
 
     def _require_region_control_context(self, api: str) -> None:
         frame = _callback_frame_for(self)
