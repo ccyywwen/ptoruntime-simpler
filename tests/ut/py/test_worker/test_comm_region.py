@@ -1502,7 +1502,7 @@ def test_data_plane_does_not_consult_registry(region_worker, monkeypatch):
                 "close",
                 "cleanup_run",
                 "sweep",
-                "record_data_plane_failure",
+                "record_data_plane_failure_by_allocation_identity",
                 "_iter_run",
                 "_settle",
                 "_retire",
@@ -1578,7 +1578,10 @@ def test_record_data_plane_failure_matches_single_region(region_worker):
     finally:
         worker._building_run_resources = None
     error = RuntimeError("issued local operation failed")
-    worker._region_instance_registry.record_data_plane_failure(resources, instance.provider_resource_id, error)
+    session, transaction_id = instance._allocation_identity
+    worker._region_instance_registry.record_data_plane_failure_by_allocation_identity(
+        resources, session, transaction_id, error
+    )
     assert instance.data_plane_error is error
     assert instance._close_attempted is False
     assert instance.state is RegionInstanceState.LIVE
@@ -1594,9 +1597,12 @@ def test_record_data_plane_failure_matches_only_target_among_multiple(region_wor
         second = _materialize_default_region(worker)
     finally:
         worker._building_run_resources = None
-    second._provider_resource_id = 43
+    second._delegated_transaction_id = int(first._delegated_transaction_id) + 1
     error = RuntimeError("issued local operation failed")
-    worker._region_instance_registry.record_data_plane_failure(resources, first.provider_resource_id, error)
+    session, transaction_id = first._allocation_identity
+    worker._region_instance_registry.record_data_plane_failure_by_allocation_identity(
+        resources, session, transaction_id, error
+    )
     assert first.data_plane_error is error
     assert second.data_plane_error is None
     assert first._close_attempted is False
@@ -1612,8 +1618,10 @@ def test_record_data_plane_failure_unknown_resource_is_routing_error(region_work
         instance = _materialize_default_region(worker)
     finally:
         worker._building_run_resources = None
-    with pytest.raises(MaterializationError, match="no region instance for resource 99"):
-        worker._region_instance_registry.record_data_plane_failure(resources, 99, RuntimeError("unused"))
+    with pytest.raises(MaterializationError, match="no region instance for allocation identity"):
+        worker._region_instance_registry.record_data_plane_failure_by_allocation_identity(
+            resources, b"\x11" * 8, 99, RuntimeError("unused")
+        )
     assert instance.data_plane_error is None
     assert instance._close_attempted is False
 
@@ -1627,19 +1635,20 @@ def test_record_data_plane_failure_duplicate_match_is_invariant_error(region_wor
         second = _materialize_default_region(worker)
     finally:
         worker._building_run_resources = None
-    second._provider_resource_id = first.provider_resource_id
-    with pytest.raises(MaterializationError, match="duplicate region instances for resource 42"):
-        worker._region_instance_registry.record_data_plane_failure(
-            resources, first.provider_resource_id, RuntimeError("unused")
+    second._delegated_session_instance_id = first._delegated_session_instance_id
+    second._delegated_transaction_id = first._delegated_transaction_id
+    session, transaction_id = first._allocation_identity
+    with pytest.raises(MaterializationError, match="duplicate region instances for allocation identity"):
+        worker._region_instance_registry.record_data_plane_failure_by_allocation_identity(
+            resources, session, transaction_id, RuntimeError("unused")
         )
     assert first.data_plane_error is None
     assert second.data_plane_error is None
 
 
-def _endpoint_error(resource_id: int) -> RuntimeError:
-    return RuntimeError(
-        f"L3-L2 endpoint error op=payload_write kind=5 region={int(resource_id)} msg=issued local operation failed"
-    )
+def _endpoint_error(session: bytes, transaction_id: int) -> RuntimeError:
+    bits = int.from_bytes(bytes(session), "little")
+    return RuntimeError(f"prefix Region endpoint error session=0x{bits:016x} transaction={int(transaction_id)}")
 
 
 def test_endpoint_unknown_resource_poisons_worker(region_worker):
@@ -1650,7 +1659,7 @@ def test_endpoint_unknown_resource_poisons_worker(region_worker):
         instance = _materialize_default_region(worker)
     finally:
         worker._building_run_resources = None
-    assert worker._poison_worker_chip_region_from_endpoint_error(_endpoint_error(99), resources) is True
+    assert worker._poison_region_from_endpoint_error(_endpoint_error(b"\x22" * 8, 99), resources) is True
     assert instance.data_plane_error is None
     assert instance._close_attempted is False
     assert [item for item in calls if item[0] == "release"] == []
@@ -1669,8 +1678,10 @@ def test_endpoint_duplicate_match_poisons_worker(region_worker):
         second = _materialize_default_region(worker)
     finally:
         worker._building_run_resources = None
-    second._provider_resource_id = first.provider_resource_id
-    assert worker._poison_worker_chip_region_from_endpoint_error(_endpoint_error(first.provider_resource_id), resources)
+    second._delegated_session_instance_id = first._delegated_session_instance_id
+    second._delegated_transaction_id = first._delegated_transaction_id
+    session, transaction_id = first._allocation_identity
+    assert worker._poison_region_from_endpoint_error(_endpoint_error(session, transaction_id), resources)
     assert first.data_plane_error is None
     assert second.data_plane_error is None
     assert [item for item in calls if item[0] == "release"] == []
@@ -1680,10 +1691,7 @@ def test_endpoint_duplicate_match_poisons_worker(region_worker):
 
 def _queue_endpoint_error(session: bytes, transaction_id: int) -> RuntimeError:
     bits = int.from_bytes(bytes(session), "little")
-    return RuntimeError(
-        "SPSC queue endpoint error op=init kind=6 "
-        f"session=0x{bits:016x} transaction={int(transaction_id)} msg=issued local operation failed"
-    )
+    return RuntimeError(f"SPSC queue endpoint error session=0x{bits:016x} transaction={int(transaction_id)}")
 
 
 def test_allocation_identity_returns_bound_session_and_transaction(region_worker):
@@ -1812,9 +1820,8 @@ def test_queue_endpoint_error_malformed_does_not_modify_instance_or_fall_back(re
     finally:
         worker._building_run_resources = None
     error = RuntimeError(
-        "SPSC queue endpoint error op=init kind=2 msg=invalid queue binding "
-        f"L3-L2 endpoint error op=payload_write kind=5 region={int(instance.provider_resource_id)} "
-        "msg=issued local operation failed"
+        "SPSC queue endpoint error session=0x0000000000000001 transaction=1 extra\n"
+        "Region endpoint error identity=untrusted"
     )
     assert worker._poison_spsc_queue_from_endpoint_error(error, resources) is True
     assert instance.data_plane_error is None
@@ -1846,9 +1853,10 @@ def test_legacy_region_parser_still_handles_independent_region_marker(region_wor
         instance = _materialize_default_region(worker)
     finally:
         worker._building_run_resources = None
-    error = _endpoint_error(instance.provider_resource_id)
+    session, transaction_id = instance._allocation_identity
+    error = _endpoint_error(session, transaction_id)
     assert worker._poison_spsc_queue_from_endpoint_error(error, resources) is False
-    assert worker._poison_worker_chip_region_from_endpoint_error(error, resources) is True
+    assert worker._poison_region_from_endpoint_error(error, resources) is True
     assert instance.data_plane_error is error
 
 
@@ -1860,8 +1868,9 @@ def test_data_plane_poison_still_completes_registry_cleanup_and_release(region_w
         instance = _materialize_default_region(worker)
     finally:
         worker._building_run_resources = None
-    error = _endpoint_error(instance.provider_resource_id)
-    assert worker._poison_worker_chip_region_from_endpoint_error(error, resources) is True
+    session, transaction_id = instance._allocation_identity
+    error = _endpoint_error(session, transaction_id)
+    assert worker._poison_region_from_endpoint_error(error, resources) is True
     assert instance.data_plane_error is error
     assert instance._close_attempted is False
     assert instance.state is RegionInstanceState.LIVE

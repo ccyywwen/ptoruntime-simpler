@@ -325,13 +325,12 @@ from .worker_level import span_prefix as _span_prefix
 _BOOTSTRAP_WAIT_TIMEOUT_S = 120.0
 _BOOTSTRAP_POLL_INTERVAL_S = 0.001
 _PY_CONTROL_TIMEOUT_S = 30.0
-# L2 endpoint metadata currently reaches the parent through the canonical fatal
-# text emitted by the orchestration wrapper; keep this pattern in sync with the
-# wrapper's ``L3-L2 endpoint error ... region=<id>`` format.
-_WORKER_CHIP_ENDPOINT_ERROR_REGION_RE = re.compile(r"\bL3-L2 endpoint error\b[^\n]*\bregion=(\d+)\b")
-_SPSC_QUEUE_ENDPOINT_ERROR_RE = re.compile(
-    r"SPSC queue endpoint error op=\S+ kind=\d+ session=0x([0-9A-Fa-f]{16}) transaction=(\d+) msg="
+_ENDPOINT_SHORT_MARKERS = ("Region endpoint error", "SPSC queue endpoint error")
+_ENDPOINT_SHORT_RE = re.compile(
+    r"^(Region endpoint error|SPSC queue endpoint error) session=0x([0-9a-fA-F]{16}) transaction=([0-9]+)$"
 )
+_ENDPOINT_UNTRUSTED_RE = re.compile(r"^(Region endpoint error|SPSC queue endpoint error) identity=untrusted$")
+_UINT64_MAX = (1 << 64) - 1
 
 
 def _host_spans_active() -> bool:
@@ -2552,6 +2551,52 @@ def _request_child_shutdown(buf) -> None:
     _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _SHUTDOWN)
 
 
+def _parse_endpoint_failure_marker(text: str) -> tuple[str, bytes, int] | None:
+    """Return the unique short allocation marker, or None when the text has none.
+
+    A present but incomplete, repeated, or untrusted marker raises ValueError.
+    """
+    found: list[tuple[str, bytes, int]] = []
+    saw_marker = False
+    for raw_line in str(text).splitlines() or [str(text)]:
+        for marker in _ENDPOINT_SHORT_MARKERS:
+            index = raw_line.find(marker)
+            if index < 0:
+                continue
+            saw_marker = True
+            tail = raw_line[index:]
+            if _ENDPOINT_UNTRUSTED_RE.fullmatch(tail):
+                raise ValueError(f"endpoint error identity is untrusted: {tail}")
+            match = _ENDPOINT_SHORT_RE.fullmatch(tail)
+            if match is None:
+                raise ValueError(f"endpoint error marker is malformed: {tail}")
+            transaction_id = int(match.group(3))
+            if transaction_id < 1 or transaction_id > _UINT64_MAX:
+                raise ValueError(f"endpoint error transaction is illegal: {tail}")
+            session = struct.pack("<Q", int(match.group(2), 16))
+            found.append((marker, session, transaction_id))
+    if not saw_marker:
+        return None
+    if len(found) != 1:
+        raise ValueError("endpoint error marker is ambiguous")
+    return found[0]
+
+
+def _prioritize_endpoint_failure_marker(text: str) -> str:
+    """Move one valid short marker to the first line without inventing uniqueness."""
+    try:
+        parsed = _parse_endpoint_failure_marker(text)
+    except ValueError:
+        return text
+    if parsed is None:
+        return text
+    marker, session, transaction_id = parsed
+    bits = int.from_bytes(session, "little")
+    short = f"{marker} session=0x{bits:016x} transaction={transaction_id}"
+    lines = [line for line in str(text).splitlines() if line.strip() != short and short not in line]
+    return "\n".join([short, *lines]) if lines else short
+
+
 def _write_error(buf, code: int, msg: str = "") -> None:
     """Write an (error code, message) tuple into the mailbox error region.
 
@@ -2560,7 +2605,7 @@ def _write_error(buf, code: int, msg: str = "") -> None:
     NUL-terminated content. On success (code=0) callers may pass an empty
     message; the region is zero-padded.
     """
-    _write_error_fields(buf, code, msg, _OFF_ERROR, MAILBOX_OFF_ERROR_MSG)
+    _write_error_fields(buf, code, _prioritize_endpoint_failure_marker(msg), _OFF_ERROR, MAILBOX_OFF_ERROR_MSG)
 
 
 def _read_error_msg(buf) -> str:
@@ -9687,23 +9732,19 @@ class Worker:
         self, exc: BaseException, resources: _RunResources | None = None
     ) -> bool:
         text = str(exc)
-        if "SPSC queue endpoint error" not in text:
-            return False
-        match = _SPSC_QUEUE_ENDPOINT_ERROR_RE.search(text)
-        if match is None:
+        try:
+            parsed = _parse_endpoint_failure_marker(text)
+        except ValueError:
+            if "SPSC queue endpoint error" not in text:
+                return False
             self._record_unreclaimable(
                 "spsc queue: endpoint error marker is malformed; no further work is admitted",
                 exc,
             )
             return True
-        session = struct.pack("<Q", int(match.group(1), 16))
-        transaction_id = int(match.group(2))
-        if transaction_id == 0:
-            self._record_unreclaimable(
-                "spsc queue: endpoint error transaction id is illegal; no further work is admitted",
-                exc,
-            )
-            return True
+        if parsed is None or parsed[0] != "SPSC queue endpoint error":
+            return False
+        _marker, session, transaction_id = parsed
         try:
             self._region_instance_registry.record_data_plane_failure_by_allocation_identity(
                 resources, session, transaction_id, exc
@@ -9720,26 +9761,36 @@ class Worker:
         )
         return True
 
-    def _poison_worker_chip_region_from_endpoint_error(
+    def _poison_region_from_endpoint_error(
         self, exc: BaseException, resources: _RunResources | None = None
     ) -> bool:
-        match = _WORKER_CHIP_ENDPOINT_ERROR_REGION_RE.search(str(exc))
-        if match is None:
-            return False
-        region_id = int(match.group(1))
-        if region_id == 0:
-            return False
+        text = str(exc)
         try:
-            self._region_instance_registry.record_data_plane_failure(resources, region_id, exc)
+            parsed = _parse_endpoint_failure_marker(text)
+        except ValueError:
+            if "Region endpoint error" not in text:
+                return False
+            self._record_unreclaimable(
+                "region instance: endpoint error marker is malformed; no further work is admitted",
+                exc,
+            )
+            return True
+        if parsed is None or parsed[0] != "Region endpoint error":
+            return False
+        _marker, session, transaction_id = parsed
+        try:
+            self._region_instance_registry.record_data_plane_failure_by_allocation_identity(
+                resources, session, transaction_id, exc
+            )
         except MaterializationError as routing:
             self._record_unreclaimable(
-                f"region instance: data-plane failure routing failed for resource {region_id}; "
+                "region instance: data-plane failure routing failed for allocation identity; "
                 "no further work is admitted",
                 routing,
             )
             return True
         self._record_unreclaimable(
-            f"region instance: issued local operation failed for resource {region_id}; no further work is admitted",
+            "region instance: issued local operation failed; no further work is admitted",
             exc,
         )
         return True
@@ -13452,7 +13503,7 @@ class Worker:
                 if native_error is not None:
                     if self._poison_spsc_queue_from_endpoint_error(native_error, resources):
                         return
-                    self._poison_worker_chip_region_from_endpoint_error(native_error, resources)
+                    self._poison_region_from_endpoint_error(native_error, resources)
 
             def _release_native_run() -> None:
                 if orch is None:

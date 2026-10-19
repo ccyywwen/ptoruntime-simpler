@@ -685,6 +685,7 @@ simpler_ut_cases(platform_single_case
     test_run_stream_pair.cpp
     test_teardown_proof.cpp
     test_teardown_recorder.cpp
+    test_region_task_args.cpp
     test_worker_chip_orch_comm.cpp
     test_workspace_manager.cpp
     test_workspace_staging.cpp)
