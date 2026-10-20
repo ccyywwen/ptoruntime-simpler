@@ -8,7 +8,7 @@ appear — a serving loop, not a batch.
 The transport is the L3-L2 SPSC queue (`SPSQ` binding): two arenas (input and
 output) plus a 10-scalar endpoint binding the L2 orchestration receives as
 plain `TaskArgs` scalars starting at offset 0. See
-[`docs/l3-l2-message-queue.md`](../../../../docs/l3-l2-message-queue.md) for
+[`docs/CPU-NPU-message-queue.md`](../../../../docs/CPU-NPU-message-queue.md) for
 the channel's current design.
 
 ## What this exercises

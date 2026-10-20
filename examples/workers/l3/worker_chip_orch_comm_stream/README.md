@@ -12,7 +12,7 @@ host: write input  ->  bump data_ready  ->  wait completion  ->  read output
 L2:   wait data_ready  ->  transform  ->  bump completion
 ```
 
-See [`docs/l3-l2-orch-comm.md`](../../../../docs/l3-l2-orch-comm.md) for the
+See [`docs/CPU-NPU-orch-comm.md`](../../../../docs/CPU-NPU-orch-comm.md) for the
 mechanism.
 
 ## What this exercises
