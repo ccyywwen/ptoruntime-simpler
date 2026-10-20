@@ -15,11 +15,11 @@ import itertools
 import operator
 import struct
 import threading
-from collections.abc import Callable, Iterator, SupportsIndex
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import Any, cast
+from typing import Any, SupportsIndex, cast
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     AccessMode,

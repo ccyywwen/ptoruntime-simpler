@@ -14,11 +14,10 @@ import ctypes
 import struct
 import threading
 import time
-from collections.abc import Buffer as ReadableBuffer
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import Any, NoReturn, Protocol, TypeVar, cast
+from typing import Any, NoReturn, Protocol, TypeVar
 
 from .buffer import AccessMode, Buffer
 from .comm_endpoints import (
@@ -591,9 +590,10 @@ class _RegionTemplateCoordinator:
 
 
 def _admit_bytes_like(obj: object, nbytes: int, *, writable: bool) -> object:
-    if not isinstance(obj, ReadableBuffer):
-        raise ValueError("SPSC queue requires a registered HOST Buffer or contiguous host buffer")
-    view = memoryview(cast(ReadableBuffer, obj))
+    try:
+        view = memoryview(obj)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ValueError("SPSC queue requires a registered HOST Buffer or contiguous host buffer") from exc
     if not view.c_contiguous:
         raise ValueError("SPSC queue ordinary host buffer must be C-contiguous")
     if writable and view.readonly:
@@ -1030,11 +1030,12 @@ class _SpscQueueInitiatorOutput:
         queue = self._queue
         queue._ensure_usable()
         self._require_active_handle(handle, ownership_violation=True)
-        admitted = _admit_spsc_payload(
-            queue._instance, buffer, int(handle.payload_nbytes), writable=True, allow_none=True
-        )
         if int(handle.payload_nbytes) == 0:
+            _admit_spsc_payload_kind(queue._instance, buffer, writable=True)
             return
+        admitted = _admit_spsc_payload(
+            queue._instance, buffer, int(handle.payload_nbytes), writable=True, allow_none=False
+        )
         queue._run_primitive(queue._instance.payload_read, handle.payload_offset, admitted, handle.payload_nbytes)
 
     def release(self, handle: SpscQueueMessage) -> None:

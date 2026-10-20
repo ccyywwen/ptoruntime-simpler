@@ -1436,7 +1436,10 @@ def test_output_exact_fit_true_wrap_and_zero_byte_replay():
     assert handle is not None
     assert handle.payload_nbytes == 0
     assert handle.payload_offset == 0
+    queue.output.read_into(handle, bytearray(4))
+    queue.output.read_into(handle, None)
     queue.output.release(handle)
+    assert queue._output_active is None
     assert queue._output_payload_head == 80
 
 

@@ -1171,7 +1171,6 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
     if (slot_id >= runtime_bufs_.size() || slot_id >= endpoint_failures_.size()) {
         throw RunPreparationRefused("prepare_native_run slot is outside the runtime PipelineContract");
     }
-    endpoint_failures_[slot_id] = {};
     const uint64_t run_epoch = next_native_run_epoch();
     const ChipWorkerNativeRun run_identity{slot_id, generation, run_epoch, run_id, dispatch_id};
     const bool allow_prepared_successor = supports_concurrent_native_prepare();
@@ -1219,6 +1218,8 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
         entry->phase = NativeRunPhase::PREPARING;
         entry->permits_prepared_successor = allow_prepared_successor;
         native_runs_.emplace(run_epoch, std::move(entry));
+        // The admitted run owns this slot. A refused prepare leaves another run's identity in place.
+        endpoint_failures_[slot_id] = {};
     }
 
     int rc = -1;
