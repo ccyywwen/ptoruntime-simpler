@@ -319,8 +319,7 @@ public:
     // prewarm callers without a run retain the runner-query fallback.
     HostApi(
         void *runner_ctx, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch, const HostApiOps *ops,
-        std::optional<DiagnosticConfig> diagnostics = std::nullopt,
-        EndpointFailureIdentity *endpoint_failure = nullptr
+        std::optional<DiagnosticConfig> diagnostics = std::nullopt, EndpointFailureIdentity *endpoint_failure = nullptr
     ) noexcept :
         runner_ctx_(runner_ctx),
         pipeline_slot_(pipeline_slot),
