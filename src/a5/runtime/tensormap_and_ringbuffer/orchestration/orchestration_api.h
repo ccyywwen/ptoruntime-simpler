@@ -261,12 +261,10 @@ static inline bool rt_is_fatal() {
         _rt->ops->report_fatal(_rt, (code), __FUNCTION__, (fmt), ##__VA_ARGS__); \
     } while (0)
 
-#define rt_report_endpoint_failure(kind, session_bits, transaction_id, message)                                 \
-    do {                                                                                                        \
-        RuntimeContext *_rt = current_runtime();                                                                \
-        _rt->ops->report_endpoint_failure(                                                                      \
-            _rt, (kind), (session_bits), (transaction_id), __FUNCTION__, (message)                              \
-        );                                                                                                      \
+#define rt_report_endpoint_failure(kind, session_bits, transaction_id, message)                                    \
+    do {                                                                                                           \
+        RuntimeContext *_rt = current_runtime();                                                                   \
+        _rt->ops->report_endpoint_failure(_rt, (kind), (session_bits), (transaction_id), __FUNCTION__, (message)); \
     } while (0)
 
 // =============================================================================

@@ -84,9 +84,7 @@ def test_child_l3_owns_region_inside_l4_tree(st_platform, st_device_ids):
 
         def l4_drive(orch_handle, _args, cfg, slot: int):
             assert worker._region_instance_registry._instances == {}
-            orch_handle.submit_next_level(
-                l3_orch_handle, sentinel_task_args(slot), cfg, worker=int(l3_worker_id)
-            )
+            orch_handle.submit_next_level(l3_orch_handle, sentinel_task_args(slot), cfg, worker=int(l3_worker_id))
 
         worker.run(lambda orch, args, cfg: l4_drive(orch, args, cfg, 1), args=None, config=_stream_config())
         worker.run(lambda orch, args, cfg: l4_drive(orch, args, cfg, 2), args=None, config=_stream_config())

@@ -27,10 +27,12 @@ from pathlib import Path
 
 import pytest
 from _task_interface import DataType
+from simpler import comm_endpoints as ce
 from simpler.buffer import mint_owner_instance_id, wrap_device_malloc
 from simpler.callable_identity import CallableHandle
+from simpler.orchestrator import _callback_run
 from simpler.task_interface import CallConfig, TaskArgs, TaskHandle
-from simpler.worker import RunHandle, Worker, _CloseAttempt, _Lifecycle, attach_exception_note
+from simpler.worker import RunHandle, Worker, _CloseAttempt, _Lifecycle, _RunResources, attach_exception_note
 
 from tests.st.worker.comm_region.recursive_single_owner._helpers import close_owned_workers
 
@@ -808,10 +810,6 @@ class TestFatalBoundary:
         worker._config = {**worker._config, "platform": "a2a3sim", "device_ids": [0]}
         first = RuntimeError("callback-fatal")
         worker._latch_delegated_session_fatal(first)
-        from simpler import comm_endpoints as ce
-        from simpler.orchestrator import _callback_run
-        from simpler.worker import _RunResources
-
         worker._building_run_resources = _RunResources()
         with _callback_run(1, worker):
             with pytest.raises(RuntimeError, match="no further work is admitted") as control_exc:
