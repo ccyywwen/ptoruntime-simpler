@@ -31,8 +31,8 @@ static_assert(offsetof(EndpointFailureIdentity, kind) == 0, "kind offset");
 static_assert(offsetof(EndpointFailureIdentity, reserved) == 4, "reserved offset");
 static_assert(offsetof(EndpointFailureIdentity, session_instance_id_bits) == 8, "session offset");
 static_assert(offsetof(EndpointFailureIdentity, transaction_id) == 16, "transaction offset");
-static_assert(std::is_trivially_copyable<EndpointFailureIdentity>::value, "identity must be trivially copyable");
-static_assert(std::is_standard_layout<EndpointFailureIdentity>::value, "identity must be standard layout");
+static_assert(std::is_trivially_copyable_v<EndpointFailureIdentity>, "identity must be trivially copyable");
+static_assert(std::is_standard_layout_v<EndpointFailureIdentity>, "identity must be standard layout");
 
 inline bool endpoint_failure_identity_is_well_formed(const EndpointFailureIdentity &identity) {
     if (identity.reserved != 0) {

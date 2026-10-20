@@ -49,13 +49,14 @@ def test_l3_single_hop(st_platform, st_device_ids):
         platform=st_platform,
         runtime="tensormap_and_ringbuffer",
     )
-    chip_handle = worker.register(build_chip_callable(st_platform))
-    lifecycle = region_lifecycle()
-    recorder = lifecycle.install_lifecycle_recorder(worker)
-    worker.init()
+    recorder = None
     transactions: list[int] = []
     primary = None
     try:
+        chip_handle = worker.register(build_chip_callable(st_platform))
+        lifecycle = region_lifecycle()
+        recorder = lifecycle.install_lifecycle_recorder(worker)
+        worker.init()
 
         def orch(orch_handle, _args, cfg):
             queue = create_queue(orch_handle)
@@ -141,5 +142,5 @@ def test_l3_single_hop(st_platform, st_device_ids):
         try:
             close_owned_workers(primary, worker)
         finally:
-            if recorder.restore is not None:
+            if recorder is not None and recorder.restore is not None:
                 recorder.restore()
