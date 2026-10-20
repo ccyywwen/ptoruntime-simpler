@@ -1188,12 +1188,19 @@ def _selector_label(selector: EndpointSelector) -> str:
 
 
 __all__ = [
+    "BufferAccessQuery",
     "DEVICE_AICORE",
     "DEVICE_AICPU",
     "EndpointResolveError",
     "EndpointResolveReason",
     "HOST_CPU",
+    "RegionAccessDecision",
+    "RegionAccessDiagnostics",
+    "RegionAccessReasonCode",
+    "RegionAccessService",
     "SingleOwner",
+    "StaticRegionAccessService",
     "at",
+    "buffer_adapter_candidates",
     "under",
 ]
