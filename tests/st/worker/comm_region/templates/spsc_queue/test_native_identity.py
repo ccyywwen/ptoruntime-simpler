@@ -98,9 +98,7 @@ def test_l4_descriptor_failure_returns_trusted_identity(st_platform, st_device_i
             queue = create_queue(orch_handle, host_path="L4", peer_path=f"L4/L3[{l3_worker_id}]/L2[0]")
             remembered.append(queue)
             _smash(queue)
-            orch_handle.submit_next_level(
-                l3_orch, queue_task_args(queue, sentinels=True), cfg, worker=l3_worker_id
-            )
+            orch_handle.submit_next_level(l3_orch, queue_task_args(queue, sentinels=True), cfg, worker=l3_worker_id)
 
         text = _run_failure(worker, orch)
         queue = remembered[0]

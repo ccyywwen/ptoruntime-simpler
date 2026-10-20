@@ -14,10 +14,11 @@ import ctypes
 import struct
 import threading
 import time
+from collections.abc import Buffer as ReadableBuffer
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import Any, NoReturn, Protocol, TypeVar
+from typing import Any, NoReturn, Protocol, TypeVar, cast
 
 from .buffer import AccessMode, Buffer
 from .comm_endpoints import (
@@ -590,10 +591,9 @@ class _RegionTemplateCoordinator:
 
 
 def _admit_bytes_like(obj: object, nbytes: int, *, writable: bool) -> object:
-    try:
-        view = memoryview(obj)
-    except TypeError as exc:
-        raise ValueError("SPSC queue requires a registered HOST Buffer or contiguous host buffer") from exc
+    if not isinstance(obj, ReadableBuffer):
+        raise ValueError("SPSC queue requires a registered HOST Buffer or contiguous host buffer")
+    view = memoryview(cast(ReadableBuffer, obj))
     if not view.c_contiguous:
         raise ValueError("SPSC queue ordinary host buffer must be C-contiguous")
     if writable and view.readonly:
@@ -615,9 +615,7 @@ def _admit_registered_buffer(worker: object, obj: Buffer, nbytes: int, *, writab
     return obj
 
 
-def _admit_spsc_payload(
-    instance: object, obj: object, nbytes: int, *, writable: bool, allow_none: bool
-) -> object:
+def _admit_spsc_payload(instance: object, obj: object, nbytes: int, *, writable: bool, allow_none: bool) -> object:
     if int(nbytes) == 0 and allow_none:
         if obj is not None:
             raise ValueError("SPSC queue zero-byte payload requires buffer == None")
@@ -733,14 +731,10 @@ class SpscQueue:
             raise
 
     def _signal_test(self, offset: int, cmp_value: int, cmp: WaitCmp) -> Any:
-        return self._run_primitive(
-            lambda: self._instance._counter_test(offset, _counter_low32(cmp_value), cmp)
-        )
+        return self._run_primitive(lambda: self._instance._counter_test(offset, _counter_low32(cmp_value), cmp))
 
     def _signal_notify(self, offset: int, value: int) -> None:
-        self._run_primitive(
-            lambda: self._instance._counter_notify(offset, _counter_low32(value), NotifyOp.Set)
-        )
+        self._run_primitive(lambda: self._instance._counter_notify(offset, _counter_low32(value), NotifyOp.Set))
 
     def _sample_peer_abort(self) -> None:
         result = self._signal_test(self._layout.peer_abort_offset, 1, WaitCmp.GE)
@@ -882,17 +876,13 @@ class _SpscQueueInitiatorInput:
     def try_enqueue(self, buffer_or_none: object, nbytes: int) -> bool:
         queue = self._queue
         queue._ensure_usable()
-        admitted = _admit_spsc_payload(
-            queue._instance, buffer_or_none, int(nbytes), writable=False, allow_none=True
-        )
+        admitted = _admit_spsc_payload(queue._instance, buffer_or_none, int(nbytes), writable=False, allow_none=True)
         return self._try_enqueue(admitted, nbytes, SpscQueueOpcode.DATA)
 
     def enqueue(self, buffer_or_none: object, nbytes: int, timeout: float) -> None:
         queue = self._queue
         queue._ensure_usable()
-        admitted = _admit_spsc_payload(
-            queue._instance, buffer_or_none, int(nbytes), writable=False, allow_none=True
-        )
+        admitted = _admit_spsc_payload(queue._instance, buffer_or_none, int(nbytes), writable=False, allow_none=True)
         self._enqueue(admitted, nbytes, SpscQueueOpcode.DATA, timeout)
 
     def _enqueue(self, buffer_or_none: object, nbytes: int, opcode: SpscQueueOpcode, timeout: float) -> None:

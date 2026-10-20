@@ -183,11 +183,7 @@ def forwarded_task_args(args) -> TaskArgs:
     count = int(args.scalar_count())
     start = 0
     end = count
-    if (
-        count >= 2
-        and int(args.scalar(0)) == _SENTINEL_HEAD
-        and int(args.scalar(count - 1)) == _SENTINEL_TAIL
-    ):
+    if count >= 2 and int(args.scalar(0)) == _SENTINEL_HEAD and int(args.scalar(count - 1)) == _SENTINEL_TAIL:
         start = 1
         end = count - 1
     task_args = TaskArgs()

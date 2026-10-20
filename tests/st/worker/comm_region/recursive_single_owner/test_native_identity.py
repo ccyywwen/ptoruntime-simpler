@@ -142,9 +142,7 @@ def test_l3_bad_transaction_is_untrusted(st_platform, st_device_ids):
         def orch(orch_handle, _args, cfg):
             region = create_live_region(orch_handle, "L3/L2[0]")
             region_ref["region"] = region
-            orch_handle.submit_next_level(
-                chip_handle, build_region_task_args(region, {7: 0}), cfg, worker=0
-            )
+            orch_handle.submit_next_level(chip_handle, build_region_task_args(region, {7: 0}), cfg, worker=0)
 
         text = _run_region_failure(worker, orch)
         region = region_ref["region"]

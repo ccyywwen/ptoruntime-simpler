@@ -134,9 +134,7 @@ def _handshake(orch_handle, region, round_idx: int) -> None:
     data_ready.notify(stop_seq, NotifyOp.Set)
 
 
-def build_region_task_args(
-    region, overrides: dict[int, int] | None = None, *, sentinels: bool = False
-) -> TaskArgs:
+def build_region_task_args(region, overrides: dict[int, int] | None = None, *, sentinels: bool = False) -> TaskArgs:
     values: list[object] = [int(scalar) for scalar in region.descriptor_scalars()]
     values.extend(
         [
@@ -295,11 +293,7 @@ def forwarded_task_args(args) -> TaskArgs:
     count = int(args.scalar_count())
     start = 0
     end = count
-    if (
-        count >= 2
-        and int(args.scalar(0)) == _SENTINEL_HEAD
-        and int(args.scalar(count - 1)) == _SENTINEL_TAIL
-    ):
+    if count >= 2 and int(args.scalar(0)) == _SENTINEL_HEAD and int(args.scalar(count - 1)) == _SENTINEL_TAIL:
         start = 1
         end = count - 1
     chip_args = TaskArgs()

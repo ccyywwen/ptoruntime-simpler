@@ -65,13 +65,9 @@ def test_l4_two_hop(st_platform, st_device_ids):
         worker.init()
 
         def drive(orch_handle, _args, cfg, *, free: bool):
-            queue = create_queue(
-                orch_handle, host_path="L4", peer_path=f"L4/L3[{l3_worker_id}]/L2[0]"
-            )
+            queue = create_queue(orch_handle, host_path="L4", peer_path=f"L4/L3[{l3_worker_id}]/L2[0]")
             transactions.append(int(queue._endpoint_binding.transaction_id))
-            orch_handle.submit_next_level(
-                l3_orch, queue_task_args(queue, sentinels=True), cfg, worker=l3_worker_id
-            )
+            orch_handle.submit_next_level(l3_orch, queue_task_args(queue, sentinels=True), cfg, worker=l3_worker_id)
             echo_once(queue, free=free)
 
         worker.run(lambda orch, args, cfg: drive(orch, args, cfg, free=False), args=None, config=stream_config())

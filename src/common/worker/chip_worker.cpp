@@ -1283,9 +1283,9 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
             const EndpointFailureIdentity identity = endpoint_failures_[slot_id];
             endpoint_failures_[slot_id] = {};
             drop_preparing_native_run(run_epoch);
-            throw std::runtime_error(with_endpoint_failure_marker(
-                identity, "native-run identity changed while prepare was in progress"
-            ));
+            throw std::runtime_error(
+                with_endpoint_failure_marker(identity, "native-run identity changed while prepare was in progress")
+            );
         }
         if (admit_pipeline_generation && !pipeline_generations_.admit(PipelineSlotLease{slot_id, 0, generation})) {
             lk.unlock();

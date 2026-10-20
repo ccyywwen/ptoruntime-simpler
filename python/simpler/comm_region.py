@@ -15,11 +15,11 @@ import itertools
 import operator
 import struct
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, SupportsIndex
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import Any
+from typing import Any, cast
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     AccessMode,
@@ -252,10 +252,10 @@ def _require_region_scalar(name: str, value: int) -> int:
 
 def _require_region_size(name: str, value: object) -> int:
     """Accept an integer index and reject bool, non-positive, and uint64 overflow."""
-    if isinstance(value, bool) or getattr(value, "__index__", None) is None:
+    if isinstance(value, bool) or not isinstance(value, SupportsIndex):
         raise TypeError(f"{name} must be an integer index")
     try:
-        converted = operator.index(value)
+        converted = operator.index(cast(SupportsIndex, value))
     except TypeError as exc:
         raise TypeError(f"{name} must be an integer index") from exc
     if type(converted) is not int or converted <= 0 or converted > _UINT64_MAX:
@@ -264,10 +264,10 @@ def _require_region_size(name: str, value: object) -> int:
 
 
 def _require_counter_i32(name: str, value: object) -> int:
-    if isinstance(value, bool) or getattr(value, "__index__", None) is None:
+    if isinstance(value, bool) or not isinstance(value, SupportsIndex):
         raise TypeError(f"{name} must be an integer")
     try:
-        converted = operator.index(value)
+        converted = operator.index(cast(SupportsIndex, value))
     except TypeError as exc:
         raise TypeError(f"{name} must be an integer") from exc
     if converted < _INT32_MIN or converted > _INT32_MAX:
@@ -318,10 +318,10 @@ class PayloadPart:
 
 
 def _require_non_negative_size(name: str, value: object) -> int:
-    if isinstance(value, bool) or getattr(value, "__index__", None) is None:
+    if isinstance(value, bool) or not isinstance(value, SupportsIndex):
         raise TypeError(f"{name} must be an integer index")
     try:
-        converted = operator.index(value)
+        converted = operator.index(cast(SupportsIndex, value))
     except TypeError as exc:
         raise TypeError(f"{name} must be an integer index") from exc
     if converted < 0:
@@ -365,9 +365,7 @@ class CounterPart:
         selected = WaitCmp(cmp)
         operand = _require_counter_i32("counter cmp_value", cmp_value)
         try:
-            matched, observed = _region_counter_test(
-                self._handle, self._mapping_offset(offset), operand, int(selected)
-            )
+            matched, observed = _region_counter_test(self._handle, self._mapping_offset(offset), operand, int(selected))
         except Exception as exc:
             self._on_issued_failure(exc)
             raise
@@ -1002,9 +1000,7 @@ class RegionInstance:
             raise RuntimeError(f"{api}: region data plane failed") from self._data_plane_error
         if self._owner_run_id is None or self._cleanup_resources is None:
             raise RuntimeError(f"{api}: region access requires its owning run")
-        self._worker._require_region_access_run(
-            api, resources=self._cleanup_resources, run_id=int(self._owner_run_id)
-        )
+        self._worker._require_region_access_run(api, resources=self._cleanup_resources, run_id=int(self._owner_run_id))
 
 
 def project_region_allocation_spec(plan: object, layout: object) -> RegionAllocationSpec:

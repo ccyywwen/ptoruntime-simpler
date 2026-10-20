@@ -10085,9 +10085,7 @@ class Worker:
         )
         return True
 
-    def _poison_region_from_endpoint_error(
-        self, exc: BaseException, resources: _RunResources | None = None
-    ) -> bool:
+    def _poison_region_from_endpoint_error(self, exc: BaseException, resources: _RunResources | None = None) -> bool:
         text = str(exc)
         try:
             parsed = _parse_endpoint_failure_marker(text)
@@ -10129,11 +10127,7 @@ class Worker:
         if base <= 0 or nbytes <= 0:
             return
         resources = self._building_run_resources
-        buffers = (
-            self._region_host_buffers
-            if resources is None
-            else resources.region_host_buffers
-        )
+        buffers = self._region_host_buffers if resources is None else resources.region_host_buffers
         buffers[base] = max(
             int(buffers.get(base, 0)),
             nbytes,
@@ -10149,11 +10143,7 @@ class Worker:
         if base <= 0 or nbytes <= 0:
             raise ValueError("L3-L2 payload buffer must have a nonzero address and size")
         resources = self._building_run_resources
-        buffers = (
-            self._region_host_buffers
-            if resources is None
-            else resources.region_host_buffers
-        )
+        buffers = self._region_host_buffers if resources is None else resources.region_host_buffers
         registered_nbytes = buffers.get(base)
         if registered_nbytes is None:
             raise ValueError("L3-L2 payload buffer is not registered; use a handle returned by orch.alloc(...)")

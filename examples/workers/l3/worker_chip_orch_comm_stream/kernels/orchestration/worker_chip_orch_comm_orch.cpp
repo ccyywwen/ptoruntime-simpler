@@ -89,9 +89,7 @@ __attribute__((visibility("default"))) void worker_chip_orch_comm_orchestration(
     for (uint64_t seq = 1;; ++seq) {
         const int32_t signal_value = static_cast<int32_t>(seq);
         int32_t observed = 0;
-        if (!view.counter().wait(
-                data_ready_counter_offset, signal_value, RegionWaitCmp::GE, timeout, observed
-            )) {
+        if (!view.counter().wait(data_ready_counter_offset, signal_value, RegionWaitCmp::GE, timeout, observed)) {
             report_view_error(
                 session_bits, transaction_id, region_id, view.error(), counter_addr_at(data_ready_counter_offset),
                 signal_value

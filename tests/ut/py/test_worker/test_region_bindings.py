@@ -47,7 +47,9 @@ def sim_counter():
 
 
 def _store(shm: SharedMemory, value: int) -> None:
-    struct.pack_into("<i", shm.buf, 0, value)
+    buf = shm.buf
+    assert buf is not None
+    struct.pack_into("<i", buf, 0, value)
 
 
 def test_host_counter_add_keeps_small_positive_and_negative_deltas(sim_counter):
