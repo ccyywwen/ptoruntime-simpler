@@ -496,9 +496,7 @@ class _SpscQueueInitiatorInput:
                 return
             if self._queue._input_stop_published:
                 raise RuntimeError("SPSC queue input is stopped")
-            self._queue._wait_progress(
-                self._queue._layout.input_desc_head_offset, self._queue._input_head, deadline_ns
-            )
+            self._queue._wait_progress(self._queue._layout.input_desc_head_offset, self._queue._input_head, deadline_ns)
 
     def _try_enqueue(self, buffer_or_none: object, nbytes: int, opcode: SpscQueueOpcode) -> bool:
         queue = self._queue
@@ -558,9 +556,7 @@ class _SpscQueueInitiatorInput:
             if hasattr(buffer_or_none, "nbytes") and hasattr(buffer_or_none, "base"):
                 available = int(buffer_or_none.nbytes)
                 if available < int(nbytes):
-                    raise ValueError(
-                        f"SPSC queue nbytes={nbytes} exceeds registered buffer size {available}"
-                    ) from None
+                    raise ValueError(f"SPSC queue nbytes={nbytes} exceeds registered buffer size {available}") from None
                 return
             raise ValueError("SPSC queue requires a contiguous host buffer") from exc
         if not view.c_contiguous:
@@ -679,8 +675,8 @@ class _SpscQueueInitiatorOutput:
 def create_spsc_queue(
     orch: object,
     *,
-    initiator: object,
-    peer: object,
+    initiator: ce.EndpointSelector,
+    peer: ce.EndpointSelector,
     depth: int,
     input_arena_bytes: int,
     output_arena_bytes: int,

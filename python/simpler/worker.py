@@ -342,9 +342,7 @@ _BOOTSTRAP_WAIT_TIMEOUT_S = 120.0
 _BOOTSTRAP_POLL_INTERVAL_S = 0.001
 _PY_CONTROL_TIMEOUT_S = 30.0
 _ENDPOINT_SHORT_MARKERS = ("Region endpoint error",)
-_ENDPOINT_SHORT_RE = re.compile(
-    r"^(Region endpoint error) session=0x([0-9a-fA-F]{16}) transaction=([0-9]+)$"
-)
+_ENDPOINT_SHORT_RE = re.compile(r"^(Region endpoint error) session=0x([0-9a-fA-F]{16}) transaction=([0-9]+)$")
 _ENDPOINT_UNTRUSTED_RE = re.compile(r"^(Region endpoint error) identity=untrusted$")
 _UINT64_MAX = (1 << 64) - 1
 

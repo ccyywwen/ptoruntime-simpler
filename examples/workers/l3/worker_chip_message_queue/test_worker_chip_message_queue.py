@@ -19,7 +19,6 @@ import struct
 
 import pytest
 from simpler import comm_endpoints as ce
-from .spsc_queue import SpscQueueOpcode, create_spsc_queue
 from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import CallConfig, ChipCallable, CoreCallable, TaskArgs
 from simpler.worker import Worker
@@ -27,6 +26,8 @@ from simpler.worker import Worker
 from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
+
+from .spsc_queue import SpscQueueOpcode, create_spsc_queue
 
 _RUNTIME = "tensormap_and_ringbuffer"
 _HERE = os.path.dirname(os.path.abspath(__file__))

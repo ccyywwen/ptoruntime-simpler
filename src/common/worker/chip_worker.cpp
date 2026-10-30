@@ -1564,9 +1564,11 @@ ChipWorker::NativeLaunch ChipWorker::launch_native_run(const ChipWorkerNativeRun
         if (poll_rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE) {
             note_native_run_completion(run.run_epoch, rc);
         }
-        failure = std::make_exception_ptr(std::runtime_error(
-            "launch_native_run failed with code " + std::to_string(rc) + " " + format_native_run_identity(run)
-        ));
+        failure = std::make_exception_ptr(
+            std::runtime_error(
+                "launch_native_run failed with code " + std::to_string(rc) + " " + format_native_run_identity(run)
+            )
+        );
     } else if (failure == nullptr) {
         note_native_run_launched(run.run_epoch);
     }
@@ -1634,9 +1636,12 @@ bool ChipWorker::launch_native_run_joined(
         if (poll_rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE) {
             note_native_run_completion(run.run_epoch, rc);
         }
-        failure = std::make_exception_ptr(std::runtime_error(
-            "launch_native_run_joined failed with code " + std::to_string(rc) + " " + format_native_run_identity(run)
-        ));
+        failure = std::make_exception_ptr(
+            std::runtime_error(
+                "launch_native_run_joined failed with code " + std::to_string(rc) + " " +
+                format_native_run_identity(run)
+            )
+        );
     } else if (failure == nullptr) {
         note_native_run_launched(run.run_epoch);
     }
@@ -1670,9 +1675,11 @@ bool ChipWorker::poll_native_run(const ChipWorkerNativeRun &run) {
     if (failure == nullptr && rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE) {
         note_native_run_completion(run.run_epoch, 0);
     } else if (failure == nullptr && rc != SIMPLER_NATIVE_RUN_POLL_NOT_READY) {
-        failure = std::make_exception_ptr(std::runtime_error(
-            "poll_native_run failed with code " + std::to_string(rc) + " " + format_native_run_identity(run)
-        ));
+        failure = std::make_exception_ptr(
+            std::runtime_error(
+                "poll_native_run failed with code " + std::to_string(rc) + " " + format_native_run_identity(run)
+            )
+        );
     }
     if (failure != nullptr) std::rethrow_exception(failure);
     return rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE;
@@ -2508,8 +2515,8 @@ void ChipWorker::comm_destroy(uint64_t comm_handle) {
     }
 
     int rc = destroy_comm_session(*session);
-    while (!comm_sessions_.empty() && comm_sessions_.back().handle == nullptr && comm_sessions_.back().stream == nullptr
-    ) {
+    while (!comm_sessions_.empty() && comm_sessions_.back().handle == nullptr &&
+           comm_sessions_.back().stream == nullptr) {
         comm_sessions_.pop_back();
     }
 

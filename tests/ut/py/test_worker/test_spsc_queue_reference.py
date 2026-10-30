@@ -21,9 +21,7 @@ from typing import Any
 import pytest
 from simpler.comm_region import NotifyOp, RegionInstanceState, SignalTestResult, WaitCmp
 
-_EXAMPLE_DIR = (
-    Path(__file__).resolve().parents[4] / "examples" / "workers" / "l3" / "worker_chip_message_queue"
-)
+_EXAMPLE_DIR = Path(__file__).resolve().parents[4] / "examples" / "workers" / "l3" / "worker_chip_message_queue"
 sys.path.insert(0, str(_EXAMPLE_DIR))
 
 from spsc_queue import (  # noqa: E402
@@ -220,9 +218,7 @@ def _plant_output(region: _PublicRegion, queue: SpscQueue, seq: int, opcode: Sps
         offset = 0
     slot_index = (int(seq) - 1) & (layout.depth - 1)
     slot = layout.output_desc_offset + slot_index * DESCRIPTOR_BYTES
-    region.payload[slot : slot + DESCRIPTOR_BYTES] = encode_spsc_queue_descriptor(
-        seq, opcode, offset, len(payload)
-    )
+    region.payload[slot : slot + DESCRIPTOR_BYTES] = encode_spsc_queue_descriptor(seq, opcode, offset, len(payload))
     region.counters[layout.output_desc_tail_offset] = int(seq)
     return offset
 
@@ -263,7 +259,9 @@ def test_layout_max_depth_and_invalid_values():
 
 def test_opcode_and_descriptor_golden_vector():
     assert [int(item) for item in SpscQueueOpcode] == [0, 1, 2, 3]
-    encoded = encode_spsc_queue_descriptor(*_DESCRIPTOR_GOLDEN_FIELDS[:1], SpscQueueOpcode.ERROR, *_DESCRIPTOR_GOLDEN_FIELDS[2:])
+    encoded = encode_spsc_queue_descriptor(
+        *_DESCRIPTOR_GOLDEN_FIELDS[:1], SpscQueueOpcode.ERROR, *_DESCRIPTOR_GOLDEN_FIELDS[2:]
+    )
     assert encoded == _DESCRIPTOR_GOLDEN_BYTES
     assert decode_spsc_queue_descriptor(encoded) == _DESCRIPTOR_GOLDEN_FIELDS
     assert struct.calcsize("<QQQQ") == DESCRIPTOR_BYTES
@@ -435,9 +433,7 @@ def test_output_early_wrap_poisons_once():
     queue.output.release(handle)
     region.payload[out : out + 8] = b"xxxxxxxx"
     slot = queue.layout.output_desc_offset + DESCRIPTOR_BYTES
-    region.payload[slot : slot + DESCRIPTOR_BYTES] = encode_spsc_queue_descriptor(
-        2, SpscQueueOpcode.DATA, out, 8
-    )
+    region.payload[slot : slot + DESCRIPTOR_BYTES] = encode_spsc_queue_descriptor(2, SpscQueueOpcode.DATA, out, 8)
     region.counters[queue.layout.output_desc_tail_offset] = 2
     with pytest.raises(RuntimeError, match="payload replay offset mismatch"):
         queue.output.try_peek()

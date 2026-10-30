@@ -3239,8 +3239,7 @@ def test_live_public_init_failure_rolls_back_before_delivery(region_worker, monk
 
 
 def test_comm_region_public_names_are_the_region_primitives():
-    import simpler.comm_region as comm_region
-    import simpler.orchestrator as orchestrator
+    from simpler import comm_region, orchestrator
 
     assert comm_region.__all__ == [
         "MaterializationRefusal",

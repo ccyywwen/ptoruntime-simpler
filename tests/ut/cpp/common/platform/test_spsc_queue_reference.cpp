@@ -49,9 +49,11 @@ constexpr uint8_t kDescriptorGoldenBytes[32] = {
 TEST(SpscQueueReference, LayoutGoldenVectors) {
     for (const auto &test_case : kLayoutGolden) {
         spsc_queue::SpscQueueLayout layout{};
-        ASSERT_TRUE(spsc_queue::SpscQueueLayout::create(
-            test_case.depth, test_case.input_arena_bytes, test_case.output_arena_bytes, &layout
-        ));
+        ASSERT_TRUE(
+            spsc_queue::SpscQueueLayout::create(
+                test_case.depth, test_case.input_arena_bytes, test_case.output_arena_bytes, &layout
+            )
+        );
         EXPECT_EQ(layout.input_desc_offset, 0u);
         EXPECT_EQ(layout.output_desc_offset, test_case.output_desc_offset);
         EXPECT_EQ(layout.input_arena_offset, test_case.input_arena_offset);
