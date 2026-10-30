@@ -45,8 +45,8 @@ local views, attachments, allocation identity, or the registry.
 The two spans are not a fixed "data area plus signal area". Each one accepts a
 different operation set with different rules:
 
-| | payload | counter |
-| --- | --- | --- |
+| Rule | payload | counter |
+| ---- | ------- | ------- |
 | Operations | `payload_write`, `payload_read` | `notify`, `test`, `wait` |
 | Unit | any `nbytes` within the span | exactly 4 bytes |
 | Offset | any offset whose range fits | multiple of 4 |
