@@ -73,8 +73,7 @@ changing simpler's own internals.
 | Document | What it covers |
 | -------- | -------------- |
 | [Communication Domains](comm-domain.md) | Dynamic `CommDomain` allocation and the symmetric window |
-| [CPU-NPU Region Communication](CPU-NPU-orch-comm.md) | Exchange payload bytes and synchronization signals with a running NPU task |
-| [CPU-NPU Message Queue](CPU-NPU-message-queue.md) | Exchange ordered messages with a running NPU task |
+| [CPU-NPU Region Communication](CPU-NPU-orch-comm.md) | Exchange payload bytes and synchronization signals with a running NPU task, plus the SPSC queue example built on it |
 | [Directed NEXT_LEVEL Scheduling](directed-next-level-scheduling.md) | Targeting a specific next-level child instead of any free one |
 | [Remote L3 Worker Design](remote-l3-worker-design.md) | L4 host-to-host workers — protocol, transports, status |
 | [remote-l3-worker-design/](remote-l3-worker-design/README.md) | Full design set: protocol, buffers and transports, implementation plan and record |

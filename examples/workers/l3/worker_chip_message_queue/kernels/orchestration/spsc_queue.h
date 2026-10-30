@@ -1099,16 +1099,16 @@ private:
 
 static_assert(kSpscQueueConfigScalarCount == 3, "SPSC config scalar count changed");
 static_assert(kDescriptorBytes == 32, "SPSC descriptor size changed");
-static_assert(kArenaAlignment == 64, "SPSQ arena alignment changed");
-static_assert(kCounterStride == 64, "SPSQ counter stride changed");
-static_assert(kCounterBytes == 384, "SPSQ counter bytes changed");
-static_assert(kMaxDepth == (1ull << 30), "SPSQ max depth changed");
-static_assert(kInputDescTailOffset == 0, "SPSQ input tail offset changed");
-static_assert(kInputDescHeadOffset == 64, "SPSQ input head offset changed");
-static_assert(kOutputDescTailOffset == 128, "SPSQ output tail offset changed");
-static_assert(kOutputDescHeadOffset == 192, "SPSQ output head offset changed");
-static_assert(kInitiatorAbortOffset == 256, "SPSQ initiator abort offset changed");
-static_assert(kPeerAbortOffset == 320, "SPSQ peer abort offset changed");
+static_assert(kArenaAlignment == 64, "SPSC arena alignment changed");
+static_assert(kCounterStride == 64, "SPSC counter stride changed");
+static_assert(kCounterBytes == 384, "SPSC counter bytes changed");
+static_assert(kMaxDepth == (1ull << 30), "SPSC max depth changed");
+static_assert(kInputDescTailOffset == 0, "SPSC input tail offset changed");
+static_assert(kInputDescHeadOffset == 64, "SPSC input head offset changed");
+static_assert(kOutputDescTailOffset == 128, "SPSC output tail offset changed");
+static_assert(kOutputDescHeadOffset == 192, "SPSC output head offset changed");
+static_assert(kInitiatorAbortOffset == 256, "SPSC initiator abort offset changed");
+static_assert(kPeerAbortOffset == 320, "SPSC peer abort offset changed");
 static_assert(sizeof(SpscQueueDescriptor) == 32, "SpscQueueDescriptor ABI size changed");
 static_assert(offsetof(SpscQueueDescriptor, seq) == 0, "SpscQueueDescriptor::seq offset changed");
 static_assert(offsetof(SpscQueueDescriptor, opcode) == 8, "SpscQueueDescriptor::opcode offset changed");

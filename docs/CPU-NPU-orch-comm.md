@@ -3,9 +3,10 @@
 CPU-NPU Region Communication lets a CPU orchestration callback exchange bytes
 and synchronization signals with a running NPU orchestration task.
 
-Use a region when your application has its own payload layout or handshake
-protocol. If you only need ordered messages, use the higher-level
-[CPU-NPU Message Queue](CPU-NPU-message-queue.md).
+`create_region` is the single entry point for CPU-NPU shared memory. Message
+queues, rings, and request/response protocols are application code built on
+top of it; [SPSC queue example](#spsc-queue-example) walks through one such
+protocol that ships with the repository.
 
 ## When to use a region
 
@@ -20,6 +21,47 @@ A region provides:
 Typical uses include a persistent NPU task that accepts several rounds of
 input, publishes completion for each round, and exits after an application
 defined stop message.
+
+### Public surface
+
+`simpler.comm_region` exports exactly these names:
+
+| Name | Purpose |
+| ---- | ------- |
+| `RegionInstance` | `payload_write`, `payload_read`, `counter`, `descriptor_scalars`, `free` |
+| `RegionCounter` | `notify`, `test`, `wait` |
+| `NotifyOp` | `Set` and `Add` for `notify` |
+| `WaitCmp` | comparison for `test` and `wait` |
+| `SignalTestResult` | `matched` and `observed` from `test` |
+| `MaterializationRefusal` | creation was refused |
+| `RefusalReason` | why creation was refused |
+
+Everything else in that module is internal. An application that stays within
+this surface can define its own payload protocol without reaching into
+local views, attachments, allocation identity, or the registry.
+
+### Payload and counter are different access contracts
+
+The two spans are not a fixed "data area plus signal area". Each one accepts a
+different operation set with different rules:
+
+| | payload | counter |
+| --- | --- | --- |
+| Operations | `payload_write`, `payload_read` | `notify`, `test`, `wait` |
+| Unit | any `nbytes` within the span | exactly 4 bytes |
+| Offset | any offset whose range fits | multiple of 4 |
+| Value | opaque bytes from a host buffer | one signed 32-bit integer |
+| Comparison | none | `WaitCmp` against the observed value |
+| Blocking | never | `wait` blocks until its timeout |
+| Concurrent writers | the application's own rule | one writer per counter |
+
+So payload moves bounded byte ranges of a size the application chooses, and
+counter carries a single comparable value you can publish, poll, or block on.
+A counter cannot transfer bytes, and a payload range cannot be waited on.
+
+On the current driver both go through the same host copy backend: payload
+transfers are synchronous H2D/D2H copies, and counter notify, test, and wait
+are copy-based 4-byte accesses.
 
 ## Understand endpoints
 
@@ -119,6 +161,16 @@ Create the region inside the orchestration callback that owns it:
 Create the region before submitting work that uses it. A region cannot be
 created outside its owning callback, retained across runs, or shared with a
 remote node.
+
+Cross-node members, `DEVICE_AICORE` providers, Host providers, several
+consumers, and persistence across runs are not supported.
+
+One logical region does not promise the same virtual address at every
+endpoint, and it does not promise that every endpoint can load and store the
+memory directly. Each side uses its own endpoint-local addresses: the CPU side
+uses the `payload_*` and `counter` methods, and the NPU side uses the spans
+carried by the descriptor. Pass the descriptor through; do not share a raw
+pointer between the two sides.
 
 ## Quick start
 
@@ -239,11 +291,26 @@ observed = done.wait(sequence, WaitCmp.GE, timeout=5.0)
 `WaitCmp` supports `EQ`, `NE`, `GT`, `GE`, `LT`, and `LE`. Prefer `GE` for a
 monotonic sequence so the waiter still succeeds if it observes a later value.
 
-`NotifyOp.Add` is not an atomic multi-writer operation. Keep one writer per
-counter and one writer per 64-byte counter cache line. Place counters written
-by different sides at offsets such as `0` and `64`.
+`NotifyOp.Add` is a copy-based read-modify-write, not a multi-writer atomic
+fetch-add. Keep one writer per counter and one writer per 64-byte counter
+cache line. Place counters written by different sides at offsets such as `0`
+and `64`.
 
 A failed `test` and an ordinary `wait` timeout do not poison the region.
+
+### What a publish guarantees
+
+The supported path guarantees this ordering in both directions:
+
+1. an endpoint finishes its `payload_write` calls, then calls `notify`;
+2. the peer observes that publication through `test` or `wait`;
+3. the peer's later `payload_read` sees the payload writes that completed
+   before the publication.
+
+The guarantee comes from synchronous copies, call ordering, and the backend's
+cache maintenance. It does not imply a shared virtual address or a
+general-purpose hardware atomic. Keep the order above: a `notify` issued
+before its payload writes complete publishes nothing useful.
 
 ## NPU-side integration
 
@@ -303,6 +370,11 @@ calling `free()`, the run still reclaims the region automatically.
 Do not use a region, a previously acquired counter, or descriptor scalars
 after `free()` or after the owning callback has returned.
 
+An application `STOP` and `region.free()` are independent. `STOP` is a message
+in your protocol that tells the NPU task to finish; `free()` ends CPU access to
+the region. Neither one implies the other, and neither replaces the run's own
+drain of submitted work.
+
 ## Errors
 
 Argument, range, buffer, and timeout validation errors are reported directly
@@ -341,3 +413,71 @@ pytest examples/workers/l3/worker_chip_orch_comm_stream \
 ```
 
 The same public API is available on `a2a3sim`, `a5sim`, `a2a3`, and `a5`.
+
+## SPSC queue example
+
+`examples/workers/l3/worker_chip_message_queue` implements a duplex
+single-producer, single-consumer message queue on top of the public region
+API. It is a reference application, not part of the simpler runtime: the
+layout, the opcodes, the backpressure rule, and the `STOP` handshake all live
+in the example. Treat it as a worked example of a protocol you could write
+differently, or replace entirely, without changing `python/simpler`.
+
+The example's `create_spsc_queue` helper calls `create_region` and nothing
+else:
+
+```python
+layout = SpscQueueLayout.create(
+    depth=depth,
+    input_arena_bytes=input_arena_bytes,
+    output_arena_bytes=output_arena_bytes,
+)
+region = orch.create_region(
+    members=(initiator, peer),
+    topology=ce.SingleOwner(provider=peer),
+    payload_bytes=layout.payload_bytes,
+    counter_bytes=layout.counter_bytes,
+)
+return SpscQueue(region, layout)
+```
+
+The layout places two descriptor rings and two payload arenas inside the
+payload span, and the head, tail, and abort counters inside the counter span.
+Every queue operation is a `payload_write`, `payload_read`, or counter call on
+that region; the queue reads no private region attribute.
+
+### Task arguments are 8 + 3 scalars
+
+The NPU side receives eleven scalars:
+
+| Index | Meaning |
+| ----- | ------- |
+| 0-7 | region descriptor from `descriptor_scalars()`, forwarded unchanged |
+| 8 | queue depth |
+| 9 | input arena bytes |
+| 10 | output arena bytes |
+
+The first eight are decoded by the shared `region_decode_task_args` helper
+into a `RegionInstanceView`. The last three are application configuration that
+the example's own header validates. Nothing in the first eight is reinterpreted
+by the queue.
+
+### Failures split by owner
+
+Region access failures and protocol failures are reported through different
+paths. When the underlying view has failed, the example reports it as a region
+failure with `region_report_endpoint_error(...)`, so the host attributes it to
+the owning region. A bad sequence number, an unknown opcode, or a broken
+ownership rule is an application bug and is reported with `rt_report_fatal`.
+The runtime does not recognize queue protocol errors.
+
+### Run it
+
+```bash
+pytest examples/workers/l3/worker_chip_message_queue --platform a2a3sim
+pytest examples/workers/l3/worker_chip_message_queue --platform a2a3 --device <id>
+```
+
+See the example's
+[README](../examples/workers/l3/worker_chip_message_queue/README.md) for the
+request modes, the response ordering, and the device-side loop.
