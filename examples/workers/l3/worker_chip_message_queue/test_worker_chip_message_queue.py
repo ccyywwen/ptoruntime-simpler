@@ -19,7 +19,7 @@ import struct
 
 import pytest
 from simpler import comm_endpoints as ce
-from simpler.comm_region_template import SpscQueueOpcode
+from .spsc_queue import SpscQueueOpcode, create_spsc_queue
 from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import CallConfig, ChipCallable, CoreCallable, TaskArgs
 from simpler.worker import Worker
@@ -151,7 +151,9 @@ def _read_message_payload(queue, message) -> bytes:
     return bytes(output)
 
 
-def run_worker_chip_message_queue_example(platform: str, device_id: int) -> None:
+def run_worker_chip_message_queue_example(
+    platform: str, device_id: int, *, depth: int = _QUEUE_DEPTH, repeats: int = 1, prefill: bool = False
+) -> None:
     chip_callable = _build_chip_callable(platform)
     worker = Worker(
         level=3,
@@ -169,34 +171,45 @@ def run_worker_chip_message_queue_example(platform: str, device_id: int) -> None
         def orch(orch_handle, _args, cfg):
             host = ce.at("L3", ce.HOST_CPU)
             device = ce.at("L3/L2[0]", ce.DEVICE_AICPU)
-            queue = orch_handle.create_spsc_queue(
+            queue = create_spsc_queue(
+                orch_handle,
                 initiator=host,
                 peer=device,
-                depth=_QUEUE_DEPTH,
+                depth=depth,
                 input_arena_bytes=_INPUT_ARENA_BYTES,
                 output_arena_bytes=_OUTPUT_ARENA_BYTES,
             )
+            payloads = _input_payloads()
+            expected_outputs = _expected_outputs()
+            if prefill:
+                for payload in payloads:
+                    queue.input.enqueue(payload, nbytes=len(payload), timeout=_TIMEOUT_S)
+                assert queue.input.try_enqueue(payloads[0], len(payloads[0])) is False
+                assert queue.output.try_peek() is None
 
             task_args = TaskArgs()
             for scalar in queue.peer_task_arg_scalars():
                 task_args.add_scalar(int(scalar))
+            assert len(queue.peer_task_arg_scalars()) == 11
             orch_handle.submit_next_level(handle, task_args, cfg, worker=0)
 
-            payloads = _input_payloads()
-            expected_outputs = _expected_outputs()
-
-            for payload in payloads[:2]:
-                queue.input.enqueue(payload, nbytes=len(payload), timeout=_TIMEOUT_S)
+            if not prefill:
+                for payload in payloads[:2]:
+                    queue.input.enqueue(payload, nbytes=len(payload), timeout=_TIMEOUT_S)
             _read_expected_outputs(queue, expected_outputs[:3])
 
-            for payload in payloads[2:]:
-                queue.input.enqueue(payload, nbytes=len(payload), timeout=_TIMEOUT_S)
+            if not prefill:
+                for payload in payloads[2:]:
+                    queue.input.enqueue(payload, nbytes=len(payload), timeout=_TIMEOUT_S)
             queue.request_stop(timeout=_TIMEOUT_S)
             _read_expected_outputs(queue, expected_outputs[3:])
 
             queue.free()
+            with pytest.raises(RuntimeError, match="released"):
+                queue.input.try_enqueue(payloads[0], len(payloads[0]))
 
-        worker.run(orch, args=None, config=config)
+        for _ in range(repeats):
+            worker.run(orch, args=None, config=config)
     finally:
         worker.close()
 

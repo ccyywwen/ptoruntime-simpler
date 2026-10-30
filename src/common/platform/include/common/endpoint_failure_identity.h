@@ -17,7 +17,6 @@
 
 constexpr uint32_t kEndpointFailureKindNone = 0;
 constexpr uint32_t kEndpointFailureKindRegion = 1;
-constexpr uint32_t kEndpointFailureKindSpscQueue = 2;
 
 struct EndpointFailureIdentity {
     uint32_t kind;
@@ -41,7 +40,7 @@ inline bool endpoint_failure_identity_is_well_formed(const EndpointFailureIdenti
     if (identity.kind == 0) {
         return identity.session_instance_id_bits == 0 && identity.transaction_id == 0;
     }
-    if (identity.kind != 1 && identity.kind != 2) {
+    if (identity.kind != kEndpointFailureKindRegion) {
         return false;
     }
     if (identity.transaction_id == 0) {

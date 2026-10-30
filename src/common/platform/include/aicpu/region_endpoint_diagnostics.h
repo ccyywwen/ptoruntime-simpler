@@ -16,7 +16,6 @@
 #include "aicpu/region_instance_view.h"
 #include "common/endpoint_failure_identity.h"
 #include "common/region_task_args.h"
-#include "common/region_template.h"
 #include "orchestration_api.h"
 
 // A detailed line carries fields past the Host short record, so the native log
@@ -112,14 +111,4 @@ inline void region_report_invalid_task_args(RegionTaskArgError error) {
         static_cast<unsigned>(error), region_task_arg_error_text(error)
     );
     rt_report_endpoint_failure(kEndpointFailureKindRegion, 0, 0, message);
-}
-
-inline void region_report_spsc_queue_error(const spsc_queue::SpscQueueError &error) {
-    char detail[320];
-    region_copy_log_text(detail, sizeof(detail), error.message);
-    const bool trusted = error.transaction_id != 0;
-    rt_report_endpoint_failure(
-        kEndpointFailureKindSpscQueue, trusted ? error.session_instance_id_bits : 0, trusted ? error.transaction_id : 0,
-        detail
-    );
 }

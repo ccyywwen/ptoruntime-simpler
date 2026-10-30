@@ -100,25 +100,6 @@ void report_samples() {
     EXPECT_NE(g_message.find("counter_operand=5"), std::string::npos);
     EXPECT_EQ(g_message.find('\n'), std::string::npos);
     EXPECT_NE(g_message.find("line one line two"), std::string::npos);
-
-    spsc_queue::SpscQueueError queue{};
-    queue.kind = spsc_queue::SpscQueueErrorKind::OWNERSHIP;
-    queue.op = spsc_queue::SpscQueueOp::INPUT_RELEASE;
-    queue.session_instance_id_bits = 0x22;
-    queue.transaction_id = 8;
-    std::snprintf(queue.message, sizeof(queue.message), "SPSC queue endpoint error op=input_release kind=4 msg=held");
-    region_report_spsc_queue_error(queue);
-    EXPECT_EQ(g_kind, kEndpointFailureKindSpscQueue);
-    EXPECT_EQ(g_session, 0x22u);
-    EXPECT_EQ(g_transaction, 8u);
-    EXPECT_NE(g_message.find("op=input_release"), std::string::npos);
-
-    queue.transaction_id = 0;
-    queue.session_instance_id_bits = 0x99;
-    region_report_spsc_queue_error(queue);
-    EXPECT_EQ(g_kind, kEndpointFailureKindSpscQueue);
-    EXPECT_EQ(g_session, 0u);
-    EXPECT_EQ(g_transaction, 0u);
 }
 
 }  // namespace

@@ -96,8 +96,10 @@ TEST(EndpointFailureIdentity, ChecksShape) {
     EXPECT_TRUE(endpoint_failure_identity_is_well_formed(empty));
     EndpointFailureIdentity region{1, 0, 0, 7};
     EXPECT_TRUE(endpoint_failure_identity_is_well_formed(region));
-    EndpointFailureIdentity untrusted{2, 0, 0, 0};
+    EndpointFailureIdentity untrusted{kEndpointFailureKindRegion, 0, 0, 0};
     EXPECT_TRUE(endpoint_failure_identity_is_well_formed(untrusted));
+    EndpointFailureIdentity retired_kind{2, 0, 0, 0};
+    EXPECT_FALSE(endpoint_failure_identity_is_well_formed(retired_kind));
     EndpointFailureIdentity bad_reserved{1, 1, 0, 7};
     EXPECT_FALSE(endpoint_failure_identity_is_well_formed(bad_reserved));
     EndpointFailureIdentity bad_kind{3, 0, 0, 7};

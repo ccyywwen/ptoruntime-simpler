@@ -103,9 +103,10 @@ platform_cases(
     test_region_instance_view.cpp
     PER_ARCH)
 
-# SPSQ region template is header-only under src/common/platform and opens no
-# arch or runtime headers, so one build covers it.
-platform_single_case(test_region_template.cpp)
+# Example-private SPSC reference. The header lives with the message-queue
+# example and opens no arch or runtime headers.
+platform_single_case(test_spsc_queue_reference.cpp
+    INCLUDES ${SIMPLER_SRC}/../examples/workers/l3/worker_chip_message_queue/kernels/orchestration)
 
 # The helper calls rt_report_endpoint_failure through the orchestration ops
 # table. That table's context type is the runtime's, so one build cannot stand

@@ -292,10 +292,14 @@ TEST(HostApi, EndpointFailureSinkKeepsTheFirstWellFormedRecord) {
     region.transaction_id = 9;
     api.record_endpoint_failure(region);
 
-    EndpointFailureIdentity queue{};
-    queue.kind = kEndpointFailureKindSpscQueue;
-    queue.transaction_id = 3;
-    api.record_endpoint_failure(queue);
+    EndpointFailureIdentity later{};
+    later.kind = kEndpointFailureKindRegion;
+    later.transaction_id = 3;
+    api.record_endpoint_failure(later);
+    EndpointFailureIdentity retired{};
+    retired.kind = 2;
+    retired.transaction_id = 4;
+    api.record_endpoint_failure(retired);
     EXPECT_EQ(sink.kind, kEndpointFailureKindRegion);
     EXPECT_EQ(sink.session_instance_id_bits, 0xabcu);
     EXPECT_EQ(sink.transaction_id, 9u);

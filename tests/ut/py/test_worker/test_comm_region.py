@@ -1689,11 +1689,6 @@ def test_endpoint_duplicate_match_poisons_worker(region_worker):
         worker._require_no_ordered_cleanup_failure("test")
 
 
-def _queue_endpoint_error(session: bytes, transaction_id: int) -> RuntimeError:
-    bits = int.from_bytes(bytes(session), "little")
-    return RuntimeError(f"SPSC queue endpoint error session=0x{bits:016x} transaction={int(transaction_id)}")
-
-
 def test_allocation_identity_returns_bound_session_and_transaction(region_worker):
     worker, _calls, _leases = region_worker()
     resources = _RunResources()
@@ -1778,74 +1773,7 @@ def test_record_data_plane_failure_by_allocation_identity_duplicate_match_is_inv
     assert second.data_plane_error is None
 
 
-def test_queue_endpoint_error_correlates_unique_allocation_identity(region_worker):
-    worker, calls, _leases = region_worker()
-    resources = _RunResources()
-    worker._building_run_resources = resources
-    try:
-        instance = _materialize_default_region(worker)
-    finally:
-        worker._building_run_resources = None
-    session, transaction_id = instance._allocation_identity
-    error = _queue_endpoint_error(session, transaction_id)
-    assert worker._poison_spsc_queue_from_endpoint_error(error, resources) is True
-    assert instance.data_plane_error is error
-    assert instance._close_attempted is False
-    assert [item for item in calls if item[0] == "release"] == []
-    with pytest.raises(RuntimeError, match="no further work is admitted"):
-        worker._require_no_ordered_cleanup_failure("test")
-
-
-def test_queue_endpoint_error_unknown_identity_fail_closed(region_worker):
-    worker, _calls, _leases = region_worker()
-    resources = _RunResources()
-    worker._building_run_resources = resources
-    try:
-        instance = _materialize_default_region(worker)
-    finally:
-        worker._building_run_resources = None
-    error = _queue_endpoint_error(b"\xff" * 8, 1)
-    assert worker._poison_spsc_queue_from_endpoint_error(error, resources) is True
-    assert instance.data_plane_error is None
-    with pytest.raises(RuntimeError, match="no further work is admitted"):
-        worker._require_no_ordered_cleanup_failure("test")
-
-
-def test_queue_endpoint_error_malformed_does_not_modify_instance_or_fall_back(region_worker):
-    worker, _calls, _leases = region_worker()
-    resources = _RunResources()
-    worker._building_run_resources = resources
-    try:
-        instance = _materialize_default_region(worker)
-    finally:
-        worker._building_run_resources = None
-    error = RuntimeError(
-        "SPSC queue endpoint error session=0x0000000000000001 transaction=1 extra\n"
-        "Region endpoint error identity=untrusted"
-    )
-    assert worker._poison_spsc_queue_from_endpoint_error(error, resources) is True
-    assert instance.data_plane_error is None
-    with pytest.raises(RuntimeError, match="no further work is admitted"):
-        worker._require_no_ordered_cleanup_failure("test")
-
-
-def test_queue_endpoint_error_zero_transaction_does_not_modify_instance(region_worker):
-    worker, _calls, _leases = region_worker()
-    resources = _RunResources()
-    worker._building_run_resources = resources
-    try:
-        instance = _materialize_default_region(worker)
-    finally:
-        worker._building_run_resources = None
-    session, _transaction_id = instance._allocation_identity
-    error = _queue_endpoint_error(session, 0)
-    assert worker._poison_spsc_queue_from_endpoint_error(error, resources) is True
-    assert instance.data_plane_error is None
-    with pytest.raises(RuntimeError, match="no further work is admitted"):
-        worker._require_no_ordered_cleanup_failure("test")
-
-
-def test_legacy_region_parser_still_handles_independent_region_marker(region_worker):
+def test_region_marker_poisons_the_matching_instance(region_worker):
     worker, _calls, _leases = region_worker()
     resources = _RunResources()
     worker._building_run_resources = resources
@@ -1855,7 +1783,6 @@ def test_legacy_region_parser_still_handles_independent_region_marker(region_wor
         worker._building_run_resources = None
     session, transaction_id = instance._allocation_identity
     error = _endpoint_error(session, transaction_id)
-    assert worker._poison_spsc_queue_from_endpoint_error(error, resources) is False
     assert worker._poison_region_from_endpoint_error(error, resources) is True
     assert instance.data_plane_error is error
 

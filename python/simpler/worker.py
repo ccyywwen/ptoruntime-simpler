@@ -341,11 +341,11 @@ from .worker_level import span_prefix as _span_prefix
 _BOOTSTRAP_WAIT_TIMEOUT_S = 120.0
 _BOOTSTRAP_POLL_INTERVAL_S = 0.001
 _PY_CONTROL_TIMEOUT_S = 30.0
-_ENDPOINT_SHORT_MARKERS = ("Region endpoint error", "SPSC queue endpoint error")
+_ENDPOINT_SHORT_MARKERS = ("Region endpoint error",)
 _ENDPOINT_SHORT_RE = re.compile(
-    r"^(Region endpoint error|SPSC queue endpoint error) session=0x([0-9a-fA-F]{16}) transaction=([0-9]+)$"
+    r"^(Region endpoint error) session=0x([0-9a-fA-F]{16}) transaction=([0-9]+)$"
 )
-_ENDPOINT_UNTRUSTED_RE = re.compile(r"^(Region endpoint error|SPSC queue endpoint error) identity=untrusted$")
+_ENDPOINT_UNTRUSTED_RE = re.compile(r"^(Region endpoint error) identity=untrusted$")
 _UINT64_MAX = (1 << 64) - 1
 
 
@@ -10052,39 +10052,6 @@ class Worker:
             if handle._config is not None and not handle.released
         }
 
-    def _poison_spsc_queue_from_endpoint_error(
-        self, exc: BaseException, resources: _RunResources | None = None
-    ) -> bool:
-        text = str(exc)
-        try:
-            parsed = _parse_endpoint_failure_marker(text)
-        except ValueError:
-            if "SPSC queue endpoint error" not in text:
-                return False
-            self._record_unreclaimable(
-                "spsc queue: endpoint error marker is malformed; no further work is admitted",
-                exc,
-            )
-            return True
-        if parsed is None or parsed[0] != "SPSC queue endpoint error":
-            return False
-        _marker, session, transaction_id = parsed
-        try:
-            self._region_instance_registry.record_data_plane_failure_by_allocation_identity(
-                resources, session, transaction_id, exc
-            )
-        except MaterializationError as routing:
-            self._record_unreclaimable(
-                "spsc queue: data-plane failure routing failed for allocation identity; no further work is admitted",
-                routing,
-            )
-            return True
-        self._record_unreclaimable(
-            "spsc queue: issued local operation failed; no further work is admitted",
-            exc,
-        )
-        return True
-
     def _poison_region_from_endpoint_error(self, exc: BaseException, resources: _RunResources | None = None) -> bool:
         text = str(exc)
         try:
@@ -14159,8 +14126,6 @@ class Worker:
 
             def _poison_endpoint() -> None:
                 if native_error is not None:
-                    if self._poison_spsc_queue_from_endpoint_error(native_error, resources):
-                        return
                     self._poison_region_from_endpoint_error(native_error, resources)
 
             def _release_native_run() -> None:
