@@ -103,9 +103,10 @@ platform_cases(
     test_region_instance_view.cpp
     PER_ARCH)
 
-# Example-private SPSC reference. The header lives with the message-queue
-# example and opens no arch or runtime headers.
-platform_single_case(test_spsc_queue_reference.cpp
+# The example header reaches device_time.h, which includes the arch
+# platform_config.h. Those two copies differ, so one build cannot stand
+# for both.
+platform_case(test_spsc_queue_reference.cpp PER_ARCH
     INCLUDES ${SIMPLER_SRC}/../examples/workers/l3/worker_chip_message_queue/kernels/orchestration)
 
 # The helper calls rt_report_endpoint_failure through the orchestration ops
