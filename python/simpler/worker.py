@@ -10314,53 +10314,6 @@ class Worker:
                 resources.requires_ordered_cleanup = previous_cleanup
             raise
 
-    def _create_spsc_queue(
-        self,
-        *,
-        initiator: object,
-        peer: object,
-        depth: object,
-        input_arena_bytes: object,
-        output_arena_bytes: object,
-    ):
-        from .comm_region_template import (  # noqa: PLC0415
-            _RegionTemplateCoordinator,
-            _RegionTemplatePlacementRequest,
-            _return_spsc_queue,
-            _SpscQueueConfig,
-            _SpscQueueSlot,
-            _SpscQueueTemplate,
-            _TemplateSlotBindingRequest,
-        )
-
-        resources = self._require_region_creation_run("_create_spsc_queue")
-        checked_initiator = _require_endpoint_selector("initiator", initiator)
-        checked_peer = _require_endpoint_selector("peer", peer)
-        placement = _RegionTemplatePlacementRequest(
-            members=(checked_initiator, checked_peer),
-            topology=SingleOwner(provider=checked_peer),
-            slot_bindings=(
-                _TemplateSlotBindingRequest(_SpscQueueSlot.INITIATOR, checked_initiator),
-                _TemplateSlotBindingRequest(_SpscQueueSlot.PEER, checked_peer),
-            ),
-        )
-        previous_cleanup = resources.requires_ordered_cleanup
-        try:
-            return _RegionTemplateCoordinator(self).create(
-                template=_SpscQueueTemplate(),
-                config=_SpscQueueConfig(
-                    depth=depth,
-                    input_arena_bytes=input_arena_bytes,
-                    output_arena_bytes=output_arena_bytes,
-                ),
-                placement=placement,
-                result_projector=_return_spsc_queue,
-            )
-        except BaseException:
-            if not self._run_retains_ordered_cleanup(resources):
-                resources.requires_ordered_cleanup = previous_cleanup
-            raise
-
     def _finish_region_publication(self, instance: RegionInstance, resources: _RunResources, run_id: int) -> None:
         instance._cleanup_resources = resources
         instance._owner_run_id = int(run_id)

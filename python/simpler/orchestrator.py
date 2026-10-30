@@ -734,18 +734,6 @@ class Orchestrator:
             counter_bytes=counter_bytes,
         )
 
-    def create_spsc_queue(self, *, initiator, peer, depth, input_arena_bytes, output_arena_bytes):
-        """Create one SPSC queue for this orchestration callback's run."""
-        if self._worker is None:
-            raise RuntimeError("create_spsc_queue requires an Orchestrator bound to a Worker")
-        return self._worker._create_spsc_queue(
-            initiator=initiator,
-            peer=peer,
-            depth=depth,
-            input_arena_bytes=input_arena_bytes,
-            output_arena_bytes=output_arena_bytes,
-        )
-
     # ------------------------------------------------------------------
     # Nested scope (Strict-1 per-scope rings)
     # ------------------------------------------------------------------

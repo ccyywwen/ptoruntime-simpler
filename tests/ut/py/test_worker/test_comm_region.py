@@ -3309,3 +3309,19 @@ def test_live_public_init_failure_rolls_back_before_delivery(region_worker, monk
         _materialize_default_region(worker)
     assert worker._region_instance_registry._instances == {}
     assert [item for item in calls if item[0] == "release"] == [("release", 1, 42)]
+
+
+def test_comm_region_public_names_are_the_region_primitives():
+    import simpler.comm_region as comm_region
+    import simpler.orchestrator as orchestrator
+
+    assert comm_region.__all__ == [
+        "MaterializationRefusal",
+        "NotifyOp",
+        "RefusalReason",
+        "RegionCounter",
+        "RegionInstance",
+        "SignalTestResult",
+        "WaitCmp",
+    ]
+    assert not hasattr(orchestrator.Orchestrator, "create_spsc_queue")
